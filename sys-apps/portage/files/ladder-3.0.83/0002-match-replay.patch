@@ -1,0 +1,154 @@
+depgraph: replay _iter_match_pkgs_atom results across backtracking runs
+
+Every backtracking run asks for the matches of the same atoms again. The
+result depends on the arguments and on state shared by all runs through
+_frozen_config, except when onlydeps is set or the package has a recorded
+USE change; in those two cases the memo is bypassed. Filled lazily.
+
+Alone on 3.0.83 (three states measured): start 119.6 -> 108.6,
+masks 91.0 -> 75.0, base 29.1 -> 26.2.
+Least-checked change of the first three: plan identity only, no lock-step,
+and no state with autounmask USE changes was run.
+On upstream head it needs regenerating (context only); 114.4 -> 105.5 s there.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -316,6 +316,8 @@
+         self.roots = {}
+         # All Package instances
+         self._pkg_cache = {}
++        # See depgraph._iter_match_pkgs_atom.
++        self._match_pkgs_atom_memo = {}
+         self._highest_license_masked = {}
+         # We can't know that an soname dep is unsatisfied if there are
+         # any unbuilt ebuilds in the graph, since unbuilt ebuilds have
+@@ -908,6 +910,9 @@
+                 # This needs to be called for the first depgraph, but not for
+                 # backtracking depgraphs that share the same frozen_config.
+                 fake_vartree.sync()
++                # The installed packages have just been loaded, so nothing
++                # that was matched against them before is valid.
++                self._frozen_config._match_pkgs_atom_memo.clear()
+ 
+                 # FakeVartree.sync() populates virtuals, and we want
+                 # self.pkgsettings to have them populated too.
+@@ -7175,11 +7180,83 @@
+         unbuilt ebuilds since USE are lazily calculated after visibility
+         checks (to avoid the expense when possible).
+         """
++        # The packages that _iter_match_pkgs_atom_imp yields depend on the
++        # arguments, on things that are the same for every depgraph sharing
++        # this _frozen_config (the package databases, with the installed
++        # packages loaded once by _load_vdb, _pkg_cache, the "remove"
++        # parameter, the dbs list) and on two things that are not: onlydeps
++        # makes _pkg look into the graph, and a package listed in
++        # _needed_use_config_changes is matched with changed USE. So while
++        # neither of these two applies, the items can be replayed from a memo
++        # shared by all backtracking runs, which ask for the same atoms again
++        # and again. The memo is filled lazily, as far as the furthest
++        # consumer went, so that no Package is created that the generator
++        # would not have created.
++        use_changes = self._dynamic_config._needed_use_config_changes
++        start = 0
++        if not (onlydeps or use_changes):
++            memo_key = (
++                root_config,
++                pkg_type,
++                atom,
++                atom.unevaluated_atom,
++                "remove" in self._dynamic_config.myparams,
++            )
++            memo = self._frozen_config._match_pkgs_atom_memo.get(memo_key)
++            if memo is None:
++                # [[(start index for the item after this one, pkg), ...],
++                #  True once the list is complete]
++                memo = self._frozen_config._match_pkgs_atom_memo[memo_key] = [
++                    [],
++                    False,
++                ]
++            items = memo[0]
++            i = 0
++            # use_changes is tested again before every item, since the
++            # consumer may have added a USE change in the meantime.
++            while not use_changes:
++                if i < len(items):
++                    start, pkg = items[i]
++                    i += 1
++                    yield pkg
++                elif memo[1]:
++                    return
++                else:
++                    break
++            if start is None:
++                # The last item replayed is one after which the generator
++                # returns.
++                return
++            # Compute the items after those replayed, and record them unless
++            # USE changes showed up or somebody else recorded them already.
++            for next_start, pkg in self._iter_match_pkgs_atom_imp(
++                root_config, pkg_type, atom, onlydeps, start
++            ):
++                if not use_changes and i == len(items):
++                    items.append((next_start, pkg))
++                i += 1
++                yield pkg
++            if not use_changes and i == len(items):
++                memo[1] = True
++            return
++
++        for next_start, pkg in self._iter_match_pkgs_atom_imp(
++            root_config, pkg_type, atom, onlydeps, start
++        ):
++            yield pkg
++
++    def _iter_match_pkgs_atom_imp(self, root_config, pkg_type, atom, onlydeps, start):
++        """
++        The body of _iter_match_pkgs_atom. It yields (next_start, pkg): with
++        next_start as start, it begins with the item that follows pkg.
++        next_start is None for an item after which nothing follows.
++        """
+ 
+         db = root_config.trees[self.pkg_tree_map[pkg_type]].dbapi
+         atom_exp = dep_expand(atom, mydb=db, settings=root_config.settings)
+         cp_list = db.cp_list(atom_exp.cp)
+-        matched_something = False
++        # An item was yielded before the start index, if that is not 0.
++        matched_something = start > 0
+         installed = pkg_type == "installed"
+ 
+         if cp_list:
+@@ -7187,7 +7264,8 @@
+ 
+             # descending order
+             cp_list.reverse()
+-            for cpv in cp_list:
++            for cp_list_index in range(start, len(cp_list)):
++                cpv = cp_list[cp_list_index]
+                 # Call match_from_list on one cpv at a time, in order
+                 # to avoid unnecessary match_from_list comparisons on
+                 # versions that are never yielded from this method.
+@@ -7220,7 +7298,7 @@
+                         ):
+                             continue
+                         matched_something = True
+-                        yield pkg
++                        yield cp_list_index + 1, pkg
+ 
+         # USE=multislot can make an installed package appear as if
+         # it doesn't satisfy a slot dependency. Rebuilding the ebuild
+@@ -7281,7 +7359,7 @@
+                     # Remove the slot from the atom and verify that
+                     # the package matches the resulting atom.
+                     if atom_set.findAtomForPackage(inst_pkg):
+-                        yield inst_pkg
++                        yield None, inst_pkg
+                         return
+ 
+     def _select_pkg_highest_available(self, root, atom, onlydeps=False, parent=None):

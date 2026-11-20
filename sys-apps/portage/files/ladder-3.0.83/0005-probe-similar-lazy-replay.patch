@@ -1,0 +1,107 @@
+depgraph: replay _iter_similar_available lazily inside the probe loop
+
+Over 0004 (three states): start 103.7 -> 98.6, masks 67.9 -> 62.6,
+base 23.6 -> 22.5; under 1.5 s per state once patch 0002 is applied.
+Does NOT apply to upstream head: the function gained a parameter there.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -13,7 +13,7 @@
+ import warnings
+ from collections import OrderedDict, deque
+ from collections.abc import Callable, Iterable
+-from itertools import chain
++from itertools import chain, islice
+ 
+ import portage
+ from portage.const import (
+@@ -299,6 +299,54 @@
+         self.mergelist = mergelist
+ 
+ 
++class _ReplayIter:
++    """
++    Iterable over the items of the generator that factory() returns. The
++    generator is advanced lazily, exactly as far as the furthest consumer
++    went, and the items it yielded are kept, so that the next consumer gets
++    the same items without running the generator again.
++    """
++
++    __slots__ = ("_factory", "_items", "_source", "_running", "_broken")
++
++    def __init__(self, factory):
++        self._factory = factory
++        self._items = []
++        self._source = factory()
++        self._running = False
++        self._broken = False
++
++    def __iter__(self):
++        items = self._items
++        i = 0
++        while True:
++            if i < len(items):
++                yield items[i]
++                i += 1
++                continue
++            source = self._source
++            if source is None:
++                return
++            if self._running or self._broken:
++                # The shared generator is being advanced further up the
++                # stack, or it raised. Iterate a private one instead, which
++                # is what happens without the memo.
++                yield from islice(self._factory(), i, None)
++                return
++            self._running = True
++            try:
++                item = next(source)
++            except StopIteration:
++                self._source = None
++                return
++            except BaseException:
++                self._broken = True
++                raise
++            finally:
++                self._running = False
++            items.append(item)
++
++
+ class _frozen_depgraph_config:
+     def __init__(self, settings, trees, myopts, params, spinner):
+         self.settings = settings
+@@ -3066,7 +3114,27 @@
+         see if a similar package is available to install. The given
+         graph_pkg itself may be yielded only if it's not installed.
+         """
++        memo = self._probe_memo
++        if memo is None or autounmask_level is not None or not atom.package:
++            return self._iter_similar_available_imp(graph_pkg, atom, autounmask_level)
++        # The generator uses graph_pkg only for its root_config and its cp.
++        key = (
++            "similar",
++            graph_pkg.root_config,
++            graph_pkg.cp,
++            atom,
++            atom.unevaluated_atom,
++        )
++        replay = memo.get(key)
++        if replay is None:
++            replay = memo[key] = _ReplayIter(
++                functools.partial(
++                    self._iter_similar_available_imp, graph_pkg, atom, None
++                )
++            )
++        return iter(replay)
+ 
++    def _iter_similar_available_imp(self, graph_pkg, atom, autounmask_level):
+         usepkgonly = self._frozen_config.myopts.get("--usepkgonly") is True
+         useoldpkg_atoms = self._frozen_config.useoldpkg_atoms
+         use_ebuild_visibility = (
