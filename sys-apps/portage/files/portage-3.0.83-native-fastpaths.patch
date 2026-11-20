@@ -1,0 +1,1821 @@
+diff -ruN a/lib/_emerge/Package.py b/lib/_emerge/Package.py
+--- a/lib/_emerge/Package.py
++++ b/lib/_emerge/Package.py
+@@ -978,7 +978,7 @@
+         else:
+             self.update(metadata)
+ 
+-    def __getitem__(self, k):
++    def _py_getitem(self, k):
+         v = _PackageMetadataWrapperBase.__getitem__(self, k)
+         if k in self._use_conditional_keys:
+             if self._pkg.root_config.settings.local_config and "?" in v:
+@@ -1004,6 +1004,15 @@
+ 
+         return v
+ 
++    if hasattr(_PackageMetadataWrapperBase, "_c_getitem_hooked"):
++        # C __getitem__ (src/portage_util__cfast.c): the keys that
++        # _py_getitem treats specially go to it, every other key is the
++        # plain slot lookup that _py_getitem starts with and returns.
++        _c_slow_keys = _use_conditional_keys | frozenset(["USE"])
++        __getitem__ = _PackageMetadataWrapperBase._c_getitem_hooked
++    else:
++        __getitem__ = _py_getitem
++
+     def __setitem__(self, k, v):
+         _PackageMetadataWrapperBase.__setitem__(self, k, v)
+         if k in self._wrapped_keys:
+diff -ruN a/lib/_emerge/Task.py b/lib/_emerge/Task.py
+--- a/lib/_emerge/Task.py
++++ b/lib/_emerge/Task.py
+@@ -3,26 +3,39 @@
+ 
+ from portage.util.SlotObject import SlotObject
+ 
++try:
++    # C base type with _hash_key, _hash_value and the hash and equality
++    # methods below (src/portage_util__hashbase.c). Every dict and set of
++    # packages calls them, a few million times per dependency calculation.
++    from portage.util._hashbase import TaskBase as _TaskBase
++except ImportError:
++    _TaskBase = None
++
++
++class Task(*((SlotObject,) if _TaskBase is None else (_TaskBase, SlotObject))):
++    # With the C base, the two fields are its members (it names them in
++    # its own __slots__ for SlotObject), and it provides __eq__, __ne__
++    # and __hash__ with the semantics of the Python methods here.
++    __slots__ = ("_hash_key", "_hash_value") if _TaskBase is None else ()
++
++    if _TaskBase is None:
++
++        def __eq__(self, other):
++            try:
++                return self._hash_key == other._hash_key
++            except AttributeError:
++                # depgraph._pkg() generates _hash_key
++                # for lookups here, so handle that
++                return self._hash_key == other
++
++        def __ne__(self, other):
++            try:
++                return self._hash_key != other._hash_key
++            except AttributeError:
++                return True
+ 
+-class Task(SlotObject):
+-    __slots__ = ("_hash_key", "_hash_value")
+-
+-    def __eq__(self, other):
+-        try:
+-            return self._hash_key == other._hash_key
+-        except AttributeError:
+-            # depgraph._pkg() generates _hash_key
+-            # for lookups here, so handle that
+-            return self._hash_key == other
+-
+-    def __ne__(self, other):
+-        try:
+-            return self._hash_key != other._hash_key
+-        except AttributeError:
+-            return True
+-
+-    def __hash__(self):
+-        return self._hash_value
++        def __hash__(self):
++            return self._hash_value
+ 
+     def __len__(self):
+         return len(self._hash_key)
+diff -ruN a/lib/portage/cache/mappings.py b/lib/portage/cache/mappings.py
+--- a/lib/portage/cache/mappings.py
++++ b/lib/portage/cache/mappings.py
+@@ -11,6 +11,7 @@
+     "slot_dict_class",
+ ]
+ 
++from types import MemberDescriptorType
+ import weakref
+ 
+ 
+@@ -271,7 +272,45 @@
+     keys = __iter__
+ 
+ 
+-class _SlotDict:
++try:
++    # C base type with __getitem__ and get() of _SlotDict
++    # (src/portage_util__cfast.c).
++    from portage.util._cfast import SlotDictBase as _SlotDictBase
++    from portage.util._cfast import set_keymap_builder as _set_keymap_builder
++except ImportError:
++    _SlotDictBase = None
++
++
++def _build_c_keymap(cls):
++    """
++    Make cls._c_keymap for the C __getitem__: the allowed keys of cls that
++    are stored in an ordinary slot, each with its slot descriptor. A key
++    that is left out (or anything that is not exactly a str) is looked up
++    by _SlotDict._py_raw_getitem instead.
++    """
++    keymap = {}
++    prefix = None
++    for c in cls.__mro__:
++        if "_prefix" in c.__dict__:
++            prefix = c.__dict__["_prefix"]
++            break
++    allowed_keys = getattr(cls, "allowed_keys", ())
++    # _PickledSlotDict keeps prefix, keys and values in the instance
++    if type(prefix) is str and not issubclass(cls, _PickledSlotDict):
++        for k in allowed_keys:
++            if type(k) is not str:
++                continue
++            name = prefix + k
++            for c in cls.__mro__:
++                if name in c.__dict__:
++                    if type(c.__dict__[name]) is MemberDescriptorType:
++                        keymap[k] = c.__dict__[name]
++                    break
++    cls._c_keymap = keymap
++    return keymap
++
++
++class _SlotDict(*(() if _SlotDictBase is None else (_SlotDictBase,))):
+     """
+     Base class for classes returned from slot_dict_class.
+     """
+@@ -367,17 +406,20 @@
+         if kwargs:
+             self.update(kwargs)
+ 
+-    def __getitem__(self, k):
++    def _py_raw_getitem(self, k):
+         try:
+             return getattr(self, self._prefix + k)
+         except AttributeError:
+             raise KeyError(k)
+ 
+-    def get(self, key, default=None):
+-        try:
+-            return self[key]
+-        except KeyError:
+-            return default
++    if _SlotDictBase is None:
++        __getitem__ = _py_raw_getitem
++
++        def get(self, key, default=None):
++            try:
++                return self[key]
++            except KeyError:
++                return default
+ 
+     def __contains__(self, k):
+         return hasattr(self, self._prefix + k)
+@@ -440,6 +482,9 @@
+         super().__init__(*args, **kwargs)
+ 
+ 
++if _SlotDictBase is not None:
++    _set_keymap_builder(_build_c_keymap)
++
+ _slot_dict_classes = weakref.WeakValueDictionary()
+ 
+ 
+diff -ruN a/lib/portage/dep/__init__.py b/lib/portage/dep/__init__.py
+--- a/lib/portage/dep/__init__.py
++++ b/lib/portage/dep/__init__.py
+@@ -255,9 +255,31 @@
+     return out
+ 
+ 
++try:
++    # _c_convert_result and _c_flatten_result in C
++    # (src/portage_util__cfast.c).
++    from portage.util._cfast import convert as _c_convert
++except ImportError:
++    _c_convert = None
++
++
+ def _c_fast_use_reduce(depstr, uselist, matchall, eapi, flat):
+     raw = _c_dep_parser.parse(depstr, uselist=uselist, matchall=matchall)
+     eapi_attrs = _get_eapi_attrs(eapi)
++    if _c_convert is not None and type(raw) is list:
++        result = _c_convert(
++            raw,
++            flat,
++            _c_atom_memo,
++            _c_atom_from_c,
++            eapi,
++            eapi_attrs,
++            uselist,
++            matchall,
++        )
++        if flat:
++            return result
++        return _c_normalize_seq(result, eapi_attrs.empty_groups_always_true)
+     if flat:
+         return _c_flatten_result(raw, [], eapi, eapi_attrs, uselist, matchall)
+     result = _c_convert_result(raw, eapi, eapi_attrs, uselist, matchall)
+@@ -1884,28 +1906,42 @@
+     )
+ 
+ 
+-class Atom:
+-    __slots__ = (
+-        "__weakref__",
+-        "_blocker_obj",
+-        "_build_id",
+-        "_cp",
+-        "_cpv",
+-        "_eapi",
+-        "_extended_syntax",
+-        "_intern_key",
+-        "_match_kind",
+-        "_operator",
+-        "_orig_atom",
+-        "_repo",
+-        "_slot",
+-        "_slot_operator",
+-        "_string",
+-        "_sub_slot",
+-        "_unevaluated_atom",
+-        "_use",
+-        "_version",
+-        "_without_use",
++try:
++    # C base type with the _string field and the hash and equality methods
++    # of Atom (src/portage_util__hashbase.c).
++    from portage.util._hashbase import AtomBase as _AtomBase
++except ImportError:
++    _AtomBase = None
++
++
++class Atom(*(() if _AtomBase is None else (_AtomBase,))):
++    # With the C base, _string is its member, and it provides __eq__ and
++    # __hash__ with the semantics of the Python methods below.
++    __slots__ = tuple(
++        name
++        for name in (
++            "__weakref__",
++            "_blocker_obj",
++            "_build_id",
++            "_cp",
++            "_cpv",
++            "_eapi",
++            "_extended_syntax",
++            "_intern_key",
++            "_match_kind",
++            "_operator",
++            "_orig_atom",
++            "_repo",
++            "_slot",
++            "_slot_operator",
++            "_string",
++            "_sub_slot",
++            "_unevaluated_atom",
++            "_use",
++            "_version",
++            "_without_use",
++        )
++        if _AtomBase is None or name != "_string"
+     )
+ 
+     def __str__(self) -> str:
+@@ -1914,15 +1950,17 @@
+     def __repr__(self) -> str:
+         return f"Atom({self._string!r})"
+ 
+-    def __eq__(self, value: object) -> bool:
+-        if isinstance(value, Atom):
+-            return self._string == value._string
+-        if isinstance(value, str):
+-            return self._string == value
+-        return super().__eq__(value)
++    if _AtomBase is None:
++
++        def __eq__(self, value: object) -> bool:
++            if isinstance(value, Atom):
++                return self._string == value._string
++            if isinstance(value, str):
++                return self._string == value
++            return super().__eq__(value)
+ 
+-    def __hash__(self) -> int:
+-        return hash(self._string)
++        def __hash__(self) -> int:
++            return hash(self._string)
+ 
+     @property
+     def category(self) -> str:
+diff -ruN a/lib/portage/tests/util/test_cfast.py b/lib/portage/tests/util/test_cfast.py
+--- a/lib/portage/tests/util/test_cfast.py
++++ b/lib/portage/tests/util/test_cfast.py
+@@ -0,0 +1,297 @@
++# Copyright 2026 Gentoo Authors
++# Distributed under the terms of the GNU General Public License v2
++
++"""
++portage.util._cfast against the Python code it replaces: the slot dict
++lookups of portage.cache.mappings and the conversion of the C parser's tree
++in portage.dep. Same results and same exception types.
++"""
++
++import itertools
++
++import pytest
++
++import portage.dep as dep
++from portage.cache import mappings
++from portage.dep import Atom
++
++try:
++    from portage.util import _cfast
++except ImportError:
++    _cfast = None
++
++pytestmark = pytest.mark.skipif(_cfast is None, reason="native extensions are not built")
++
++
++def outcome(func):
++    try:
++        result = func()
++    except Exception as e:  # noqa: BLE001 - the type is the result
++        return ("raised", type(e))
++    return ("value", type(result), result)
++
++
++# ---- slot dict -----------------------------------------------------------
++
++
++def py_getitem(self, k):
++    """_SlotDict.__getitem__ before the C base."""
++    try:
++        return getattr(self, self._prefix + k)
++    except AttributeError:
++        raise KeyError(k)
++
++
++def py_get(self, key, default=None):
++    try:
++        return py_getitem(self, key)
++    except KeyError:
++        return default
++
++
++class StrSub(str):
++    pass
++
++
++KEYS = ["SLOT", "EAPI", "USE", "KEYWORDS", "DEFINED_PHASES"]
++PROBES = [
++    "SLOT",
++    "EAPI",
++    "USE",
++    "KEYWORDS",
++    "nope",
++    "",
++    StrSub("SLOT"),
++    StrSub("nope"),
++    Atom("dev-libs/foo"),
++    b"SLOT",
++    1,
++    None,
++    ("SLOT",),
++    ["SLOT"],
++    3.5,
++]
++
++
++def test_slot_dict_uses_the_c_base():
++    cls = mappings.slot_dict_class(KEYS)
++    assert issubclass(cls, _cfast.SlotDictBase)
++    assert "__getitem__" not in mappings._SlotDict.__dict__
++    assert "get" not in mappings._SlotDict.__dict__
++
++
++@pytest.mark.parametrize("prefix", ["_val_", "", "x"])
++def test_slot_dict_getitem_and_get_match_python(prefix):
++    cls = mappings.slot_dict_class(KEYS, prefix=prefix)
++    d = cls({"SLOT": "0/1", "EAPI": "8", "USE": ""})  # KEYWORDS, DEFINED_PHASES unset
++    for k in PROBES:
++        assert outcome(lambda: d[k]) == outcome(lambda: py_getitem(d, k)), (prefix, k)
++        assert outcome(lambda: d.get(k)) == outcome(lambda: py_get(d, k)), (prefix, k)
++        assert outcome(lambda: d.get(k, 7)) == outcome(lambda: py_get(d, k, 7)), (prefix, k)
++    assert d.get("KEYWORDS") is None and d.get("KEYWORDS", "x") == "x"
++    with pytest.raises(TypeError):
++        d.get()
++    with pytest.raises(TypeError):
++        d.get("SLOT", 1, 2)
++    # the keymap follows later changes of a value, deletion included
++    d["KEYWORDS"] = "amd64"
++    assert d["KEYWORDS"] == "amd64" and d.get("KEYWORDS") == "amd64"
++    del d["KEYWORDS"]
++    with pytest.raises(KeyError):
++        d["KEYWORDS"]
++    assert set(cls._c_keymap) == set(KEYS)
++
++
++def test_slot_dict_rest_of_the_mapping_api():
++    cls = mappings.slot_dict_class(KEYS)
++    d = cls(SLOT="0")
++    assert dict(d) == {"SLOT": "0"} and len(d) == 1 and "SLOT" in d
++    assert d.setdefault("EAPI", "8") == "8" and d.pop("EAPI") == "8"
++    assert d.pop("EAPI", "gone") == "gone"
++    c = d.copy()
++    assert c == d and c is not d and c["SLOT"] == "0"
++    d.update({"USE": "a b"})
++    assert sorted(d.items()) == [("SLOT", "0"), ("USE", "a b")]
++
++
++def test_slot_dict_subclass_with_python_getitem():
++    cls = mappings.slot_dict_class(KEYS)
++
++    class Loud(cls):
++        __slots__ = ()
++
++        def __getitem__(self, k):
++            return cls.__getitem__(self, k).upper()
++
++    d = Loud(SLOT="abc")
++    assert d["SLOT"] == "ABC"
++    # get() goes through the overriding __getitem__, as the Python get() did
++    assert d.get("SLOT") == "ABC" and d.get("EAPI", "dflt") == "dflt"
++
++
++def test_pickled_slot_dict_stays_on_python_path():
++    import pickle
++
++    cls = mappings.slot_dict_class(KEYS)
++    d = cls(SLOT="0", EAPI="8")
++    p = pickle.loads(pickle.dumps(d))
++    assert type(p) is mappings._PickledSlotDict
++    assert p["SLOT"] == "0" and p.get("EAPI") == "8" and p.get("USE", 5) == 5
++    assert type(p)._c_keymap == {}
++    with pytest.raises(KeyError):
++        p["USE"]
++
++
++def test_package_metadata_wrapper_hooked_getitem():
++    from _emerge.Package import _PackageMetadataWrapper as W
++    from _emerge.Package import _PackageMetadataWrapperBase as B
++
++    assert W.__dict__["__getitem__"] is _cfast.SlotDictBase._c_getitem_hooked
++    assert W._c_slow_keys == W._use_conditional_keys | {"USE"}
++
++    class FakePkg:
++        built = True
++
++    w = W.__new__(W)
++    B.__init__(w)
++    w._pkg = FakePkg()
++    B.__setitem__(w, "SLOT", "0")
++    B.__setitem__(w, "USE", "a b")
++    calls = []
++    orig = W._py_getitem
++
++    def spy(self, k):
++        calls.append(k)
++        return orig(self, k)
++
++    W._py_getitem = spy
++    try:
++        assert w["SLOT"] == "0" and calls == []  # plain key: no Python call
++        assert w["USE"] == "a b" and calls == ["USE"]  # special key: Python method
++        assert w.get("SLOT") == "0" and w.get("EAPI", "x") == "x"
++        with pytest.raises(KeyError):
++            w["EAPI"]
++        for k in PROBES:
++            assert outcome(lambda: w[k]) == outcome(lambda: orig(w, k)), k
++    finally:
++        W._py_getitem = orig
++    # the raw base lookup has no hook, for a wrapper instance too
++    assert B.__getitem__(w, "USE") == "a b"
++
++
++# ---- convert() -----------------------------------------------------------
++
++DEPSTRINGS = [
++    "",
++    "dev-libs/a",
++    "dev-libs/a dev-libs/b",
++    ">=dev-libs/a-1.2:0= !dev-libs/b !!<dev-libs/c-3 ~dev-libs/d-1 =dev-libs/e-2*",
++    "|| ( dev-libs/a dev-libs/b )",
++    "|| ( dev-libs/a ( dev-libs/b dev-libs/c ) )",
++    "|| ( ( dev-libs/a ) )",
++    "|| ( || ( dev-libs/a dev-libs/b ) dev-libs/c )",
++    "|| ( )",
++    "x? ( dev-libs/a ) !x? ( dev-libs/b )",
++    "x? ( y? ( dev-libs/a ) || ( dev-libs/b z? ( dev-libs/c ) ) )",
++    "dev-libs/a[x,y?,-z,w=,!v?] dev-libs/b[x(+),y(-)?]",
++    "dev-libs/a:2/3= dev-libs/b:* dev-libs/c:=",
++    "( dev-libs/a ( dev-libs/b ) ) dev-libs/c",
++    "x? ( ) dev-libs/a",
++    "dev-libs/a::gentoo",
++]
++USELISTS = [(), ("x",), ("x", "y"), ("y", "z", "w", "v")]
++EAPIS = ["8", "7", "6", None]
++
++
++def py_fast_use_reduce(depstr, uselist, matchall, eapi, flat):
++    """_c_fast_use_reduce with the Python conversion."""
++    saved = dep._c_convert
++    dep._c_convert = None
++    try:
++        return dep._c_fast_use_reduce(depstr, uselist, matchall, eapi, flat)
++    finally:
++        dep._c_convert = saved
++
++
++def same_tree(a, b):
++    """Same nesting, types and strings; the very same Atom objects (both
++    trees are alive, so the weak intern caches hand out one instance)."""
++    if isinstance(a, list) or isinstance(b, list):
++        return (
++            type(a) is type(b)
++            and len(a) == len(b)
++            and all(same_tree(x, y) for x, y in zip(a, b))
++        )
++    if isinstance(a, Atom) or isinstance(b, Atom):
++        return a is b
++    return type(a) is type(b) and a == b
++
++
++@pytest.mark.skipif(dep._c_dep_parser is None, reason="no C dependency parser")
++def test_convert_matches_python():
++    n = 0
++    for depstr, uselist, eapi, matchall, flat in itertools.product(
++        DEPSTRINGS, USELISTS, EAPIS, (False, True), (False, True)
++    ):
++        # twice: the first call fills the atom memo, the second one reads it
++        for _ in range(2):
++            expected = outcome(
++                lambda: py_fast_use_reduce(depstr, uselist, matchall, eapi, flat)
++            )
++            got = outcome(
++                lambda: dep._c_fast_use_reduce(depstr, uselist, matchall, eapi, flat)
++            )
++            where = (depstr, uselist, eapi, matchall, flat)
++            assert got[:2] == expected[:2], where
++            if got[0] == "value":
++                assert same_tree(got[2], expected[2]), (where, got[2], expected[2])
++            n += 1
++    assert n == len(DEPSTRINGS) * len(USELISTS) * len(EAPIS) * 8
++
++
++def test_convert_argument_checks_and_errors():
++    with pytest.raises(TypeError):
++        _cfast.convert([], False, {}, None, "8", None, (), False, "extra")
++    with pytest.raises(TypeError):
++        _cfast.convert((), False, {}, None, "8", None, (), False)
++    with pytest.raises(TypeError):
++        _cfast.convert([], False, [], None, "8", None, (), False)
++
++    class Token:
++        def __str__(self):
++            return "tok"
++
++    def boom(*args):
++        raise ValueError("from the slow path")
++
++    with pytest.raises(ValueError):
++        _cfast.convert([Token()], False, {}, boom, "8", None, (), False)
++
++    seen = []
++
++    def slow(catom, eapi, eapi_attrs, uselist, matchall):
++        seen.append((str(catom), eapi, eapi_attrs, uselist, matchall))
++        return "converted"
++
++    t = Token()
++    assert _cfast.convert(["||", [t, [t]], t], False, {}, slow, "8", "attrs", ("u",), 0) == [
++        "||",
++        ["converted", ["converted"]],
++        "converted",
++    ]
++    assert seen[0] == ("tok", "8", "attrs", ("u",), 0) and len(seen) == 3
++    assert _cfast.convert(["||", [t, [t]], t], True, {}, slow, "8", None, (), 0) == [
++        "||",
++        "converted",
++        "converted",
++        "converted",
++    ]
++    # a remembered value of None is not a hit, as in the Python code
++    assert _cfast.convert([t], False, {("tok", "8"): None}, slow, "8", None, (), 1) == [
++        "converted"
++    ]
++    # a remembered atom is returned as it is when matchall is true
++    marker = object()
++    assert _cfast.convert([t], False, {("tok", "8"): marker}, boom, "8", None, (), 1) == [
++        marker
++    ]
+diff -ruN a/lib/portage/tests/util/test_hashbase.py b/lib/portage/tests/util/test_hashbase.py
+--- a/lib/portage/tests/util/test_hashbase.py
++++ b/lib/portage/tests/util/test_hashbase.py
+@@ -0,0 +1,336 @@
++# Copyright 2026 Gentoo Authors
++# Distributed under the terms of the GNU General Public License v2
++
++"""
++The C base types of portage.util._hashbase against the Python methods they
++replace in _emerge.Task and portage.dep.Atom: same results, same exception
++types, same hash values, for every pair of operands below.
++"""
++
++import itertools
++
++import pytest
++
++from portage.util.SlotObject import SlotObject
++
++try:
++    from portage.util import _hashbase
++except ImportError:
++    _hashbase = None
++
++pytestmark = pytest.mark.skipif(
++    _hashbase is None, reason="native extensions are not built"
++)
++
++
++# ---- the reference: the Python bodies, copied from Task.py and dep/__init__.py
++
++
++class PyTask(SlotObject):
++    __slots__ = ("_hash_key", "_hash_value")
++
++    def __eq__(self, other):
++        try:
++            return self._hash_key == other._hash_key
++        except AttributeError:
++            return self._hash_key == other
++
++    def __ne__(self, other):
++        try:
++            return self._hash_key != other._hash_key
++        except AttributeError:
++            return True
++
++    def __hash__(self):
++        return self._hash_value
++
++
++class PyAtom:
++    __slots__ = ("__weakref__", "_string", "_cp")
++
++    def __eq__(self, value):
++        if isinstance(value, PyAtom):
++            return self._string == value._string
++        if isinstance(value, str):
++            return self._string == value
++        return super().__eq__(value)
++
++    def __hash__(self):
++        return hash(self._string)
++
++
++if _hashbase is not None:
++
++    class CTask(_hashbase.TaskBase, SlotObject):
++        __slots__ = ()
++
++    class CTaskSub(CTask):
++        # like Package: more slots, ordering methods, the explicit __hash__
++        __hash__ = CTask.__hash__
++        __slots__ = ("extra",)
++
++        def __lt__(self, other):
++            return self._hash_key < other._hash_key
++
++    class CAtom(_hashbase.AtomBase):
++        __slots__ = ("__weakref__", "_cp")
++
++
++class PyTaskSub(PyTask):
++    __hash__ = PyTask.__hash__
++    __slots__ = ("extra",)
++
++    def __lt__(self, other):
++        return self._hash_key < other._hash_key
++
++
++class Odd:
++    """A foreign operand with a _hash_key of its own."""
++
++    def __init__(self, key):
++        self._hash_key = key
++
++
++class Raiser:
++    """Its _hash_key raises something other than AttributeError."""
++
++    @property
++    def _hash_key(self):
++        raise ValueError("boom")
++
++
++class EqAttributeError:
++    """A key element whose comparison raises AttributeError."""
++
++    def __eq__(self, other):
++        raise AttributeError("from __eq__")
++
++    def __hash__(self):
++        return 7
++
++
++def outcome(func):
++    """The result of func(), or the exception type it raised."""
++    try:
++        result = func()
++    except Exception as e:  # noqa: BLE001 - the type is the result
++        return ("raised", type(e))
++    if result is NotImplemented:
++        return ("NotImplemented",)
++    return ("value", type(result), result)
++
++
++KEYS = [
++    ("ebuild", "/", "dev-libs/foo-1", "merge", "gentoo"),
++    ("ebuild", "/", "dev-libs/foo-1", "merge", "gentoo"),  # equal, not identical
++    ("ebuild", "/", "dev-libs/foo-2", "merge", "gentoo"),
++    ("installed", "/", "dev-libs/foo-1", "nomerge", "gentoo"),
++    ("blocks", "/", "!dev-libs/foo", "8"),
++    (),
++    "a string key",
++    42,
++    None,
++]
++
++
++def make_tasks(cls, sub):
++    tasks = []
++    for key in KEYS:
++        for c in (cls, sub):
++            t = c()
++            t._hash_key = key
++            t._hash_value = hash(key)
++            tasks.append(t)
++    unset = object.__new__(cls)  # neither field set
++    odd_hash = cls()
++    odd_hash._hash_key = ("x",)
++    odd_hash._hash_value = 2**70 + 3  # outside Py_hash_t
++    minus_one = cls()
++    minus_one._hash_key = ("y",)
++    minus_one._hash_value = -1
++    bad_eq = cls()
++    bad_eq._hash_key = (EqAttributeError(),)
++    bad_eq._hash_value = 5
++    return tasks + [unset, odd_hash, minus_one, bad_eq]
++
++
++FOREIGN = [
++    ("ebuild", "/", "dev-libs/foo-1", "merge", "gentoo"),
++    ["ebuild"],
++    "a string key",
++    42,
++    None,
++    3.5,
++    Odd(("ebuild", "/", "dev-libs/foo-1", "merge", "gentoo")),
++    Odd(("other",)),
++    Raiser(),
++    object(),
++]
++
++
++def test_task_fields_and_slots():
++    assert _hashbase.TaskBase.__slots__ == ("_hash_key", "_hash_value")
++    t = CTask()
++    # SlotObject.__init__ set both to None, as it does for the Python class
++    assert t._hash_key is None and t._hash_value is None
++    raw = object.__new__(CTask)
++    with pytest.raises(AttributeError):
++        raw._hash_key
++    with pytest.raises(AttributeError):
++        raw._hash_value
++    t._hash_key = ("k",)
++    t._hash_value = 9
++    c = t.copy()
++    assert c._hash_key == ("k",) and c._hash_value == 9 and c == t
++    del t._hash_key
++    with pytest.raises(AttributeError):
++        t._hash_key
++
++
++def test_task_keyword_constructor():
++    t = CTaskSub(extra=1)
++    assert t.extra == 1 and t._hash_key is None
++    with pytest.raises(TypeError):
++        CTaskSub(nosuch=1)
++
++
++def test_task_compare_matches_python():
++    py = make_tasks(PyTask, PyTaskSub)
++    c = make_tasks(CTask, CTaskSub)
++    assert len(py) == len(c)
++    for (i, a_py), (j, b_py) in itertools.product(enumerate(py), repeat=2):
++        a_c, b_c = c[i], c[j]
++        for name, op in (("eq", lambda x, y: x == y), ("ne", lambda x, y: x != y)):
++            expected = outcome(lambda: op(a_py, b_py))
++            got = outcome(lambda: op(a_c, b_c))
++            assert got == expected, (name, i, j, got, expected)
++    for i, a_py in enumerate(py):
++        a_c = c[i]
++        for k, other in enumerate(FOREIGN):
++            for name, op in (
++                ("eq", lambda x, y: x == y),
++                ("ne", lambda x, y: x != y),
++                ("req", lambda x, y: y == x),
++                ("rne", lambda x, y: y != x),
++                ("dunder_eq", lambda x, y: x.__eq__(y)),
++                ("dunder_ne", lambda x, y: x.__ne__(y)),
++            ):
++                expected = outcome(lambda: op(a_py, other))
++                got = outcome(lambda: op(a_c, other))
++                assert got == expected, (name, i, k, got, expected)
++        for name in ("__lt__", "__le__", "__gt__", "__ge__"):
++            if isinstance(a_py, PyTaskSub) and name == "__lt__":
++                continue
++            assert outcome(lambda: getattr(a_c, name)(a_c)) == outcome(
++                lambda: getattr(a_py, name)(a_py)
++            )
++
++
++def test_task_hash_matches_python():
++    py = make_tasks(PyTask, PyTaskSub)
++    c = make_tasks(CTask, CTaskSub)
++    for a_py, a_c in zip(py, c):
++        assert outcome(lambda: hash(a_c)) == outcome(lambda: hash(a_py))
++    for bad in ("text", 1.5, None):
++        t_py, t_c = PyTask(), CTask()
++        t_py._hash_value = t_c._hash_value = bad
++        assert outcome(lambda: hash(t_c)) == outcome(lambda: hash(t_py))
++
++
++def test_task_set_and_dict_order_matches_python():
++    def build(cls):
++        tasks = []
++        for n in range(2000):
++            t = cls()
++            t._hash_key = ("ebuild", "/", f"cat-{n % 37}/pkg-{n}-{n % 7}", "merge", "repo")
++            t._hash_value = hash(t._hash_key)
++            tasks.append(t)
++        return tasks
++
++    py, c = build(PyTask), build(CTask)
++    assert [t._hash_key for t in set(py)] == [t._hash_key for t in set(c)]
++    assert [t._hash_key for t in set(py[::3]) | set(py[::5])] == [
++        t._hash_key for t in set(c[::3]) | set(c[::5])
++    ]
++    d = {t: n for n, t in enumerate(c)}
++    # lookup by the bare key tuple, as depgraph._pkg() does
++    assert all(d[t._hash_key] == n for n, t in enumerate(c))
++    assert all(t._hash_key in d for t in c)
++
++
++ATOM_STRINGS = ["dev-libs/foo", "dev-libs/foo", ">=dev-libs/foo-1:0=", "", "ż/ó"]
++
++
++def make_atoms(cls):
++    atoms = []
++    for s in ATOM_STRINGS:
++        a = object.__new__(cls)
++        a._string = s
++        atoms.append(a)
++    unset = object.__new__(cls)
++    nonstr = object.__new__(cls)
++    nonstr._string = ("not", "a", "string")
++    unhashable = object.__new__(cls)
++    unhashable._string = ["list"]
++    return atoms + [unset, nonstr, unhashable]
++
++
++class StrSub(str):
++    pass
++
++
++ATOM_FOREIGN = ["dev-libs/foo", StrSub("dev-libs/foo"), "", b"dev-libs/foo", 1, None, object()]
++
++
++def test_atom_matches_python():
++    py, c = make_atoms(PyAtom), make_atoms(CAtom)
++    ops = (
++        ("eq", lambda x, y: x == y),
++        ("ne", lambda x, y: x != y),
++        ("req", lambda x, y: y == x),
++        ("rne", lambda x, y: y != x),
++        ("dunder_eq", lambda x, y: x.__eq__(y)),
++        ("dunder_ne", lambda x, y: x.__ne__(y)),
++        ("dunder_lt", lambda x, y: x.__lt__(y)),
++    )
++    for (i, a_py), (j, b_py) in itertools.product(enumerate(py), repeat=2):
++        for name, op in ops:
++            expected = outcome(lambda: op(a_py, b_py))
++            got = outcome(lambda: op(c[i], c[j]))
++            assert got == expected, (name, i, j, got, expected)
++    for i, a_py in enumerate(py):
++        for k, other in enumerate(ATOM_FOREIGN):
++            for name, op in ops:
++                expected = outcome(lambda: op(a_py, other))
++                got = outcome(lambda: op(c[i], other))
++                assert got == expected, (name, i, k, got, expected)
++        assert outcome(lambda: hash(c[i])) == outcome(lambda: hash(a_py))
++
++
++def test_atom_field():
++    a = object.__new__(CAtom)
++    assert getattr(a, "_string", None) is None
++    a._string = "x/y"
++    assert a._string == "x/y" and hash(a) == hash("x/y")
++    assert {a: 1}["x/y"] == 1  # a str finds an Atom key and the reverse
++    assert a in {"x/y"}
++
++
++def test_real_classes_use_the_c_bases():
++    from _emerge.Blocker import Blocker
++    from _emerge.Package import Package
++    from _emerge.Task import Task
++    from portage.dep import Atom
++
++    assert issubclass(Task, _hashbase.TaskBase)
++    assert issubclass(Atom, _hashbase.AtomBase)
++    for cls in (Task, Package, Blocker):
++        assert cls.__hash__ is _hashbase.TaskBase.__hash__
++        assert "__eq__" not in cls.__dict__
++    assert "_string" not in Atom.__slots__
++    a = Atom("dev-libs/foo")
++    assert a == "dev-libs/foo" and a == Atom("dev-libs/foo") and a != Atom("dev-libs/bar")
++    assert hash(a) == hash("dev-libs/foo")
++    b = Blocker(atom=Atom("!dev-libs/foo"), eapi="8", root="/")
++    assert b == ("blocks", "/", Atom("!dev-libs/foo"), "8")
++    assert hash(b) == hash(("blocks", "/", Atom("!dev-libs/foo"), "8"))
+diff -ruN a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -20,6 +20,42 @@
+     check : true
+ )
+ 
++hashbase_ext = py.extension_module(
++    '_hashbase',
++    'portage_util__hashbase.c',
++    dependencies : py.dependency(),
++    subdir : 'portage' / 'util',
++    install : true
++)
++
++run_command(
++    [
++        'ln', '-srnf',
++        hashbase_ext.full_path(),
++        meson.project_source_root() / 'lib' / 'portage' / 'util/'
++    ],
++    capture : false,
++    check : true
++)
++
++cfast_ext = py.extension_module(
++    '_cfast',
++    'portage_util__cfast.c',
++    dependencies : py.dependency(),
++    subdir : 'portage' / 'util',
++    install : true
++)
++
++run_command(
++    [
++        'ln', '-srnf',
++        cfast_ext.full_path(),
++        meson.project_source_root() / 'lib' / 'portage' / 'util/'
++    ],
++    capture : false,
++    check : true
++)
++
+ dep_parser_ext = py.extension_module(
+     '_parser',
+     'dep_parser_core.c',
+@@ -40,7 +76,7 @@
+     check : true
+ )
+ 
+-foreach mod : ['portage.util._whirlpool', 'portage.dep._parser']
++foreach mod : ['portage.util._whirlpool', 'portage.util._hashbase', 'portage.util._cfast', 'portage.dep._parser']
+     test(
+         'import ' + mod,
+         py,
+diff -ruN a/src/portage_util__cfast.c b/src/portage_util__cfast.c
+--- a/src/portage_util__cfast.c
++++ b/src/portage_util__cfast.c
+@@ -0,0 +1,427 @@
++/* Copyright 2026 Gentoo Authors
++ * Distributed under the terms of the GNU General Public License v2
++ *
++ * Two hot paths of the dependency resolver that are plain data work:
++ *
++ *   SlotDictBase   base of portage.cache.mappings._SlotDict: __getitem__ and
++ *                  get() without a Python frame, plus a "hooked" __getitem__
++ *                  for _emerge.Package._PackageMetadataWrapper (about a
++ *                  million metadata lookups per dependency calculation).
++ *   convert()      turns the tree returned by portage.dep._parser.parse()
++ *                  into lists of portage.dep.Atom, taking remembered atoms
++ *                  straight from the memo dict (_c_convert_result and
++ *                  _c_flatten_result of portage/dep/__init__.py).
++ *
++ * Whatever is not the common case is handed to the Python code that these
++ * replace, which stays in place as the fallback for builds without native
++ * extensions and as the reference of
++ * lib/portage/tests/util/test_cfast.py.
++ */
++
++#define PY_SSIZE_T_CLEAN
++#include <Python.h>
++
++static PyObject *str_c_keymap = NULL;		/* "_c_keymap" */
++static PyObject *str_c_slow_keys = NULL;	/* "_c_slow_keys" */
++static PyObject *str_py_raw_getitem = NULL;	/* "_py_raw_getitem" */
++static PyObject *str_py_getitem = NULL;		/* "_py_getitem" */
++static PyObject *str_use = NULL;		/* "_use" */
++static PyObject *str_conditional = NULL;	/* "conditional" */
++static PyObject *keymap_builder = NULL;		/* set by set_keymap_builder() */
++
++/* ------------------------------------------------------------------ */
++/* SlotDictBase                                                         */
++
++/* The class's {key: slot descriptor} dict, a new reference. It lives in the
++ * class's own __dict__ as _c_keymap; the Python builder makes it on first
++ * use (portage.cache.mappings._build_c_keymap). */
++static PyObject *
++slotdict_keymap(PyTypeObject *tp)
++{
++	PyObject *dict, *map;
++
++	dict = PyType_GetDict(tp);
++	if (dict == NULL)
++		return NULL;
++	map = PyDict_GetItemWithError(dict, str_c_keymap);
++	Py_XINCREF(map);
++	Py_DECREF(dict);
++	if (map != NULL)
++		return map;
++	if (PyErr_Occurred())
++		return NULL;
++	if (keymap_builder == NULL) {
++		PyErr_SetString(PyExc_RuntimeError,
++			"portage.util._cfast: no keymap builder registered");
++		return NULL;
++	}
++	map = PyObject_CallOneArg(keymap_builder, (PyObject *)tp);
++	if (map != NULL && !PyDict_Check(map)) {
++		Py_DECREF(map);
++		PyErr_SetString(PyExc_TypeError, "keymap builder must return a dict");
++		return NULL;
++	}
++	return map;
++}
++
++/*  def __getitem__(self, k):
++ *      try:
++ *          return getattr(self, self._prefix + k)
++ *      except AttributeError:
++ *          raise KeyError(k)
++ *
++ * Fast path: k is exactly a str and names an ordinary slot of the class.
++ * Everything else is answered by the Python body (_py_raw_getitem).
++ * With quiet set, an unset slot returns NULL with *missing = 1 and no
++ * exception. */
++static PyObject *
++slotdict_lookup(PyObject *self, PyObject *k, int quiet, int *missing)
++{
++	PyObject *map, *descr, *value;
++	descrgetfunc get;
++
++	if (PyUnicode_CheckExact(k)) {
++		map = slotdict_keymap(Py_TYPE(self));
++		if (map == NULL)
++			return NULL;
++		descr = PyDict_GetItemWithError(map, k);
++		Py_XINCREF(descr);
++		Py_DECREF(map);
++		if (descr != NULL) {
++			get = Py_TYPE(descr)->tp_descr_get;
++			if (get == NULL) {
++				Py_DECREF(descr);
++				PyErr_SetString(PyExc_TypeError,
++					"_c_keymap value is not a descriptor");
++				return NULL;
++			}
++			value = get(descr, self, (PyObject *)Py_TYPE(self));
++			Py_DECREF(descr);
++			if (value == NULL && PyErr_ExceptionMatches(PyExc_AttributeError)) {
++				PyErr_Clear();
++				if (quiet)
++					*missing = 1;
++				else
++					PyErr_SetObject(PyExc_KeyError, k);
++			}
++			return value;
++		}
++		if (PyErr_Occurred())
++			return NULL;
++	}
++	return PyObject_CallMethodOneArg(self, str_py_raw_getitem, k);
++}
++
++static PyObject *
++slotdict_subscript(PyObject *self, PyObject *k)
++{
++	return slotdict_lookup(self, k, 0, NULL);
++}
++
++/* The __getitem__ of a subclass that treats some keys specially: a key in
++ * the class's _c_slow_keys goes to the subclass's Python method
++ * _py_getitem, any other key is a plain lookup. */
++static PyObject *
++slotdict_getitem_hooked(PyObject *self, PyObject *k)
++{
++	PyObject *slow;
++	int is_slow;
++
++	slow = PyObject_GetAttr((PyObject *)Py_TYPE(self), str_c_slow_keys);
++	if (slow == NULL)
++		return NULL;
++	is_slow = PySequence_Contains(slow, k);
++	Py_DECREF(slow);
++	if (is_slow < 0)
++		return NULL;
++	if (is_slow)
++		return PyObject_CallMethodOneArg(self, str_py_getitem, k);
++	return slotdict_lookup(self, k, 0, NULL);
++}
++
++/*  def get(self, key, default=None):
++ *      try:
++ *          return self[key]
++ *      except KeyError:
++ *          return default
++ */
++static PyObject *
++slotdict_get(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
++{
++	PyObject *key, *fallback = Py_None, *value;
++	PyMappingMethods *mapping = Py_TYPE(self)->tp_as_mapping;
++	int missing = 0;
++
++	if (nargs < 1 || nargs > 2) {
++		PyErr_Format(PyExc_TypeError,
++			"get expected 1 or 2 arguments, got %zd", nargs);
++		return NULL;
++	}
++	key = args[0];
++	if (nargs == 2)
++		fallback = args[1];
++
++	if (mapping != NULL && mapping->mp_subscript == slotdict_subscript)
++		value = slotdict_lookup(self, key, 1, &missing);
++	else
++		value = PyObject_GetItem(self, key);	/* an overriding __getitem__ */
++	if (value != NULL)
++		return value;
++	if (!missing) {
++		if (!PyErr_ExceptionMatches(PyExc_KeyError))
++			return NULL;
++		PyErr_Clear();
++	}
++	return Py_NewRef(fallback);
++}
++
++static PyMethodDef slotdict_methods[] = {
++	{"get", (PyCFunction)(void (*)(void))slotdict_get, METH_FASTCALL,
++	 "get(key, default=None): self[key], or default if the key is unset"},
++	{"_c_getitem_hooked", slotdict_getitem_hooked, METH_O,
++	 "__getitem__ for a subclass with _c_slow_keys and _py_getitem"},
++	{NULL}
++};
++
++static PyType_Slot slotdict_slots[] = {
++	{Py_mp_subscript, slotdict_subscript},
++	{Py_tp_methods, slotdict_methods},
++	{0, NULL}
++};
++
++static PyType_Spec slotdict_spec = {
++	.name = "portage.util._cfast.SlotDictBase",
++	.basicsize = sizeof(PyObject),
++	.flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
++	.slots = slotdict_slots,
++};
++
++static PyObject *
++cfast_set_keymap_builder(PyObject *Py_UNUSED(module), PyObject *func)
++{
++	if (!PyCallable_Check(func)) {
++		PyErr_SetString(PyExc_TypeError, "expected a callable");
++		return NULL;
++	}
++	Py_XSETREF(keymap_builder, Py_NewRef(func));
++	Py_RETURN_NONE;
++}
++
++/* ------------------------------------------------------------------ */
++/* convert()                                                            */
++
++typedef struct {
++	PyObject *memo;		/* {(token string, eapi): Atom} */
++	PyObject *slow;		/* _c_atom_from_c */
++	PyObject *eapi;
++	PyObject *eapi_attrs;
++	PyObject *uselist;
++	PyObject *matchall;
++	int matchall_true;
++} convert_ctx;
++
++/* _c_atom_from_c(catom, eapi, eapi_attrs, uselist, matchall) for a token
++ * whose Atom is remembered and needs no USE evaluation; the Python function
++ * for every other token. Returns a new reference. */
++static PyObject *
++convert_atom(PyObject *catom, convert_ctx *ctx)
++{
++	PyObject *token, *key, *atom, *use, *conditional;
++	int truth;
++
++	token = PyObject_Str(catom);
++	if (token == NULL)
++		return NULL;
++	key = PyTuple_Pack(2, token, ctx->eapi);
++	Py_DECREF(token);
++	if (key == NULL)
++		return NULL;
++	atom = PyDict_GetItemWithError(ctx->memo, key);
++	Py_XINCREF(atom);
++	Py_DECREF(key);
++	if (atom == NULL && PyErr_Occurred())
++		return NULL;
++
++	if (atom != NULL && atom != Py_None) {
++		if (ctx->matchall_true)
++			return atom;
++		use = PyObject_GetAttr(atom, str_use);
++		if (use == NULL) {
++			Py_DECREF(atom);
++			return NULL;
++		}
++		if (use == Py_None) {
++			Py_DECREF(use);
++			return atom;
++		}
++		conditional = PyObject_GetAttr(use, str_conditional);
++		Py_DECREF(use);
++		if (conditional == NULL) {
++			Py_DECREF(atom);
++			return NULL;
++		}
++		truth = PyObject_IsTrue(conditional);
++		Py_DECREF(conditional);
++		if (truth < 0) {
++			Py_DECREF(atom);
++			return NULL;
++		}
++		if (!truth)
++			return atom;
++	}
++	Py_XDECREF(atom);
++	return PyObject_CallFunctionObjArgs(ctx->slow, catom, ctx->eapi,
++		ctx->eapi_attrs, ctx->uselist, ctx->matchall, NULL);
++}
++
++/* Append the conversion of items to out: nested lists stay nested
++ * (_c_convert_result) or are spliced in (flat, _c_flatten_result). */
++static int
++convert_into(PyObject *items, PyObject *out, int flat, convert_ctx *ctx)
++{
++	Py_ssize_t i;
++	PyObject *item, *converted;
++	int rc;
++
++	if (Py_EnterRecursiveCall(" while converting a dependency string"))
++		return -1;
++	/* the list can change while Python code runs: re-read its size */
++	for (i = 0; i < PyList_GET_SIZE(items); i++) {
++		item = Py_NewRef(PyList_GET_ITEM(items, i));
++		if (PyUnicode_Check(item)) {
++			rc = PyList_Append(out, item);
++		}
++		else if (PyList_Check(item)) {
++			if (flat) {
++				rc = convert_into(item, out, 1, ctx);
++			}
++			else {
++				converted = PyList_New(0);
++				rc = -1;
++				if (converted != NULL) {
++					rc = convert_into(item, converted, 0, ctx);
++					if (rc == 0)
++						rc = PyList_Append(out, converted);
++					Py_DECREF(converted);
++				}
++			}
++		}
++		else {
++			converted = convert_atom(item, ctx);
++			rc = -1;
++			if (converted != NULL) {
++				rc = PyList_Append(out, converted);
++				Py_DECREF(converted);
++			}
++		}
++		Py_DECREF(item);
++		if (rc < 0) {
++			Py_LeaveRecursiveCall();
++			return -1;
++		}
++	}
++	Py_LeaveRecursiveCall();
++	return 0;
++}
++
++static PyObject *
++cfast_convert(PyObject *Py_UNUSED(module), PyObject *const *args, Py_ssize_t nargs)
++{
++	convert_ctx ctx;
++	PyObject *raw, *out;
++	int flat;
++
++	if (nargs != 8) {
++		PyErr_Format(PyExc_TypeError,
++			"convert expected 8 arguments, got %zd", nargs);
++		return NULL;
++	}
++	raw = args[0];
++	if (!PyList_Check(raw)) {
++		PyErr_SetString(PyExc_TypeError, "convert: the parse tree must be a list");
++		return NULL;
++	}
++	flat = PyObject_IsTrue(args[1]);
++	if (flat < 0)
++		return NULL;
++	ctx.memo = args[2];
++	if (!PyDict_Check(ctx.memo)) {
++		PyErr_SetString(PyExc_TypeError, "convert: the memo must be a dict");
++		return NULL;
++	}
++	ctx.slow = args[3];
++	ctx.eapi = args[4];
++	ctx.eapi_attrs = args[5];
++	ctx.uselist = args[6];
++	ctx.matchall = args[7];
++	ctx.matchall_true = PyObject_IsTrue(ctx.matchall);
++	if (ctx.matchall_true < 0)
++		return NULL;
++
++	out = PyList_New(0);
++	if (out == NULL)
++		return NULL;
++	if (convert_into(raw, out, flat, &ctx) < 0) {
++		Py_DECREF(out);
++		return NULL;
++	}
++	return out;
++}
++
++/* ------------------------------------------------------------------ */
++/* module                                                               */
++
++static PyMethodDef cfast_functions[] = {
++	{"set_keymap_builder", cfast_set_keymap_builder, METH_O,
++	 "set_keymap_builder(func): func(cls) makes and returns cls._c_keymap"},
++	{"convert", (PyCFunction)(void (*)(void))cfast_convert, METH_FASTCALL,
++	 "convert(raw, flat, memo, slow, eapi, eapi_attrs, uselist, matchall)\n"
++	 "The parse tree raw with every parser atom replaced by its Atom."},
++	{NULL}
++};
++
++static struct PyModuleDef cfast_module = {
++	PyModuleDef_HEAD_INIT,
++	.m_name = "_cfast",
++	.m_doc = "C fast paths of the dependency resolver",
++	.m_size = -1,
++	.m_methods = cfast_functions,
++};
++
++PyMODINIT_FUNC
++PyInit__cfast(void)
++{
++	PyObject *m, *type;
++
++	m = PyModule_Create(&cfast_module);
++	if (m == NULL)
++		return NULL;
++
++#define INTERN(var, text) \
++	do { \
++		var = PyUnicode_InternFromString(text); \
++		if (var == NULL) \
++			goto fail; \
++	} while (0)
++	INTERN(str_c_keymap, "_c_keymap");
++	INTERN(str_c_slow_keys, "_c_slow_keys");
++	INTERN(str_py_raw_getitem, "_py_raw_getitem");
++	INTERN(str_py_getitem, "_py_getitem");
++	INTERN(str_use, "_use");
++	INTERN(str_conditional, "conditional");
++#undef INTERN
++
++	type = PyType_FromSpec(&slotdict_spec);
++	if (type == NULL)
++		goto fail;
++	if (PyModule_AddObjectRef(m, "SlotDictBase", type) < 0) {
++		Py_DECREF(type);
++		goto fail;
++	}
++	Py_DECREF(type);
++	return m;
++
++fail:
++	Py_DECREF(m);
++	return NULL;
++}
+diff -ruN a/src/portage_util__hashbase.c b/src/portage_util__hashbase.c
+--- a/src/portage_util__hashbase.c
++++ b/src/portage_util__hashbase.c
+@@ -0,0 +1,379 @@
++/* Copyright 2026 Gentoo Authors
++ * Distributed under the terms of the GNU General Public License v2
++ *
++ * C base types that carry the hash and equality of two resolver classes,
++ * so that dict and set operations on them do not call back into Python:
++ *
++ *   TaskBase  base of _emerge.Task (Package, Blocker): hashes by the stored
++ *             _hash_value and compares by _hash_key.
++ *   AtomBase  base of portage.dep.Atom: hashes and compares by _string.
++ *
++ * Both reproduce the Python methods they replace exactly, including which
++ * exception is raised when a field is unset and what is returned for a
++ * foreign operand. The Python bodies stay in Task.py and dep/__init__.py as
++ * the fallback for builds without native extensions, and are the reference:
++ * lib/portage/tests/util/test_hashbase.py compares the two.
++ */
++
++#define PY_SSIZE_T_CLEAN
++#include <Python.h>
++#include <stddef.h>
++
++static PyTypeObject *TaskBase_Type = NULL;
++static PyTypeObject *AtomBase_Type = NULL;
++static PyObject *str_hash_key = NULL;	/* interned "_hash_key" */
++
++/* ------------------------------------------------------------------ */
++/* shared helpers                                                       */
++
++static int
++unset_attribute(PyObject *self, const char *name)
++{
++	PyErr_Format(PyExc_AttributeError,
++		"'%.100s' object has no attribute '%s'",
++		Py_TYPE(self)->tp_name, name);
++	return -1;
++}
++
++static void
++base_dealloc_finish(PyObject *self)
++{
++	PyTypeObject *tp = Py_TYPE(self);
++	tp->tp_free(self);
++	Py_DECREF(tp);
++}
++
++/* ------------------------------------------------------------------ */
++/* TaskBase                                                             */
++
++typedef struct {
++	PyObject_HEAD
++	PyObject *hash_key;
++	PyObject *hash_value;
++} TaskBaseObject;
++
++static int
++taskbase_traverse(PyObject *op, visitproc visit, void *arg)
++{
++	TaskBaseObject *self = (TaskBaseObject *)op;
++	Py_VISIT(Py_TYPE(op));
++	Py_VISIT(self->hash_key);
++	Py_VISIT(self->hash_value);
++	return 0;
++}
++
++static int
++taskbase_clear(PyObject *op)
++{
++	TaskBaseObject *self = (TaskBaseObject *)op;
++	Py_CLEAR(self->hash_key);
++	Py_CLEAR(self->hash_value);
++	return 0;
++}
++
++static void
++taskbase_dealloc(PyObject *op)
++{
++	PyObject_GC_UnTrack(op);
++	(void)taskbase_clear(op);
++	base_dealloc_finish(op);
++}
++
++/* def __hash__(self): return self._hash_value
++ * followed by what CPython does with the result of a Python-level
++ * __hash__ (slot_tp_hash in Objects/typeobject.c). */
++static Py_hash_t
++taskbase_hash(PyObject *op)
++{
++	PyObject *value = ((TaskBaseObject *)op)->hash_value;
++	Py_hash_t h;
++
++	if (value == NULL)
++		return unset_attribute(op, "_hash_value");
++	if (!PyLong_Check(value)) {
++		PyErr_SetString(PyExc_TypeError,
++			"__hash__ method should return an integer");
++		return -1;
++	}
++	h = PyLong_AsSsize_t(value);
++	if (h == -1 && PyErr_Occurred()) {
++		PyErr_Clear();
++		h = PyLong_Type.tp_hash(value);
++	}
++	if (h == -1)
++		h = -2;
++	return h;
++}
++
++/* The key the other operand compares by: a new reference, or NULL with
++ * AttributeError (or another exception) set, as other._hash_key does. */
++static PyObject *
++task_other_key(PyObject *other)
++{
++	if (PyObject_TypeCheck(other, TaskBase_Type)) {
++		PyObject *key = ((TaskBaseObject *)other)->hash_key;
++		if (key == NULL) {
++			(void)unset_attribute(other, "_hash_key");
++			return NULL;
++		}
++		return Py_NewRef(key);
++	}
++	return PyObject_GetAttr(other, str_hash_key);
++}
++
++/*  def __eq__(self, other):
++ *      try:
++ *          return self._hash_key == other._hash_key
++ *      except AttributeError:
++ *          return self._hash_key == other
++ *
++ *  def __ne__(self, other):
++ *      try:
++ *          return self._hash_key != other._hash_key
++ *      except AttributeError:
++ *          return True
++ */
++static PyObject *
++taskbase_richcompare(PyObject *op, PyObject *other, int cmp)
++{
++	PyObject *key = ((TaskBaseObject *)op)->hash_key;
++	PyObject *other_key, *res;
++
++	if (cmp != Py_EQ && cmp != Py_NE)
++		Py_RETURN_NOTIMPLEMENTED;
++
++	if (key != NULL) {
++		other_key = task_other_key(other);
++		if (other_key != NULL) {
++			/* op may be released by the comparison */
++			Py_INCREF(key);
++			res = PyObject_RichCompare(key, other_key, cmp);
++			Py_DECREF(key);
++			Py_DECREF(other_key);
++			if (res != NULL)
++				return res;
++		}
++		if (!PyErr_ExceptionMatches(PyExc_AttributeError))
++			return NULL;
++		PyErr_Clear();
++	}
++
++	/* the "except AttributeError" branch */
++	if (cmp == Py_NE)
++		Py_RETURN_TRUE;
++	key = ((TaskBaseObject *)op)->hash_key;
++	if (key == NULL) {
++		(void)unset_attribute(op, "_hash_key");
++		return NULL;
++	}
++	Py_INCREF(key);
++	res = PyObject_RichCompare(key, other, Py_EQ);
++	Py_DECREF(key);
++	return res;
++}
++
++static PyMemberDef taskbase_members[] = {
++	{"_hash_key", Py_T_OBJECT_EX, offsetof(TaskBaseObject, hash_key), 0, NULL},
++	{"_hash_value", Py_T_OBJECT_EX, offsetof(TaskBaseObject, hash_value), 0, NULL},
++	{NULL}
++};
++
++static PyType_Slot taskbase_slots[] = {
++	{Py_tp_dealloc, taskbase_dealloc},
++	{Py_tp_traverse, taskbase_traverse},
++	{Py_tp_clear, taskbase_clear},
++	{Py_tp_hash, taskbase_hash},
++	{Py_tp_richcompare, taskbase_richcompare},
++	{Py_tp_members, taskbase_members},
++	{0, NULL}
++};
++
++static PyType_Spec taskbase_spec = {
++	.name = "portage.util._hashbase.TaskBase",
++	.basicsize = sizeof(TaskBaseObject),
++	.flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,
++	.slots = taskbase_slots,
++};
++
++/* ------------------------------------------------------------------ */
++/* AtomBase                                                             */
++
++typedef struct {
++	PyObject_HEAD
++	PyObject *string;
++} AtomBaseObject;
++
++static int
++atombase_traverse(PyObject *op, visitproc visit, void *arg)
++{
++	Py_VISIT(Py_TYPE(op));
++	Py_VISIT(((AtomBaseObject *)op)->string);
++	return 0;
++}
++
++static int
++atombase_clear(PyObject *op)
++{
++	Py_CLEAR(((AtomBaseObject *)op)->string);
++	return 0;
++}
++
++static void
++atombase_dealloc(PyObject *op)
++{
++	PyObject_GC_UnTrack(op);
++	(void)atombase_clear(op);
++	base_dealloc_finish(op);
++}
++
++/* def __hash__(self) -> int: return hash(self._string) */
++static Py_hash_t
++atombase_hash(PyObject *op)
++{
++	PyObject *string = ((AtomBaseObject *)op)->string;
++	Py_hash_t h;
++
++	if (string == NULL)
++		return unset_attribute(op, "_string");
++	Py_INCREF(string);
++	h = PyObject_Hash(string);
++	Py_DECREF(string);
++	return h;
++}
++
++/*  def __eq__(self, value):
++ *      if isinstance(value, Atom):
++ *          return self._string == value._string
++ *      if isinstance(value, str):
++ *          return self._string == value
++ *      return super().__eq__(value)      # object.__eq__: NotImplemented,
++ *                                        # an identical operand is an Atom
++ *  __ne__ is not defined, so it is object's: the inverse of __eq__ unless
++ *  that returns NotImplemented.
++ */
++static PyObject *
++atombase_eq(PyObject *op, PyObject *other)
++{
++	PyObject *string, *other_string, *res;
++	int other_is_atom = PyObject_TypeCheck(other, AtomBase_Type);
++
++	if (!other_is_atom && !PyUnicode_Check(other))
++		Py_RETURN_NOTIMPLEMENTED;
++
++	string = ((AtomBaseObject *)op)->string;
++	if (string == NULL) {
++		(void)unset_attribute(op, "_string");
++		return NULL;
++	}
++	if (other_is_atom) {
++		other_string = ((AtomBaseObject *)other)->string;
++		if (other_string == NULL) {
++			(void)unset_attribute(other, "_string");
++			return NULL;
++		}
++	}
++	else {
++		other_string = other;
++	}
++	Py_INCREF(string);
++	Py_INCREF(other_string);
++	res = PyObject_RichCompare(string, other_string, Py_EQ);
++	Py_DECREF(string);
++	Py_DECREF(other_string);
++	return res;
++}
++
++static PyObject *
++atombase_richcompare(PyObject *op, PyObject *other, int cmp)
++{
++	PyObject *res;
++	int truth;
++
++	if (cmp == Py_EQ)
++		return atombase_eq(op, other);
++	if (cmp != Py_NE)
++		Py_RETURN_NOTIMPLEMENTED;
++
++	res = atombase_eq(op, other);
++	if (res == NULL || res == Py_NotImplemented)
++		return res;
++	truth = PyObject_IsTrue(res);
++	Py_DECREF(res);
++	if (truth < 0)
++		return NULL;
++	return PyBool_FromLong(!truth);
++}
++
++static PyMemberDef atombase_members[] = {
++	{"_string", Py_T_OBJECT_EX, offsetof(AtomBaseObject, string), 0, NULL},
++	{NULL}
++};
++
++static PyType_Slot atombase_slots[] = {
++	{Py_tp_dealloc, atombase_dealloc},
++	{Py_tp_traverse, atombase_traverse},
++	{Py_tp_clear, atombase_clear},
++	{Py_tp_hash, atombase_hash},
++	{Py_tp_richcompare, atombase_richcompare},
++	{Py_tp_members, atombase_members},
++	{0, NULL}
++};
++
++static PyType_Spec atombase_spec = {
++	.name = "portage.util._hashbase.AtomBase",
++	.basicsize = sizeof(AtomBaseObject),
++	.flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,
++	.slots = atombase_slots,
++};
++
++/* ------------------------------------------------------------------ */
++/* module                                                               */
++
++static struct PyModuleDef hashbase_module = {
++	PyModuleDef_HEAD_INIT,
++	.m_name = "_hashbase",
++	.m_doc = "C base types with the hash and equality of Task and Atom",
++	.m_size = -1,
++};
++
++PyMODINIT_FUNC
++PyInit__hashbase(void)
++{
++	PyObject *m, *slots;
++
++	m = PyModule_Create(&hashbase_module);
++	if (m == NULL)
++		return NULL;
++
++	str_hash_key = PyUnicode_InternFromString("_hash_key");
++	if (str_hash_key == NULL)
++		goto fail;
++
++	TaskBase_Type = (PyTypeObject *)PyType_FromSpec(&taskbase_spec);
++	if (TaskBase_Type == NULL)
++		goto fail;
++	/* SlotObject.__init__ and SlotObject.copy() walk __slots__ of every
++	 * base class: name the two fields there as Task.__slots__ did. */
++	slots = Py_BuildValue("(ss)", "_hash_key", "_hash_value");
++	if (slots == NULL)
++		goto fail;
++	if (PyObject_SetAttrString((PyObject *)TaskBase_Type, "__slots__", slots) < 0) {
++		Py_DECREF(slots);
++		goto fail;
++	}
++	Py_DECREF(slots);
++	if (PyModule_AddObjectRef(m, "TaskBase", (PyObject *)TaskBase_Type) < 0)
++		goto fail;
++
++	AtomBase_Type = (PyTypeObject *)PyType_FromSpec(&atombase_spec);
++	if (AtomBase_Type == NULL)
++		goto fail;
++	if (PyModule_AddObjectRef(m, "AtomBase", (PyObject *)AtomBase_Type) < 0)
++		goto fail;
++
++	return m;
++
++fail:
++	Py_DECREF(m);
++	return NULL;
++}

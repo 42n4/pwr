@@ -22,6 +22,9 @@ HOMEPAGE="https://wiki.gentoo.org/wiki/Project:Portage"
 # -r1: C base types for the hash and equality of Task (Package, Blocker) and
 # Atom (portage.util._hashbase, built with USE=native-extensions; the Python
 # methods stay as the fallback). Same plans; emptytree resolve about 3 % faster.
+# -r2: portage.util._cfast: slot dict lookups (package metadata) and the
+# conversion of the C parser's result to Atoms; about 1.6 % more. Both modules
+# are optional: without their .so files the Python code runs as before.
 MY_P="${PN}-3.0.83"
 SRC_URI="https://gitweb.gentoo.org/proj/portage.git/snapshot/${MY_P}.tar.bz2"
 S="${WORKDIR}/${MY_P}"
@@ -103,7 +106,7 @@ PDEPEND="
 PATCHES=(
 	"${FILESDIR}"/0001-bintree-provide-an-empty-default-for-USER_PATCHES.patch
 	"${FILESDIR}"/portage-3.0.83-emerge-fast-resolver.patch
-	"${FILESDIR}"/portage-3.0.83-hashbase-c.patch
+	"${FILESDIR}"/portage-3.0.83-native-fastpaths.patch
 )
 
 pkg_pretend() {
