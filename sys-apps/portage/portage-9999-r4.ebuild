@@ -29,6 +29,9 @@ HOMEPAGE="https://wiki.gentoo.org/wiki/Project:Portage"
 # Package, the comparisons of the dependency priorities and cmp_sort_key;
 # about 1.6 % more. (Atom matching was ported too and measured SLOWER than
 # the Python it replaced, so it is not here.)
+# -r4: three string functions: the _pkg_str constructor, vercmp and
+# catpkgsplit (plain ASCII input; the Python functions for the rest). By
+# instruction count 1.4 % less on an emptytree resolve, 3.1 % on a world update.
 MY_P="${PN}-3.0.83"
 SRC_URI="https://gitweb.gentoo.org/proj/portage.git/snapshot/${MY_P}.tar.bz2"
 S="${WORKDIR}/${MY_P}"

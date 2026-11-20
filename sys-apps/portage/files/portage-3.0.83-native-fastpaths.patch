@@ -476,7 +476,7 @@ diff -ruN a/lib/portage/tests/util/meson.build b/lib/portage/tests/util/meson.bu
 diff -ruN a/lib/portage/tests/util/test_cfast.py b/lib/portage/tests/util/test_cfast.py
 --- a/lib/portage/tests/util/test_cfast.py
 +++ b/lib/portage/tests/util/test_cfast.py
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,403 @@
 +# Copyright 2026 Gentoo Authors
 +# Distributed under the terms of the GNU General Public License v2
 +
@@ -774,6 +774,112 @@ diff -ruN a/lib/portage/tests/util/test_cfast.py b/lib/portage/tests/util/test_c
 +    assert _cfast.convert([t], False, {("tok", "8"): marker}, boom, "8", None, (), 1) == [
 +        marker
 +    ]
++
++
++# ---- vercmp, catpkgsplit, _pkg_str -----------------------------------------
++# The heavy differential runs are qagent/emerge-fast/corpus-vercmp.py and
++# corpus-split.py (every version and cpv of a repository); these are the
++# cases that pin the corners.
++
++from portage import versions  # noqa: E402
++
++VERSIONS = [
++    "0", "1", "01", "1.0", "1.00", "1.01", "1.1", "1.10", "1.9", "1.0.0", "1.0.1",
++    "1a", "1z", "1.0a", "1_p", "1_p0", "1_p1", "1_pre", "1_pre1", "1_rc1", "1_alpha",
++    "1_beta2", "1_p1_p2", "1_rc1_p1", "1.0-r0", "1.0-r1", "1.0-r01", "1.0_p1-r2",
++    "9" * 30, "1." + "9" * 30, "1_p" + "9" * 30, "1-r" + "9" * 30, "1" + ".1" * 80,
++    "", "x", "1.", "1_", "1_foo", "1-r", "1\n", "١", "1.٢", "1A", " 1",
++]
++
++
++def test_vercmp_matches_python():
++    assert versions.vercmp.__wrapped__ is _cfast.vercmp
++    for a in VERSIONS:
++        for b in VERSIONS:
++            assert outcome(lambda: _cfast.vercmp(a, b)) == outcome(
++                lambda: versions._py_vercmp(a, b)
++            ), (a, b)
++    for args in ((1, "1"), ("1", None), ("1",), ("1", "2", 0), ("1", "2", 1, 3)):
++        assert outcome(lambda: _cfast.vercmp(*args)) == outcome(
++            lambda: versions._py_vercmp(*args)
++        ), args
++    assert versions.vercmp("1.10", "1.9") == 1 and versions.vercmp("1.01", "1.1") == -1
++
++
++CPVS = [
++    "dev-libs/foo-1.2", "dev-libs/foo-1.2-r3", "dev-libs/foo-1.2-r0", "foo-1.2",
++    "dev-libs/foo-bar-1.2_p3", "dev-libs/foo-1.0-2.0", "dev-libs/foo", "x/y-1",
++    "gtk+/gtk+-3.0", "a/b-1.0-r1-r2", "a/b-c-1", "a/b-1a_alpha2-r5", "a/b-1-1",
++    "a/-b-1", "a/+b-1", "-a/b-1", "a/b/c-1", "a/b-1.", "a/b-", "/b-1", "a/", "",
++    "a/b-1\n", "a/bé-1", "a/b-١", "a/9-9", "a/b-1" + ".1" * 80, "a b/c-1", "a/b_c-1",
++]
++
++
++def test_catpkgsplit_matches_python():
++    assert versions.catpkgsplit.__wrapped__ is _cfast.catpkgsplit
++    for s in CPVS:
++        for kw in ({}, {"eapi": "8"}, {"eapi": None}):
++            assert outcome(lambda: _cfast.catpkgsplit(s, **kw)) == outcome(
++                lambda: versions._py_catpkgsplit(s, **kw)
++            ), (s, kw)
++    for args, kw in (((1,), {}), ((None,), {}), (("a/b-1", 0), {}), (("a/b-1",), {"silent": 0}),
++                     (("a/b-1",), {"eapi": 5}), ((), {})):
++        assert outcome(lambda: _cfast.catpkgsplit(*args, **kw)) == outcome(
++            lambda: versions._py_catpkgsplit(*args, **kw)
++        ), (args, kw)
++    # a _pkg_str answers with its own cpv_split
++    p = versions._pkg_str("dev-libs/foo-1.2")
++    assert versions.catpkgsplit(p) is p.cpv_split
++
++
++def pkg_str_state(init, cpv, kw):
++    try:
++        p = str.__new__(versions._pkg_str, cpv)
++        init(p, cpv, **kw)
++    except Exception as e:  # noqa: BLE001
++        return ("raised", type(e))
++    d = dict(vars(p))
++    cpv_is_self = d.pop("cpv", None) is p
++    return ("value", list(d), [(k, type(v), v) for k, v in d.items()], cpv_is_self)
++
++
++def test_pkg_str_constructor_matches_python():
++    assert not hasattr(versions._pkg_str.__dict__["__init__"], "__code__")
++    metadatas = [
++        None,
++        {},
++        {"SLOT": "0/1.2", "repository": "gentoo", "EAPI": "8"},
++        {"SLOT": "2", "repository": "my repo!", "EAPI": "4", "BUILD_TIME": "17", "SIZE": "x",
++         "BUILD_ID": "2", "_mtime_": 5},
++        {"SLOT": "bad slot", "EAPI": "8", "BUILD_TIME": "", "BUILD_ID": None},
++        {"SLOT": "", "repository": "", "EAPI": None},
++        mappings.slot_dict_class(["SLOT", "repository", "EAPI"])(SLOT="0", EAPI="8"),
++    ]
++    kws = [
++        {},
++        {"eapi": "8", "slot": "1/2", "repo": "gentoo"},
++        {"slot": "0", "build_time": "77", "build_id": "3", "file_size": 10, "mtime": "9"},
++        {"settings": object(), "db": object(), "repoconfig": object()},
++        {"slot": 5},
++        {"repo": 7},
++        {"eapi": ["8"], "slot": "0"},
++        {"nope": 1},
++    ]
++    for cpv in CPVS:
++        for md in metadatas:
++            for kw in kws:
++                k = dict(kw)
++                if md is not None:
++                    k["metadata"] = md
++                assert pkg_str_state(_cfast.pkg_str_init, cpv, k) == pkg_str_state(
++                    versions._pkg_str._py_init, cpv, k
++                ), (cpv, k)
++    p = versions._pkg_str("dev-libs/foo-1.2-r3", slot="0/2", repo="gentoo", eapi="8")
++    assert (p.cp, p.version, p.slot, p.sub_slot, p.repo, p.cpv is p) == (
++        "dev-libs/foo", "1.2-r3", "0", "2", "gentoo", True
++    )
++    with pytest.raises(AttributeError):
++        p.cp = "x"
 diff -ruN a/lib/portage/tests/util/test_hashbase.py b/lib/portage/tests/util/test_hashbase.py
 --- a/lib/portage/tests/util/test_hashbase.py
 +++ b/lib/portage/tests/util/test_hashbase.py
@@ -1421,6 +1527,126 @@ diff -ruN a/lib/portage/util/__init__.py b/lib/portage/util/__init__.py
  def unique_array(s):
      """lifted from python cookbook, credit: Tim Peters
      Return a list of the elements in s in arbitrary order, sans duplicates"""
+diff -ruN a/lib/portage/versions.py b/lib/portage/versions.py
+--- a/lib/portage/versions.py
++++ b/lib/portage/versions.py
+@@ -114,8 +114,7 @@
+ # pairs of versions than that, again and again, and the function is a pure
+ # function of its arguments (no caller passes silent=0, the only thing
+ # that makes it print), so a larger cache returns the same values.
+-@lru_cache(None)
+-def vercmp(ver1: str, ver2: str, silent: int = 1) -> Optional[int]:
++def _py_vercmp(ver1: str, ver2: str, silent: int = 1) -> Optional[int]:
+     """
+     Compare two versions
+     Example usage:
+@@ -262,6 +261,17 @@
+     return rval
+ 
+ 
++try:
++    # The comparison of two valid ASCII versions in C
++    # (src/portage_util__cfast.c); _py_vercmp() for the rest.
++    from portage.util import _cfast as _c_vercmp
++
++    _c_vercmp.register("py_vercmp", _py_vercmp)
++    vercmp = lru_cache(None)(_c_vercmp.vercmp)
++except (ImportError, AttributeError, ValueError):
++    vercmp = lru_cache(None)(_py_vercmp)
++
++
+ def pkgcmp(pkg1: tuple[str, str, str], pkg2: tuple[str, str, str]) -> Optional[int]:
+     """
+     Compare 2 package versions created in pkgsplit format.
+@@ -318,8 +328,7 @@
+ 
+ # Unbounded (it was 10240 entries, fewer than the cpvs that one resolver run
+ # splits): a pure function of its arguments, silent is not used.
+-@lru_cache(None)
+-def catpkgsplit(
++def _py_catpkgsplit(
+     mydata: Union[str, "_pkg_str"],
+     silent: int = 1,
+     eapi: Any = None,
+@@ -356,6 +365,19 @@
+     return retval
+ 
+ 
++try:
++    # The split of a plain ASCII string in C (src/portage_util__cfast.c);
++    # _py_catpkgsplit() for the rest (_pkg_str instances, other types).
++    from portage.util import _cfast as _c_catpkgsplit
++
++    if _missing_cat != "null":
++        raise ImportError("the C catpkgsplit returns 'null' for a missing category")
++    _c_catpkgsplit.register("py_catpkgsplit", _py_catpkgsplit)
++    catpkgsplit = lru_cache(None)(_c_catpkgsplit.catpkgsplit)
++except (ImportError, AttributeError, ValueError):
++    catpkgsplit = lru_cache(None)(_py_catpkgsplit)
++
++
+ class _pkg_str(str):
+     """
+     This class represents a cpv. It inherits from str and has attributes
+@@ -389,7 +411,7 @@
+     ):
+         return str.__new__(cls, cpv)
+ 
+-    def __init__(
++    def _py_init(
+         self,
+         cpv: str,
+         metadata: Optional[dict[str, Any]] = None,
+@@ -504,6 +526,49 @@
+             return stable
+ 
+ 
++
++def _pkg_str_slot_parts(slot, eapi):
++    """
++    (slot, sub_slot, slot_invalid or None) as _pkg_str._py_init() sets them
++    for a slot that is not None: a pure function of two strings.
++    """
++    eapi_attrs = _get_eapi_attrs(eapi)
++    slot_match = _get_slot_re(eapi_attrs).match(slot)
++    if slot_match is None:
++        # Avoid an InvalidAtom exception when creating SLOT atoms
++        return ("0", "0", slot)
++    if eapi_attrs.slot_operator:
++        slot_split = slot.split("/")
++        if len(slot_split) > 1:
++            return (slot_split[0], slot_split[1], None)
++        return (slot_split[0], slot_split[0], None)
++    return (slot, slot, None)
++
++
++def _pkg_str_repo_name(repo):
++    """The repo attribute that _pkg_str._py_init() sets for this repo."""
++    from portage.repository.config import _gen_valid_repo
++
++    repo = _gen_valid_repo(repo)
++    if not repo:
++        repo = _unknown_repo
++    return repo
++
++
++try:
++    # The constructor in C for the usual arguments
++    # (src/portage_util__cfast.c); _py_init() for the rest.
++    from portage.util import _cfast as _c_pkg_str
++
++    _c_pkg_str.register("catpkgsplit", catpkgsplit)
++    _c_pkg_str.register("pkg_str_py_init", _pkg_str._py_init)
++    _c_pkg_str.register("pkg_str_slot_parts", _pkg_str_slot_parts)
++    _c_pkg_str.register("pkg_str_repo_name", _pkg_str_repo_name)
++    _pkg_str.__init__ = _c_pkg_str.as_method(_c_pkg_str.pkg_str_init)
++except (ImportError, AttributeError):
++    _pkg_str.__init__ = _pkg_str._py_init
++
++
+ def pkgsplit(
+     mypkg: str, silent: int = 1, eapi: Any = None
+ ) -> Optional[tuple[str, str, str]]:
 diff -ruN a/src/meson.build b/src/meson.build
 --- a/src/meson.build
 +++ b/src/meson.build
@@ -1479,7 +1705,7 @@ diff -ruN a/src/meson.build b/src/meson.build
 diff -ruN a/src/portage_util__cfast.c b/src/portage_util__cfast.c
 --- a/src/portage_util__cfast.c
 +++ b/src/portage_util__cfast.c
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,1241 @@
 +/* Copyright 2026 Gentoo Authors
 + * Distributed under the terms of the GNU General Public License v2
 + *
@@ -1494,6 +1720,8 @@ diff -ruN a/src/portage_util__cfast.c b/src/portage_util__cfast.c
 + *                  straight from the memo dict (_c_convert_result and
 + *                  _c_flatten_result of portage/dep/__init__.py).
 + *
++ *   pkg_str_init() the constructor of portage.versions._pkg_str.
++ *
 + * Whatever is not the common case is handed to the Python code that these
 + * replace, which stays in place as the fallback for builds without native
 + * extensions and as the reference of
@@ -1502,6 +1730,7 @@ diff -ruN a/src/portage_util__cfast.c b/src/portage_util__cfast.c
 +
 +#define PY_SSIZE_T_CLEAN
 +#include <Python.h>
++#include <string.h>
 +
 +static PyObject *str_c_keymap = NULL;		/* "_c_keymap" */
 +static PyObject *str_c_slow_keys = NULL;	/* "_c_slow_keys" */
@@ -1851,11 +2080,785 @@ diff -ruN a/src/portage_util__cfast.c b/src/portage_util__cfast.c
 +}
 +
 +/* ------------------------------------------------------------------ */
++/* _pkg_str.__init__                                                    */
++
++/* portage.versions._pkg_str.__init__ for the usual arguments; the Python
++ * method (_py_init) for the rest, which starts again from the beginning:
++ * everything done here before that point it does again, with the same
++ * values.
++ *
++ * Registered with register():
++ *   catpkgsplit           portage.versions.catpkgsplit
++ *   pkg_str_py_init       _pkg_str._py_init
++ *   pkg_str_slot_parts    (slot, eapi) -> (slot, sub_slot, slot_invalid or None)
++ *   pkg_str_repo_name     repo -> the "repo" attribute
++ * The last two are pure functions of str arguments; their results are
++ * remembered here. */
++static PyObject *reg_catpkgsplit = NULL;
++static PyObject *reg_pkg_str_py_init = NULL;
++static PyObject *reg_slot_parts = NULL;
++static PyObject *reg_repo_name = NULL;
++static PyObject *slot_parts_memo = NULL;	/* {(slot, eapi): tuple} */
++static PyObject *repo_name_memo = NULL;	/* {repo: str} */
++static PyObject *kw_eapi = NULL;		/* ("eapi",) */
++
++static PyObject *ps_metadata = NULL, *ps_settings = NULL, *ps_db = NULL;
++static PyObject *ps_repoconfig = NULL, *ps_eapi = NULL, *ps_build_time = NULL;
++static PyObject *ps_file_size = NULL, *ps_build_id = NULL, *ps_mtime = NULL;
++static PyObject *ps_cpv_split = NULL, *ps_cp = NULL, *ps_version = NULL;
++static PyObject *ps_cpv = NULL, *ps_slot = NULL, *ps_sub_slot = NULL;
++static PyObject *ps_slot_invalid = NULL, *ps_repo = NULL, *ps_get = NULL;
++static PyObject *ps_SLOT = NULL, *ps_repository = NULL, *ps_EAPI = NULL;
++static PyObject *ps_BUILD_TIME = NULL, *ps_SIZE = NULL, *ps_BUILD_ID = NULL;
++static PyObject *ps_mtime_key = NULL, *ps_r0 = NULL, *ps_dash_r0 = NULL;
++static PyObject *ps_slash = NULL, *ps_dash = NULL;
++
++/*  @staticmethod
++ *  def _long(var, default):
++ *      if var is not None:
++ *          try:
++ *              var = int(var)
++ *          except ValueError:
++ *              if var: var = -1
++ *              else:   var = default
++ *      return var
++ * A new reference. */
++static PyObject *
++pkg_str_long(PyObject *var, PyObject *fallback)
++{
++	PyObject *value;
++	int truth;
++
++	if (var == Py_None)
++		return Py_NewRef(var);
++	if (PyLong_CheckExact(var))
++		return Py_NewRef(var);
++	value = PyObject_CallOneArg((PyObject *)&PyLong_Type, var);
++	if (value != NULL)
++		return value;
++	if (!PyErr_ExceptionMatches(PyExc_ValueError))
++		return NULL;
++	PyErr_Clear();
++	truth = PyObject_IsTrue(var);
++	if (truth < 0)
++		return NULL;
++	if (truth)
++		return PyLong_FromLong(-1);
++	return Py_NewRef(fallback);
++}
++
++/* metadata.get(key, fallback), a new reference */
++static PyObject *
++metadata_get(PyObject *metadata, PyObject *key, PyObject *fallback)
++{
++	PyObject *value;
++
++	if (PyDict_CheckExact(metadata)) {
++		value = PyDict_GetItemWithError(metadata, key);
++		if (value != NULL)
++			return Py_NewRef(value);
++		if (PyErr_Occurred())
++			return NULL;
++		return Py_NewRef(fallback);
++	}
++	return PyObject_CallMethodObjArgs(metadata, ps_get, key, fallback, NULL);
++}
++
++/* memo[key], computed with func(*key_args) on first use; a new reference */
++static PyObject *
++memo_call(PyObject *memo, PyObject *key, PyObject *func, PyObject *a, PyObject *b)
++{
++	PyObject *value = PyDict_GetItemWithError(memo, key);
++
++	if (value != NULL)
++		return Py_NewRef(value);
++	if (PyErr_Occurred())
++		return NULL;
++	value = PyObject_CallFunctionObjArgs(func, a, b, NULL);
++	if (value == NULL)
++		return NULL;
++	if (PyDict_SetItem(memo, key, value) < 0) {
++		Py_DECREF(value);
++		return NULL;
++	}
++	return value;
++}
++
++static PyObject *
++cfast_pkg_str_init(PyObject *Py_UNUSED(module), PyObject *args, PyObject *kwargs)
++{
++	static char *kwlist[] = {
++		"self", "cpv", "metadata", "settings", "eapi", "repo", "slot",
++		"build_time", "build_id", "file_size", "mtime", "db", "repoconfig", NULL
++	};
++	PyObject *self, *cpv, *metadata = Py_None, *settings = Py_None;
++	PyObject *eapi = Py_None, *repo = Py_None, *slot = Py_None;
++	PyObject *build_time = Py_None, *build_id = Py_None, *file_size = Py_None;
++	PyObject *mtime = Py_None, *db = Py_None, *repoconfig = Py_None;
++	PyObject *dict = NULL, *split = NULL, *tmp = NULL, *key = NULL, *parts = NULL;
++	PyObject *zero = NULL, *stack[2];
++	/* owned copies of the values that metadata may replace */
++	PyObject *o_slot = NULL, *o_repo = NULL, *o_eapi = NULL, *o_build_time = NULL;
++	PyObject *o_file_size = NULL, *o_build_id = NULL, *o_mtime = NULL;
++	PyObject *cat, *pn, *ver, *rev;
++	Py_ssize_t len;
++	int rc, plain_version;
++
++	if (reg_catpkgsplit == NULL || reg_pkg_str_py_init == NULL
++		|| reg_slot_parts == NULL || reg_repo_name == NULL)
++		goto python;
++	if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|OOOOOOOOOOO:_pkg_str",
++			kwlist, &self, &cpv, &metadata, &settings, &eapi, &repo, &slot,
++			&build_time, &build_id, &file_size, &mtime, &db, &repoconfig)) {
++		/* the Python method reports the argument error in its own words */
++		PyErr_Clear();
++		goto python;
++	}
++	if (!PyUnicode_Check(cpv) || !PyUnicode_Check(self))
++		goto python;
++
++	dict = PyObject_GenericGetDict(self, NULL);
++	if (dict == NULL)
++		return NULL;
++
++	o_slot = Py_NewRef(slot);
++	o_repo = Py_NewRef(repo);
++	o_eapi = Py_NewRef(eapi);
++	o_build_time = Py_NewRef(build_time);
++	o_file_size = Py_NewRef(file_size);
++	o_build_id = Py_NewRef(build_id);
++	o_mtime = Py_NewRef(mtime);
++
++#define SET(name, value) \
++	do { \
++		if (PyDict_SetItem(dict, (name), (value)) < 0) \
++			goto error; \
++	} while (0)
++#define FROM_METADATA(var, mkey) \
++	do { \
++		tmp = metadata_get(metadata, (mkey), (var)); \
++		if (tmp == NULL) \
++			goto error; \
++		Py_SETREF(var, tmp); \
++		tmp = NULL; \
++	} while (0)
++
++	if (metadata != Py_None) {
++		SET(ps_metadata, metadata);
++		FROM_METADATA(o_slot, ps_SLOT);
++		FROM_METADATA(o_repo, ps_repository);
++		FROM_METADATA(o_eapi, ps_EAPI);
++		FROM_METADATA(o_build_time, ps_BUILD_TIME);
++		FROM_METADATA(o_file_size, ps_SIZE);
++		FROM_METADATA(o_build_id, ps_BUILD_ID);
++		FROM_METADATA(o_mtime, ps_mtime_key);
++	}
++	if (settings != Py_None)
++		SET(ps_settings, settings);
++	if (db != Py_None)
++		SET(ps_db, db);
++	if (repoconfig != Py_None)
++		SET(ps_repoconfig, repoconfig);
++	if (o_eapi != Py_None)
++		SET(ps_eapi, o_eapi);
++
++	zero = PyLong_FromLong(0);
++	if (zero == NULL)
++		goto error;
++#define SET_LONG(name, var, fallback) \
++	do { \
++		tmp = pkg_str_long((var), (fallback)); \
++		if (tmp == NULL) \
++			goto error; \
++		rc = PyDict_SetItem(dict, (name), tmp); \
++		Py_CLEAR(tmp); \
++		if (rc < 0) \
++			goto error; \
++	} while (0)
++	SET_LONG(ps_build_time, o_build_time, zero);
++	SET_LONG(ps_file_size, o_file_size, Py_None);
++	SET_LONG(ps_build_id, o_build_id, Py_None);
++	SET_LONG(ps_mtime, o_mtime, Py_None);
++
++	/* self.__dict__["cpv_split"] = catpkgsplit(cpv, eapi=eapi) */
++	stack[0] = cpv;
++	stack[1] = o_eapi;
++	split = PyObject_Vectorcall(reg_catpkgsplit, stack, 1, kw_eapi);
++	if (split == NULL)
++		goto error;
++	SET(ps_cpv_split, split);
++	/* None raises InvalidData(cpv); anything that is not the usual
++	 * (cat, pn, ver, rev) of strings goes the Python way too */
++	if (!PyTuple_CheckExact(split) || PyTuple_GET_SIZE(split) != 4)
++		goto python_cleanup;
++	cat = PyTuple_GET_ITEM(split, 0);
++	pn = PyTuple_GET_ITEM(split, 1);
++	ver = PyTuple_GET_ITEM(split, 2);
++	rev = PyTuple_GET_ITEM(split, 3);
++	if (!PyUnicode_CheckExact(cat) || !PyUnicode_CheckExact(pn)
++		|| !PyUnicode_CheckExact(ver) || !PyUnicode_CheckExact(rev))
++		goto python_cleanup;
++
++	/* cp = cpv_split[0] + "/" + cpv_split[1] */
++	tmp = PyUnicode_FromFormat("%U/%U", cat, pn);
++	if (tmp == NULL)
++		goto error;
++	rc = PyDict_SetItem(dict, ps_cp, tmp);
++	Py_CLEAR(tmp);
++	if (rc < 0)
++		goto error;
++
++	/* if cpv_split[-1] == "r0" and cpv[-3:] != "-r0":
++	 *     version = "-".join(cpv_split[2:-1])
++	 * else:
++	 *     version = "-".join(cpv_split[2:]) */
++	plain_version = 0;
++	if (PyUnicode_Compare(rev, ps_r0) == 0) {
++		len = PyUnicode_GET_LENGTH(cpv);
++		rc = (int)PyUnicode_Tailmatch(cpv, ps_dash_r0, 0, len, 1);
++		if (rc < 0)
++			goto error;
++		plain_version = !rc;
++	}
++	if (PyErr_Occurred())
++		goto error;
++	if (plain_version) {
++		SET(ps_version, ver);
++	}
++	else {
++		tmp = PyUnicode_FromFormat("%U-%U", ver, rev);
++		if (tmp == NULL)
++			goto error;
++		rc = PyDict_SetItem(dict, ps_version, tmp);
++		Py_CLEAR(tmp);
++		if (rc < 0)
++			goto error;
++	}
++
++	/* for match_from_list introspection */
++	SET(ps_cpv, self);
++
++	if (o_slot != Py_None) {
++		if (!PyUnicode_CheckExact(o_slot)
++			|| !(o_eapi == Py_None || PyUnicode_CheckExact(o_eapi)))
++			goto python_cleanup;
++		key = PyTuple_Pack(2, o_slot, o_eapi);
++		if (key == NULL)
++			goto error;
++		parts = memo_call(slot_parts_memo, key, reg_slot_parts, o_slot, o_eapi);
++		Py_CLEAR(key);
++		if (parts == NULL)
++			goto error;
++		if (!PyTuple_CheckExact(parts) || PyTuple_GET_SIZE(parts) != 3) {
++			PyErr_SetString(PyExc_TypeError, "slot parts must be a 3-tuple");
++			goto error;
++		}
++		SET(ps_slot, PyTuple_GET_ITEM(parts, 0));
++		SET(ps_sub_slot, PyTuple_GET_ITEM(parts, 1));
++		if (PyTuple_GET_ITEM(parts, 2) != Py_None)
++			SET(ps_slot_invalid, PyTuple_GET_ITEM(parts, 2));
++		Py_CLEAR(parts);
++	}
++
++	if (o_repo != Py_None) {
++		if (!PyUnicode_CheckExact(o_repo))
++			goto python_cleanup;
++		tmp = memo_call(repo_name_memo, o_repo, reg_repo_name, o_repo, NULL);
++		if (tmp == NULL)
++			goto error;
++		rc = PyDict_SetItem(dict, ps_repo, tmp);
++		Py_CLEAR(tmp);
++		if (rc < 0)
++			goto error;
++	}
++#undef SET
++#undef SET_LONG
++#undef FROM_METADATA
++
++	rc = 0;
++	goto cleanup;
++error:
++	rc = -1;
++	goto cleanup;
++python_cleanup:
++	rc = 1;
++cleanup:
++	Py_XDECREF(dict);
++	Py_XDECREF(split);
++	Py_XDECREF(tmp);
++	Py_XDECREF(key);
++	Py_XDECREF(parts);
++	Py_XDECREF(zero);
++	Py_XDECREF(o_slot);
++	Py_XDECREF(o_repo);
++	Py_XDECREF(o_eapi);
++	Py_XDECREF(o_build_time);
++	Py_XDECREF(o_file_size);
++	Py_XDECREF(o_build_id);
++	Py_XDECREF(o_mtime);
++	if (rc < 0)
++		return NULL;
++	if (rc == 0)
++		Py_RETURN_NONE;
++python:
++	if (reg_pkg_str_py_init == NULL) {
++		PyErr_SetString(PyExc_RuntimeError,
++			"portage.util._cfast: _pkg_str.__init__ is not set up");
++		return NULL;
++	}
++	return PyObject_Call(reg_pkg_str_py_init, args, kwargs);
++}
++
++/* ------------------------------------------------------------------ */
++/* vercmp                                                               */
++
++/* portage.versions.vercmp(ver1, ver2, silent=1) for two ASCII strings that
++ * match ver_regexp; the Python function (registered as "py_vercmp") for
++ * everything else: invalid versions (it returns None), non-ASCII digits and
++ * a trailing newline (both of which the regular expression accepts), and
++ * silent=0. */
++static PyObject *reg_py_vercmp = NULL;
++
++#define VER_MAX_PARTS 64
++
++typedef struct {
++	const char *start;
++	Py_ssize_t len;
++} ver_span;
++
++typedef struct {
++	ver_span major;
++	ver_span comp[VER_MAX_PARTS];	/* the .N components */
++	int ncomp;
++	int letter;			/* 0 if none */
++	int suffix[VER_MAX_PARTS];	/* index into ver_suffix_value */
++	ver_span suffix_num[VER_MAX_PARTS];
++	int nsuffix;
++	ver_span rev;			/* len 0 if none */
++} ver_parsed;
++
++/* (pre|p|beta|alpha|rc), in the order the regular expression tries them */
++static const char *const ver_suffix_name[5] = {"pre", "p", "beta", "alpha", "rc"};
++static const int ver_suffix_len[5] = {3, 1, 4, 5, 2};
++static const int ver_suffix_value[5] = {-2, 0, -3, -4, -1};
++
++static Py_ssize_t
++ver_digits(const char *s, Py_ssize_t i, Py_ssize_t n)
++{
++	while (i < n && s[i] >= '0' && s[i] <= '9')
++		i++;
++	return i;
++}
++
++/* ^(\d+)((\.\d+)*)([a-z]?)((_(pre|p|beta|alpha|rc)\d*)*)(-r(\d+))?$
++ * 1 if s is such a version, 0 if not, -1 if it has more parts than fit
++ * here (the caller then asks the Python function). */
++static int
++ver_parse(const char *s, Py_ssize_t n, ver_parsed *v)
++{
++	Py_ssize_t i = 0, j;
++	int k;
++
++	j = ver_digits(s, 0, n);
++	if (j == 0)
++		return 0;
++	v->major.start = s;
++	v->major.len = j;
++	i = j;
++	v->ncomp = 0;
++	while (i < n && s[i] == '.') {
++		j = ver_digits(s, i + 1, n);
++		if (j == i + 1)
++			return 0;
++		if (v->ncomp == VER_MAX_PARTS)
++			return -1;
++		v->comp[v->ncomp].start = s + i + 1;
++		v->comp[v->ncomp].len = j - i - 1;
++		v->ncomp++;
++		i = j;
++	}
++	v->letter = 0;
++	if (i < n && s[i] >= 'a' && s[i] <= 'z') {
++		v->letter = (unsigned char)s[i];
++		i++;
++	}
++	v->nsuffix = 0;
++	while (i < n && s[i] == '_') {
++		for (k = 0; k < 5; k++) {
++			if (n - (i + 1) >= ver_suffix_len[k]
++				&& memcmp(s + i + 1, ver_suffix_name[k], ver_suffix_len[k]) == 0) {
++				/* what follows the name must be digits and then
++				 * '_', '-' or the end, or this alternative fails */
++				j = ver_digits(s, i + 1 + ver_suffix_len[k], n);
++				if (j == n || s[j] == '_' || s[j] == '-')
++					break;
++			}
++		}
++		if (k == 5)
++			return 0;
++		if (v->nsuffix == VER_MAX_PARTS)
++			return -1;
++		v->suffix[v->nsuffix] = k;
++		v->suffix_num[v->nsuffix].start = s + i + 1 + ver_suffix_len[k];
++		v->suffix_num[v->nsuffix].len = j - (i + 1 + ver_suffix_len[k]);
++		v->nsuffix++;
++		i = j;
++	}
++	v->rev.start = NULL;
++	v->rev.len = 0;
++	if (i < n) {
++		if (n - i < 3 || s[i] != '-' || s[i + 1] != 'r')
++			return 0;
++		j = ver_digits(s, i + 2, n);
++		if (j == i + 2 || j != n)
++			return 0;
++		v->rev.start = s + i + 2;
++		v->rev.len = j - i - 2;
++		i = j;
++	}
++	return i == n;
++}
++
++/* int(a) against int(b) for two strings of digits (an empty one counts as
++ * zero): -1, 0 or 1 */
++static int
++ver_cmp_int(ver_span a, ver_span b)
++{
++	int c;
++
++	while (a.len > 0 && *a.start == '0') {
++		a.start++;
++		a.len--;
++	}
++	while (b.len > 0 && *b.start == '0') {
++		b.start++;
++		b.len--;
++	}
++	if (a.len != b.len)
++		return a.len > b.len ? 1 : -1;
++	c = memcmp(a.start, b.start, (size_t)a.len);
++	return (c > 0) - (c < 0);
++}
++
++/* int(a.ljust(m, "0")) against int(b.ljust(m, "0")), m the longer length */
++static int
++ver_cmp_padded(ver_span a, ver_span b)
++{
++	Py_ssize_t i, m = a.len > b.len ? a.len : b.len;
++	char ca, cb;
++
++	for (i = 0; i < m; i++) {
++		ca = i < a.len ? a.start[i] : '0';
++		cb = i < b.len ? b.start[i] : '0';
++		if (ca != cb)
++			return ca > cb ? 1 : -1;
++	}
++	return 0;
++}
++
++static int
++ver_compare(const ver_parsed *a, const ver_parsed *b)
++{
++	int i, n, c, la, lb;
++	ver_span sa, sb, minus;
++
++	c = ver_cmp_int(a->major, b->major);
++	if (c)
++		return c;
++	/* the components: a missing one is -1 against the other's number */
++	n = a->ncomp > b->ncomp ? a->ncomp : b->ncomp;
++	for (i = 0; i < n; i++) {
++		if (i >= a->ncomp)
++			return -1;	/* -1 < int(...) >= 0 */
++		if (i >= b->ncomp)
++			return 1;
++		sa = a->comp[i];
++		sb = b->comp[i];
++		if (sa.start[0] != '0' && sb.start[0] != '0')
++			c = ver_cmp_int(sa, sb);
++		else
++			c = ver_cmp_padded(sa, sb);
++		if (c)
++			return c;
++	}
++	/* the letter is one more list element; the shorter list is less */
++	la = a->letter;
++	lb = b->letter;
++	if (la && lb) {
++		if (la != lb)
++			return la > lb ? 1 : -1;
++	}
++	else if (la || lb) {
++		return la ? 1 : -1;
++	}
++	/* the suffixes: a missing one is ("p", "-1") */
++	n = a->nsuffix > b->nsuffix ? a->nsuffix : b->nsuffix;
++	minus.start = NULL;
++	minus.len = 0;
++	for (i = 0; i < n; i++) {
++		int ka = i < a->nsuffix ? a->suffix[i] : 1;
++		int kb = i < b->nsuffix ? b->suffix[i] : 1;
++		if (ka != kb)
++			return ver_suffix_value[ka] > ver_suffix_value[kb] ? 1 : -1;
++		/* same name: compare the numbers, "" is 0, missing is -1 */
++		if (i >= a->nsuffix || i >= b->nsuffix) {
++			/* exactly one is missing (-1); the other is >= 0 */
++			if (i >= a->nsuffix && i >= b->nsuffix)
++				continue;
++			return i >= a->nsuffix ? -1 : 1;
++		}
++		c = ver_cmp_int(a->suffix_num[i], b->suffix_num[i]);
++		if (c)
++			return c;
++	}
++	(void)minus;
++	sa = a->rev;
++	sb = b->rev;
++	return ver_cmp_int(sa, sb);
++}
++
++static PyObject *
++cfast_vercmp(PyObject *Py_UNUSED(module), PyObject *const *args,
++	Py_ssize_t nargs, PyObject *kwnames)
++{
++	PyObject *ver1, *ver2;
++	const char *s1, *s2;
++	Py_ssize_t n1, n2;
++	ver_parsed a, b;
++
++	if (reg_py_vercmp == NULL) {
++		PyErr_SetString(PyExc_RuntimeError,
++			"portage.util._cfast: vercmp is not set up");
++		return NULL;
++	}
++	if (nargs != 2 || (kwnames != NULL && PyTuple_GET_SIZE(kwnames) != 0))
++		goto python;	/* silent, or an argument error */
++	ver1 = args[0];
++	ver2 = args[1];
++	if (!PyUnicode_CheckExact(ver1) || !PyUnicode_CheckExact(ver2)
++		|| !PyUnicode_IS_ASCII(ver1) || !PyUnicode_IS_ASCII(ver2))
++		goto python;
++	s1 = (const char *)PyUnicode_1BYTE_DATA(ver1);
++	s2 = (const char *)PyUnicode_1BYTE_DATA(ver2);
++	n1 = PyUnicode_GET_LENGTH(ver1);
++	n2 = PyUnicode_GET_LENGTH(ver2);
++	/* if ver1 == ver2: return 0 */
++	if (n1 == n2 && memcmp(s1, s2, (size_t)n1) == 0)
++		return PyLong_FromLong(0);
++	if (ver_parse(s1, n1, &a) <= 0 || ver_parse(s2, n2, &b) <= 0)
++		goto python;
++	return PyLong_FromLong(ver_compare(&a, &b));
++python:
++	return PyObject_Vectorcall(reg_py_vercmp, args, (size_t)nargs, kwnames);
++}
++
++/* ------------------------------------------------------------------ */
++/* catpkgsplit                                                          */
++
++/* portage.versions.catpkgsplit(mydata, silent=1, eapi=None) for a plain
++ * ASCII str without a newline; the Python function (registered as
++ * "py_catpkgsplit") for everything else.
++ *
++ * _pkgsplit() matches
++ *   ^(?P<pn>[\w][\w+-]*?(?P<pn_inval>-VR)?)-(?P<ver>V)(-r(?P<rev>\d+))?$
++ * and returns None if there is no match or if pn_inval took part in it.
++ * The lazy part of pn grows one character at a time, so the match that the
++ * regular expression finds is the one with the shortest such prefix that
++ * can be completed, first with pn_inval and then without it. */
++static PyObject *reg_py_catpkgsplit = NULL;
++static PyObject *str_null = NULL;	/* "null", portage.versions._missing_cat */
++
++static int
++is_word(char c)
++{
++	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
++		|| (c >= '0' && c <= '9') || c == '_';
++}
++
++/* 1 with *pn_len, the version span and the revision span set; 0 for None;
++ * -1 if the Python function has to decide. */
++static int
++pv_split(const char *s, Py_ssize_t n, Py_ssize_t *pn_len,
++	ver_span *ver, ver_span *rev)
++{
++	Py_ssize_t p, q;
++	ver_parsed v;
++	int r;
++
++	if (n == 0 || !is_word(s[0]))
++		return 0;
++	for (p = 1; p < n; p++) {
++		if (s[p] == '-') {
++			/* with pn_inval: -VR at p, then -V(-rN)? to the end */
++			for (q = p + 2; q < n - 1; q++) {
++				if (s[q] != '-')
++					continue;
++				r = ver_parse(s + p + 1, q - p - 1, &v);
++				if (r < 0)
++					return -1;
++				if (!r)
++					continue;
++				r = ver_parse(s + q + 1, n - q - 1, &v);
++				if (r < 0)
++					return -1;
++				if (r)
++					return 0;	/* pn ends in a version */
++			}
++			/* without it: -V(-rN)? to the end */
++			r = ver_parse(s + p + 1, n - p - 1, &v);
++			if (r < 0)
++				return -1;
++			if (r) {
++				*pn_len = p;
++				ver->start = s + p + 1;
++				ver->len = (v.rev.len ? v.rev.start - 2 - (s + p + 1)
++					: n - p - 1);
++				*rev = v.rev;
++				return 1;
++			}
++		}
++		else if (!is_word(s[p]) && s[p] != '+') {
++			return 0;	/* not a character of a package name */
++		}
++	}
++	return 0;
++}
++
++static PyObject *
++cfast_catpkgsplit(PyObject *Py_UNUSED(module), PyObject *const *args,
++	Py_ssize_t nargs, PyObject *kwnames)
++{
++	PyObject *mydata, *eapi = Py_None, *cat, *pn, *ver, *rev, *result;
++	const char *s, *slash, *pv;
++	Py_ssize_t n, i, cat_len, pv_len, pn_len = 0;
++	ver_span vspan = {NULL, 0}, rspan = {NULL, 0};
++	int r;
++
++	if (reg_py_catpkgsplit == NULL) {
++		PyErr_SetString(PyExc_RuntimeError,
++			"portage.util._cfast: catpkgsplit is not set up");
++		return NULL;
++	}
++	if (nargs != 1)
++		goto python;
++	if (kwnames != NULL && PyTuple_GET_SIZE(kwnames) != 0) {
++		if (PyTuple_GET_SIZE(kwnames) != 1
++			|| PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(kwnames, 0), "eapi") != 0)
++			goto python;
++		eapi = args[1];
++	}
++	mydata = args[0];
++	/* _get_eapi_attrs(eapi) is called with it: None or a str is fine */
++	if (!PyUnicode_CheckExact(mydata) || !PyUnicode_IS_ASCII(mydata)
++		|| !(eapi == Py_None || PyUnicode_CheckExact(eapi)))
++		goto python;
++	s = (const char *)PyUnicode_1BYTE_DATA(mydata);
++	n = PyUnicode_GET_LENGTH(mydata);
++	for (i = 0; i < n; i++)
++		if (s[i] == '\n' || s[i] == '\0')
++			goto python;
++
++	slash = memchr(s, '/', (size_t)n);
++	if (slash == NULL) {
++		cat_len = -1;
++		pv = s;
++		pv_len = n;
++	}
++	else {
++		/* ^[\w][\w+.-]*$ */
++		cat_len = slash - s;
++		if (cat_len == 0 || !is_word(s[0]))
++			Py_RETURN_NONE;
++		for (i = 1; i < cat_len; i++)
++			if (!is_word(s[i]) && s[i] != '+' && s[i] != '.' && s[i] != '-')
++				Py_RETURN_NONE;
++		pv = slash + 1;
++		pv_len = n - cat_len - 1;
++	}
++	r = pv_split(pv, pv_len, &pn_len, &vspan, &rspan);
++	if (r < 0)
++		goto python;
++	if (r == 0)
++		Py_RETURN_NONE;
++
++	cat = cat_len < 0 ? Py_NewRef(str_null) : PyUnicode_FromStringAndSize(s, cat_len);
++	pn = PyUnicode_FromStringAndSize(pv, pn_len);
++	ver = PyUnicode_FromStringAndSize(vspan.start, vspan.len);
++	rev = rspan.len ? PyUnicode_FromFormat("r%.*s", (int)rspan.len, rspan.start)
++		: PyUnicode_FromString("r0");
++	if (cat == NULL || pn == NULL || ver == NULL || rev == NULL) {
++		Py_XDECREF(cat);
++		Py_XDECREF(pn);
++		Py_XDECREF(ver);
++		Py_XDECREF(rev);
++		return NULL;
++	}
++	result = PyTuple_Pack(4, cat, pn, ver, rev);
++	Py_DECREF(cat);
++	Py_DECREF(pn);
++	Py_DECREF(ver);
++	Py_DECREF(rev);
++	return result;
++python:
++	return PyObject_Vectorcall(reg_py_catpkgsplit, args, (size_t)nargs, kwnames);
++}
++
++/* register(name, obj): hand over a function of the Python side */
++static PyObject *
++cfast_register(PyObject *Py_UNUSED(module), PyObject *args)
++{
++	const char *name;
++	PyObject *obj, **slot;
++
++	if (!PyArg_ParseTuple(args, "sO:register", &name, &obj))
++		return NULL;
++	if (strcmp(name, "catpkgsplit") == 0)
++		slot = &reg_catpkgsplit;
++	else if (strcmp(name, "pkg_str_py_init") == 0)
++		slot = &reg_pkg_str_py_init;
++	else if (strcmp(name, "pkg_str_slot_parts") == 0)
++		slot = &reg_slot_parts;
++	else if (strcmp(name, "pkg_str_repo_name") == 0)
++		slot = &reg_repo_name;
++	else if (strcmp(name, "py_vercmp") == 0)
++		slot = &reg_py_vercmp;
++	else if (strcmp(name, "py_catpkgsplit") == 0)
++		slot = &reg_py_catpkgsplit;
++	else {
++		PyErr_Format(PyExc_ValueError, "register: unknown name '%s'", name);
++		return NULL;
++	}
++	Py_XSETREF(*slot, Py_NewRef(obj));
++	Py_RETURN_NONE;
++}
++
++/* as_method(func): func wrapped so that it binds as a method when it is a
++ * class attribute (a builtin function does not). */
++static PyObject *
++cfast_as_method(PyObject *Py_UNUSED(module), PyObject *func)
++{
++	return PyInstanceMethod_New(func);
++}
++
++/* ------------------------------------------------------------------ */
 +/* module                                                               */
 +
 +static PyMethodDef cfast_functions[] = {
 +	{"set_keymap_builder", cfast_set_keymap_builder, METH_O,
 +	 "set_keymap_builder(func): func(cls) makes and returns cls._c_keymap"},
++	{"register", cfast_register, METH_VARARGS,
++	 "register(name, obj): hand over a function of the Python side"},
++	{"as_method", cfast_as_method, METH_O,
++	 "as_method(func): func as a class attribute that binds like a method"},
++	{"catpkgsplit", (PyCFunction)(void (*)(void))cfast_catpkgsplit,
++	 METH_FASTCALL | METH_KEYWORDS,
++	 "catpkgsplit(mydata, silent=1, eapi=None), see portage.versions"},
++	{"vercmp", (PyCFunction)(void (*)(void))cfast_vercmp,
++	 METH_FASTCALL | METH_KEYWORDS,
++	 "vercmp(ver1, ver2, silent=1), see portage.versions"},
++	{"pkg_str_init", (PyCFunction)(void (*)(void))cfast_pkg_str_init,
++	 METH_VARARGS | METH_KEYWORDS,
++	 "_pkg_str.__init__(self, cpv, metadata=None, ...), see portage.versions"},
 +	{"convert", (PyCFunction)(void (*)(void))cfast_convert, METH_FASTCALL,
 +	 "convert(raw, flat, memo, slow, eapi, eapi_attrs, uselist, matchall)\n"
 +	 "The parse tree raw with every parser atom replaced by its Atom."},
@@ -1891,6 +2894,43 @@ diff -ruN a/src/portage_util__cfast.c b/src/portage_util__cfast.c
 +	INTERN(str_py_getitem, "_py_getitem");
 +	INTERN(str_use, "_use");
 +	INTERN(str_conditional, "conditional");
++	INTERN(ps_metadata, "_metadata");
++	INTERN(ps_settings, "_settings");
++	INTERN(ps_db, "_db");
++	INTERN(ps_repoconfig, "_repoconfig");
++	INTERN(ps_eapi, "eapi");
++	INTERN(ps_build_time, "build_time");
++	INTERN(ps_file_size, "file_size");
++	INTERN(ps_build_id, "build_id");
++	INTERN(ps_mtime, "mtime");
++	INTERN(ps_cpv_split, "cpv_split");
++	INTERN(ps_cp, "cp");
++	INTERN(ps_version, "version");
++	INTERN(ps_cpv, "cpv");
++	INTERN(ps_slot, "slot");
++	INTERN(ps_sub_slot, "sub_slot");
++	INTERN(ps_slot_invalid, "slot_invalid");
++	INTERN(ps_repo, "repo");
++	INTERN(ps_get, "get");
++	INTERN(ps_SLOT, "SLOT");
++	INTERN(ps_repository, "repository");
++	INTERN(ps_EAPI, "EAPI");
++	INTERN(ps_BUILD_TIME, "BUILD_TIME");
++	INTERN(ps_SIZE, "SIZE");
++	INTERN(ps_BUILD_ID, "BUILD_ID");
++	INTERN(ps_mtime_key, "_mtime_");
++	INTERN(ps_r0, "r0");
++	INTERN(ps_dash_r0, "-r0");
++	INTERN(ps_slash, "/");
++	INTERN(ps_dash, "-");
++	slot_parts_memo = PyDict_New();
++	repo_name_memo = PyDict_New();
++	kw_eapi = Py_BuildValue("(s)", "eapi");
++	str_null = PyUnicode_InternFromString("null");
++	if (str_null == NULL)
++		goto fail;
++	if (slot_parts_memo == NULL || repo_name_memo == NULL || kw_eapi == NULL)
++		goto fail;
 +#undef INTERN
 +
 +	type = PyType_FromSpec(&slotdict_spec);
