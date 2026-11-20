@@ -19,6 +19,9 @@ HOMEPAGE="https://wiki.gentoo.org/wiki/Project:Portage"
 # above every ::gentoo release, so it stays until it is removed by hand.
 # Same plan, same merge order, same number of backtracking attempts as the
 # unpatched resolver on every tested state; six states 365 s -> 73 s.
+# -r1: C base types for the hash and equality of Task (Package, Blocker) and
+# Atom (portage.util._hashbase, built with USE=native-extensions; the Python
+# methods stay as the fallback). Same plans; emptytree resolve about 3 % faster.
 MY_P="${PN}-3.0.83"
 SRC_URI="https://gitweb.gentoo.org/proj/portage.git/snapshot/${MY_P}.tar.bz2"
 S="${WORKDIR}/${MY_P}"
@@ -100,6 +103,7 @@ PDEPEND="
 PATCHES=(
 	"${FILESDIR}"/0001-bintree-provide-an-empty-default-for-USER_PATCHES.patch
 	"${FILESDIR}"/portage-3.0.83-emerge-fast-resolver.patch
+	"${FILESDIR}"/portage-3.0.83-hashbase-c.patch
 )
 
 pkg_pretend() {
