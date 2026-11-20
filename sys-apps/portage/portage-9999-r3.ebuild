@@ -25,6 +25,10 @@ HOMEPAGE="https://wiki.gentoo.org/wiki/Project:Portage"
 # -r2: portage.util._cfast: slot dict lookups (package metadata) and the
 # conversion of the C parser's result to Atoms; about 1.6 % more. Both modules
 # are optional: without their .so files the Python code runs as before.
+# -r3: comparisons that C code calls for every element: the ordering of
+# Package, the comparisons of the dependency priorities and cmp_sort_key;
+# about 1.6 % more. (Atom matching was ported too and measured SLOWER than
+# the Python it replaced, so it is not here.)
 MY_P="${PN}-3.0.83"
 SRC_URI="https://gitweb.gentoo.org/proj/portage.git/snapshot/${MY_P}.tar.bz2"
 S="${WORKDIR}/${MY_P}"
