@@ -9,6 +9,10 @@ EAPI=8
 # so with it set nobody could choose the certificate store in
 # ~/.claude/settings.json. The two remaining keys stay: without them a
 # root-owned /opt/bin/claude tries to update itself into the home directory.
+# -r1: sys-apps/ripgrep is optional (USE=system-ripgrep). The binary carries
+# its own ripgrep ("exec -a rg /opt/bin/claude --version" prints it) and uses
+# it unless USE_BUILTIN_RIPGREP=0, so the hard dependency only blocked hosts
+# where Rust packages cannot be built (cross-compiled ARM images).
 
 DESCRIPTION="Claude Code - an agentic coding tool by Anthropic"
 HOMEPAGE="https://claude.com/product/claude-code"
@@ -37,9 +41,9 @@ SLOT="0"
 KEYWORDS="-* ~amd64 ~arm64"
 QA_PREBUILT="opt/bin/claude"
 
-RDEPEND="sys-apps/ripgrep"
+IUSE="cpu_flags_x86_avx cpu_flags_x86_avx2 system-ripgrep"
 
-IUSE="cpu_flags_x86_avx cpu_flags_x86_avx2"
+RDEPEND="system-ripgrep? ( sys-apps/ripgrep )"
 REQUIRED_USE="amd64? ( cpu_flags_x86_avx cpu_flags_x86_avx2 )"
 
 RESTRICT="bindist mirror strip"
@@ -57,6 +61,12 @@ src_install() {
 
 	insinto /etc/${PN}
 	newins "${FILESDIR}/managed-settings-native-r1.json" managed-settings.json
+	if use system-ripgrep; then
+		sed -i -e 's|^  "env": {$|&\n    "USE_BUILTIN_RIPGREP": "0",|' \
+			"${ED}/etc/${PN}/managed-settings.json" || die
+		grep -q USE_BUILTIN_RIPGREP "${ED}/etc/${PN}/managed-settings.json" \
+			|| die "system-ripgrep: managed settings were not updated"
+	fi
 }
 
 pkg_postinst() {
