@@ -1,5 +1,8 @@
 depgraph: remember that the runtime cycle search found nothing for a graph state
 
+Sub-series: B (cycle search and frontier) - patch 2 of 6; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs none: it also applies to 3.0.83 by itself.
+
 A mutation counter in the frontier identifies the graph state; a search
 that came back empty for a state would come back empty again.
 Alone on 3.0.83: start 119.6 -> 112.2; no effect on short merge lists.
@@ -53,10 +56,9 @@ package count as unpatched 3.0.83.
          while mygraph:
              selected_nodes = None
              ignore_priority = None
-@@ -10104,6 +10108,23 @@
-                     priority_ranges.append(DepPrioritySatisfiedRange)
- 
-                 for local_priority_range in priority_ranges:
+@@ -10106,1 +10110,18 @@
+-                for local_priority_range in priority_ranges:
++                for local_priority_range in priority_ranges:
 +                    search_state = None
 +                    if frontier is not None:
 +                        # Everything the search below reads besides constants:
@@ -74,9 +76,6 @@ package count as unpatched 3.0.83.
 +                        if no_cycle_memo.get(local_priority_range) == search_state:
 +                            selected_nodes, ignore_priority = None, None
 +                            continue
-                     if frontier is not None:
-                         # ignore_medium is ignore_priority[MEDIUM] for both
-                         # ranges, and frontier_leaves() returns the nodes of
 @@ -10128,6 +10149,8 @@
                          )
                          if selected_nodes:

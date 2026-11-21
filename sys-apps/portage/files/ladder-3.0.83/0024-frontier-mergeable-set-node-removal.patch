@@ -1,5 +1,8 @@
 depgraph: mergeable set from the frontier's leaf set, one-node graph removal
 
+Sub-series: B (cycle search and frontier) - patch 6 of 6; applies to 3.0.83 with only the earlier patches of this sub-series.
+Unchanged, but patch 0022 before it is now required-use-memo (probe-certain-atoms, the old 0022, is 0029); the step figures below are those of the old order.
+
 The set of mergeable nodes was built as set(frontier_leaves(level)): sort
 the leaves, filter them, hash every node again; once per priority range in
 every pass. frontier_mergeable() copies the frontier's leaf set and removes
@@ -191,7 +194,7 @@ package count as unpatched 3.0.83.
          if self.frontier is not None:
 --- a/lib/_emerge/depgraph.py
 +++ b/lib/_emerge/depgraph.py
-@@ -10326,6 +10326,38 @@
+@@ -10208,6 +10208,38 @@
              )
              return result[:]
  
@@ -230,7 +233,7 @@ package count as unpatched 3.0.83.
          # sys-apps/portage needs special treatment if ROOT="/"
          running_root = self._frozen_config._running_root.root
          runtime_deps = InternalPackageSet(initial_atoms=[PORTAGE_PACKAGE_ATOM])
-@@ -10468,7 +10500,11 @@
+@@ -10350,7 +10382,11 @@
          # unresolved blockers or circular dependencies.
  
          if use_frontier:
@@ -243,7 +246,7 @@ package count as unpatched 3.0.83.
              mygraph.frontier = frontier
  
          # (local_priority_range, level index) -> _GatherOkTracker, see
-@@ -10580,7 +10616,17 @@
+@@ -10462,7 +10498,17 @@
  
              if not selected_nodes:
  
@@ -262,7 +265,7 @@ package count as unpatched 3.0.83.
                      if prefer_asap and asap_nodes:
                          nodes = asap_nodes
                      else:
-@@ -10629,6 +10675,19 @@
+@@ -10511,6 +10557,19 @@
                              valid_nodes = mergeable_nodes - blocked_nodes
                          graph_nodes = mygraph.nodes
  
@@ -282,7 +285,7 @@ package count as unpatched 3.0.83.
                      for i in range(
                          local_priority_range.MEDIUM_POST,
                          local_priority_range.MEDIUM_SOFT + 1,
-@@ -10647,20 +10706,52 @@
+@@ -10529,20 +10588,52 @@
                              # iterating nodes in its own order is what the
                              # stable sort followed by that loop returns.
                              smallest_leaf = None
@@ -349,7 +352,7 @@ package count as unpatched 3.0.83.
                              if smallest_leaf is not None:
                                  smallest_cycle = frozenset((smallest_leaf,))
                                  smallest_size = 1
-@@ -10687,6 +10778,9 @@
+@@ -10569,6 +10660,9 @@
                                  for node in nodes
                              ):
                                  continue
@@ -359,7 +362,7 @@ package count as unpatched 3.0.83.
                          if sorted_nodes is None:
                              sorted_nodes = sorted(nodes)
                          # Compute gather_deps success and closure size for every
-@@ -10740,15 +10834,17 @@
+@@ -10622,15 +10716,17 @@
                              selected_nodes, ignore_priority = None, None
                              continue
                          # ignore_medium is ignore_priority[MEDIUM] for both
@@ -386,7 +389,7 @@ package count as unpatched 3.0.83.
                          )
                      else:
                          mergeable_nodes = set(
-@@ -10756,9 +10852,10 @@
+@@ -10638,9 +10734,10 @@
                                  ignore_priority=local_priority_range.ignore_medium
                              )
                          )

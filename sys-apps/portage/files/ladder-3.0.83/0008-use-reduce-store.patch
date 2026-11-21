@@ -1,5 +1,7 @@
 dep: keep _use_reduce_parse results behind the 1024-entry LRU
 
+Sub-series: C (use_reduce parser) - patch 1 of 3; applies to 3.0.83 with only the earlier patches of this sub-series.
+
 Alone on 3.0.83: start 119.6 -> 113.7, masks 91.0 -> 84.4; base
 inconclusive. Applies to upstream head unchanged.
 

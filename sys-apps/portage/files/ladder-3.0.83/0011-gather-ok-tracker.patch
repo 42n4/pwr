@@ -1,5 +1,7 @@
 depgraph: skip the cycle closure pass when it cannot select anything (_GatherOkTracker)
 
+Sub-series: B (cycle search and frontier) - patch 5 of 6; applies to 3.0.83 with only the earlier patches of this sub-series.
+
 When no leaf is available, find_smallest_cycle calls
 _gather_deps_closures for each priority level: one O(V+E) pass over the
 graph that computes, for every candidate, whether gather_deps succeeds and

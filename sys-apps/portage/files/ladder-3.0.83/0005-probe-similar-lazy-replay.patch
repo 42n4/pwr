@@ -1,5 +1,8 @@
 depgraph: replay _iter_similar_available lazily inside the probe loop
 
+Sub-series: A (probe, match and config memos) - patch 4 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs 0001 only.
+
 Over 0004 (three states): start 103.7 -> 98.6, masks 67.9 -> 62.6,
 base 23.6 -> 22.5; under 1.5 s per state once patch 0002 is applied.
 Does NOT apply to upstream head: the function gained a parameter there.

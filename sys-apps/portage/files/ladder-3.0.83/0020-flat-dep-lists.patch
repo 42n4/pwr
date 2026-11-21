@@ -1,5 +1,7 @@
 depgraph: build the dep_check() result directly for lists without a choice
 
+Sub-series: G (flat dependency lists) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
+
 For a dependency list that is a non-empty list of plain Atoms only (no
 "||" group, no virtual/, nothing from package.provided, local_config, no
 virt_parent), dep_check() has nothing to choose: it returns every atom in

@@ -1,5 +1,7 @@
 depgraph: slot-operator probes pass over lower versions before creating packages
 
+Sub-series: A (probe, match and config memos) - patch 7 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+
 _upgrade_available(pkg) is true only if some candidate compares greater
 than pkg, and the loops of _slot_operator_update_probe skip every candidate
 that is less than the package they replace unless _downgrade_probe() is

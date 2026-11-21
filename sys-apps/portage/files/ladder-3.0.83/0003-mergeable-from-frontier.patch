@@ -1,5 +1,7 @@
 depgraph: take mergeable_nodes from the leaf frontier in _serialize_tasks
 
+Sub-series: B (cycle search and frontier) - patch 1 of 6; applies to 3.0.83 with only the earlier patches of this sub-series.
+
 The frontier that _serialize_tasks already maintains returns the same nodes
 in the same order as the get_nodes() scan of the whole graph.
 

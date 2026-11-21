@@ -1,5 +1,9 @@
 depgraph: skip _select_atoms_probe for atoms that dep_check() cannot drop
 
+Sub-series: A (probe, match and config memos) - patch 10 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs 0001, 0002, 0004, 0005, 0012, 0013, 0014 only.
+In the 25-patch ladder this was patch 0022; the step figures below were measured there, on top of 0001-0021 of that order.
+
 _slot_operator_update_probe runs _select_atoms_probe(), i.e. dep_check()
 over all dependency strings of a replacement parent, only to ask whether
 one atom is among the selected atoms. An atom that stands at the top level
@@ -42,17 +46,13 @@ package count as unpatched 3.0.83.
 ---
 --- a/lib/_emerge/depgraph.py
 +++ b/lib/_emerge/depgraph.py
-@@ -443,6 +443,9 @@
-         self._pkg_cache = {}
-         # See depgraph._iter_match_pkgs_atom.
-         self._match_pkgs_atom_memo = {}
+@@ -454,1 +454,4 @@
+-        self._highest_license_masked = {}
 +        # (root, pkg, USE flags) -> frozenset of atoms, see
 +        # depgraph._select_atoms_probe_certain.
 +        self._probe_certain_cache = {}
-         self._highest_license_masked = {}
-         # We can't know that an soname dep is unsatisfied if there are
-         # any unbuilt ebuilds in the graph, since unbuilt ebuilds have
-@@ -2885,11 +2888,22 @@
++        self._highest_license_masked = {}
+@@ -2892,11 +2895,22 @@
                          # to see if this atom is really desirable, since
                          # otherwise we may trigger an undesirable rebuild
                          # as in bug #460304.
@@ -78,7 +78,7 @@ package count as unpatched 3.0.83.
                          if atom_not_selected:
                              break
  
-@@ -2906,11 +2920,20 @@
+@@ -2913,11 +2927,20 @@
                  # an soname atom which is unconditionally selected, and
                  # _select_atoms_probe is not applicable.
                  if atom_not_selected is None and unevaluated_atom is not None:
@@ -102,7 +102,7 @@ package count as unpatched 3.0.83.
  
                  if atom_not_selected:
                      continue
-@@ -3247,6 +3270,98 @@
+@@ -3254,6 +3277,98 @@
              memo.select_atoms_probe[(root, pkg)] = result
          return result
  

@@ -1,5 +1,8 @@
 config: compute the USE of an ebuild Package without setcpv()
 
+Sub-series: A (probe, match and config memos) - patch 8 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs 0012 only.
+
 Creating a Package for an ebuild called setcpv() only to read five values
 back: PORTAGE_USE, USE_EXPAND, USE_EXPAND_HIDDEN, useforce and usemask.
 config._pkg_use_fast(pkg) computes the same five values without setcpv():

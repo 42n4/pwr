@@ -1,5 +1,8 @@
 depgraph: one memo table per slot-operator probe (no functional change)
 
+Sub-series: A (probe, match and config memos) - patch 6 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs 0001, 0004, 0005 only.
+
 The probe memo of patches 0001, 0004 and 0005 was one dict with tagged
 tuple keys. It becomes an object with one dict per probe
 (_ProbeMemo: select_atoms_probe, upgrade_available, downgrade_probe,

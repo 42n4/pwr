@@ -1,5 +1,8 @@
 depgraph: replay _iter_match_pkgs_atom results across backtracking runs
 
+Sub-series: A (probe, match and config memos) - patch 2 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs none: it also applies to 3.0.83 by itself.
+
 Every backtracking run asks for the matches of the same atoms again. The
 result depends on the arguments and on state shared by all runs through
 _frozen_config, except when onlydeps is set or the package has a recorded

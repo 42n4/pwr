@@ -18,10 +18,11 @@ HOMEPAGE="https://wiki.gentoo.org/wiki/Project:Portage"
 # series (most valuable change first) that shows where the resolver speed-up
 # comes from. The highest revision, -r9, is the complete build and the one in
 # daily use; the lower revisions are comparison steps, installed only by their
-# exact atom to measure them. Port the series, not the two large patches of
+# exact atom to measure them. The patches form 13 independent sub-series
+# (files/ladder-3.0.83/README). Port the series, not the two large patches of
 # portage-9998, to a new Portage release.
 #   9999 none, -r1 0001, -r2 0001-0003, -r3 0001-0009, -r4 0001-0011,
-#   -r5 0001-0014, -r6 0001-0016, -r7 0001-0018, -r8 0001-0025 (all Python),
+#   -r5 0001-0014, -r6 0001-0016, -r7 0001-0018, -r8 0001-0030 (all Python),
 #   -r9 all Python + C modules
 # This step: patches 0001-0011, adds the cycle-closure tracker (about -54 %).
 # Figures: resolve seconds summed over six test states; see the patch headers.

@@ -1,13 +1,6 @@
-dep, depgraph: one-atom match path, string-keyed atom caches, slot reads, unbounded version caches
+dep, versions: one-atom match path, slot reads for Atom attributes, unbounded version caches
 
-Five caches are keyed by (atom, atom.unevaluated_atom): the match caches
-of PackageTracker, PackageVirtualDbapi and the composite db, the cross-run
-match memo and _highest_pkg_cache. An Atom hashes and compares by its
-string through Python-level methods; for plain Atoms the key now holds the
-two strings, which finds the same entries without those calls.
-PackageVirtualDbapi.match() also skips dep_expand() for a plain
-non-virtual Atom (it would return the atom as it is), and
-PackageTracker.match() reads the slots of a plain Atom directly.
+Sub-series: H (atom matching caches) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
 
 match_from_list() with one plain Atom and a one-element list is the
 resolver's most frequent match. A short path (_match_single) performs the
@@ -24,21 +17,19 @@ Fifteen Atom properties that only return one slot (cp, cpv, slot,
 operator, use, unevaluated_atom, ...) are replaced on the class by the slot
 descriptors themselves, so reading them needs no Python call.
 
-On top of patches 0001-0020, resolve seconds before -> after
-(median of the runs, at least 2 per figure):
+This is patch 0021 of the 25-patch ladder without its fourth piece, the
+string-keyed atom caches in _emerge, which changes a line of patch 0002
+and is now patch 0028 (sub-series A). The figures that follow are those of
+the four pieces together, on top of patches 0001-0020, resolve seconds
+before -> after (median of the runs, at least 2 per figure):
   start 25.7 -> 24.0, holds 12.9 -> 12.2, masks 27.2 -> 25.4,
   py313 15.8 -> 15.1, bdeps 18.5 -> 17.5, policykit 13.2 -> 12.4
   sum of six 113.3 -> 106.6 (-6.6 s, -1.5 % of the stock sum 447.5)
-Patches 0001-0021 together: 447.5 -> 106.6 s (-76 %); 447.5 is the
-stock sum of the ladder run of 2026-11-20, stock was not run again here.
-
-Four pieces grouped by theme (matching one atom, and the caches keyed by
-atoms); alone on 0001-0009 none of them was distinguishable from noise on
-the start state.
+Alone on 0001-0009 none of the pieces was distinguishable from noise on
+the start state. The three pieces kept here alone on stock 3.0.83: see
+README (sub-series H).
 
 Weak spots and what was not checked:
-* Relies on Atom.__eq__/__hash__ using the string alone; subclasses keep
-  Atom keys.
 * A second implementation of part of match_from_list() that has to be kept
   in step with it.
 * The two caches now grow without bound for the life of the process (a
@@ -48,149 +39,13 @@ Weak spots and what was not checked:
   assigns them was not searched.
 
 Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
-isolated from the full patch and measured on 2026-11-20..21. Not a human-written
-change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
-one system image, one resolve at a time; every run gave the same merge list
-in the same order, the same number of backtracking attempts and the same
-package count as unpatched 3.0.83.
+isolated from the full patch and measured on 2026-11-20..21; cut out of its
+former patch on 2026-11-21 without changing a line of code. Not a
+human-written change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on
+six states of one system image, one resolve at a time; every run gave the
+same merge list in the same order, the same number of backtracking attempts
+and the same package count as unpatched 3.0.83.
 ---
---- a/lib/_emerge/PackageVirtualDbapi.py
-+++ b/lib/_emerge/PackageVirtualDbapi.py
-@@ -3,6 +3,7 @@
- 
- from portage.dbapi import dbapi
- from portage.dbapi.dep_expand import dep_expand
-+from portage.dep import Atom
- 
- 
- class PackageVirtualDbapi(dbapi):
-@@ -73,8 +74,27 @@
-             self._match_cache = {}
- 
-     def match(self, origdep, use_cache=1):
--        atom = dep_expand(origdep, mydb=self, settings=self.settings)
--        cache_key = (atom, atom.unevaluated_atom)
-+        if (
-+            origdep.__class__ is Atom
-+            and not origdep.cp.startswith("virtual/")
-+            and origdep.cp != "virtual"
-+        ):
-+            # dep_expand() returns an Atom of another category than
-+            # "virtual" as it is, without looking at anything else.
-+            atom = origdep
-+        else:
-+            atom = dep_expand(origdep, mydb=self, settings=self.settings)
-+        unevaluated_atom = atom.unevaluated_atom
-+        if atom.__class__ is Atom and unevaluated_atom.__class__ is Atom:
-+            # Atoms compare equal, and hash, by their string alone
-+            # (Atom.__eq__, Atom.__hash__), so a key made of the strings of
-+            # two plain Atoms finds the same cache entries as a key made of
-+            # the Atoms (and as the string keys of cp_list() below, like
-+            # before). It is hashed and compared without a Python level
-+            # call per Atom.
-+            cache_key = (atom._string, unevaluated_atom._string)
-+        else:
-+            cache_key = (atom, unevaluated_atom)
-         result = self._match_cache.get(cache_key)
-         if result is not None:
-             return result[:]
---- a/lib/_emerge/depgraph.py
-+++ b/lib/_emerge/depgraph.py
-@@ -374,6 +374,21 @@
-             items.append(item)
- 
- 
-+def _atom_key(atom):
-+    """
-+    What stands for an atom in the key of a cache dict: the string of a
-+    plain Atom, anything else as it is. Atoms compare equal, and hash, by
-+    their string alone (Atom.__eq__, Atom.__hash__; an Atom equals its
-+    string, too), so a key with the string in place of the Atom finds
-+    exactly the same dict entries. The string is hashed and compared
-+    without a Python level call, and the resolver makes these lookups
-+    several hundred thousand times per run.
-+    """
-+    if atom.__class__ is Atom:
-+        return atom._string
-+    return atom
-+
-+
- def _find_single_atom(atom, pkg, modified_use=None):
-     """
-     For an atom that is an instance of exactly Atom without extended
-@@ -7606,11 +7621,12 @@
-         use_changes = self._dynamic_config._needed_use_config_changes
-         start = 0
-         if not (onlydeps or use_changes):
-+            # The two atoms are keyed by their strings, see _atom_key().
-             memo_key = (
-                 root_config,
-                 pkg_type,
--                atom,
--                atom.unevaluated_atom,
-+                _atom_key(atom),
-+                _atom_key(atom.unevaluated_atom),
-                 "remove" in self._dynamic_config.myparams,
-             )
-             memo = self._frozen_config._match_pkgs_atom_memo.get(memo_key)
-@@ -7821,10 +7837,11 @@
- 
-     def _select_pkg_highest_available(self, root, atom, onlydeps=False, parent=None):
-         if atom.package:
-+            # The two atoms are keyed by their strings, see _atom_key().
-             cache_key = (
-                 root,
--                atom,
--                atom.unevaluated_atom,
-+                _atom_key(atom),
-+                _atom_key(atom.unevaluated_atom),
-                 onlydeps,
-                 self._dynamic_config._autounmask,
-             )
-@@ -12655,7 +12672,8 @@
-         return ret
- 
-     def match_pkgs(self, atom):
--        cache_key = (atom, atom.unevaluated_atom)
-+        # The two atoms are keyed by their strings, see _atom_key().
-+        cache_key = (_atom_key(atom), _atom_key(atom.unevaluated_atom))
-         ret = self._match_cache.get(cache_key)
-         if ret is not None:
-             for pkg in ret:
---- a/lib/_emerge/resolver/package_tracker.py
-+++ b/lib/_emerge/resolver/package_tracker.py
-@@ -234,11 +234,26 @@
-         packages may also be returned.
-         """
- 
--        if atom.soname:
--            return iter(self._provides_index.get((root, atom), []))
--
--        cp_key = root, atom.cp
--        cache_key = root, atom, atom.unevaluated_atom, installed
-+        if atom.__class__ is Atom:
-+            # A plain Atom is not an soname atom (Atom.soname is False), and
-+            # its cp and unevaluated_atom properties return these attributes.
-+            cp_key = root, atom._cp
-+            unevaluated_atom = atom._unevaluated_atom
-+        else:
-+            if atom.soname:
-+                return iter(self._provides_index.get((root, atom), []))
-+            cp_key = root, atom.cp
-+            unevaluated_atom = atom.unevaluated_atom
-+        if atom.__class__ is Atom and unevaluated_atom.__class__ is Atom:
-+            # Atoms compare equal, and hash, by their string alone
-+            # (Atom.__eq__, Atom.__hash__), so a key made of the strings of
-+            # two plain Atoms finds the same cache entries as a key made of
-+            # the Atoms. It is hashed and compared without a Python level
-+            # call per Atom; this lookup is made several hundred thousand
-+            # times per run.
-+            cache_key = root, atom._string, unevaluated_atom._string, installed
-+        else:
-+            cache_key = root, atom, unevaluated_atom, installed
-         try:
-             return iter(self._match_cache.get(cp_key, {})[cache_key])
-         except KeyError:
 --- a/lib/portage/dep/__init__.py
 +++ b/lib/portage/dep/__init__.py
 @@ -1892,6 +1892,7 @@

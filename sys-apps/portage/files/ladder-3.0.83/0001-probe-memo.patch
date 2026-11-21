@@ -1,5 +1,7 @@
 depgraph: remember _select_atoms_probe results while _slot_operator_trigger_reinstalls runs
 
+Sub-series: A (probe, match and config memos) - patch 1 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+
 _slot_operator_trigger_reinstalls probes every slot-operator dependency up
 to twice, and each probe runs dep_check over all dependency strings of a
 candidate parent. Dependencies that share a parent ask the same question

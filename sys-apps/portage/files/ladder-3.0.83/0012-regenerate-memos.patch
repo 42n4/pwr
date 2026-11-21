@@ -1,5 +1,8 @@
 config: remember the stacked incrementals and USE of regenerate() per input
 
+Sub-series: A (probe, match and config memos) - patch 5 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs none: it also applies to 3.0.83 by itself.
+
 config.setcpv() calls regenerate() for every package, and regenerate()
 stacks every incremental variable and then USE from the same values again
 and again. The two stacking loops are moved, unchanged, into module

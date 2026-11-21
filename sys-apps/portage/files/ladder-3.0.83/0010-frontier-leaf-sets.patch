@@ -1,5 +1,8 @@
 _serialize_frontier: keep the leaves of each level as a set, journal the mutations
 
+Sub-series: B (cycle search and frontier) - patch 4 of 6; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs 0003, 0006 only.
+
 _serialize_tasks asks the frontier for the leaves of a priority level in
 every pass of its selection loop. The frontier kept a heap of order-indices
 per level with lazy deletion, so ready_nodes() drained and rebuilt the heap
@@ -126,8 +129,7 @@ package count as unpatched 3.0.83.
  
      def _compute_mask(self, priorities):
          """Bitmask of the levels whose filter this edge survives.
-@@ -138,34 +136,18 @@
-         return result
+@@ -139,32 +137,16 @@
  
      def ready_nodes(self, level):
 -        """Return the nodes that are leaves under `level`, in mygraph.order.
@@ -172,7 +174,6 @@ package count as unpatched 3.0.83.
 +        return self._leaf[level]
  
      def remove(self, node):
-         """Account for `node` leaving the graph. Must be called while the graph
 @@ -174,12 +156,12 @@
          node_data = self._graph.nodes.get(node)
          if node_data is None:

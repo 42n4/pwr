@@ -1,0 +1,223 @@
+config: small memos and trims in the per-package config work
+
+Sub-series: K (config trims) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
+
+Smaller savings in the per-package config work: getUseMask() and
+getUseForce() reuse the stacked result for equal token lists, the
+ACCEPT_LICENSE stack of getMissingLicenses() is remembered per token
+tuple (not when "*" makes it depend on the package), config._getitem()
+finds a missing key without raising KeyError once per dict, and setcpv()
+builds the RESTRICT/PROPERTIES USE set once instead of twice.
+
+This is the config part of patch 0025 of the 25-patch ladder
+(config-trims-and-leftovers), which is now patches 0022, 0025, 0026, 0027
+and 0030. As a step of the second order that was measured (chain-prelim2)
+these config trims were 4.5 s; the pieces of 0025 were not measured one by
+one in the final order. Together, on top of patches 0001-0024: sum of six
+states 95.9 -> 90.5 s (-5.5 s, -1.2 % of the stock sum 447.5). Alone on
+stock 3.0.83: see README (sub-series K).
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21; cut out of its
+former patch on 2026-11-21 without changing a line of code. Not a
+human-written change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on
+six states of one system image, one resolve at a time; every run gave the
+same merge list in the same order, the same number of backtracking attempts
+and the same package count as unpatched 3.0.83.
+---
+--- a/lib/portage/package/ebuild/_config/LicenseManager.py
++++ b/lib/portage/package/ebuild/_config/LicenseManager.py
+@@ -13,6 +13,46 @@
+ from portage.versions import _pkg_str, cpv_getkey
+ 
+ 
++# tuple of ACCEPT_LICENSE tokens -> frozenset of the accepted licenses
++_stack_accept_license_memo = {}
++_STACK_ACCEPT_LICENSE_MEMO_MAX = 1024
++
++
++def _stack_accept_license(accept_license, licenses):
++    """
++    The loop of getMissingLicenses() that stacks the ACCEPT_LICENSE tokens
++    of a package into the set of accepted licenses. The set depends on the
++    token sequence and, only through a "*" token, on the licenses of the
++    package. Without such a token it is therefore taken from a memo keyed by
++    the tokens: the expanded ACCEPT_LICENSE has hundreds of tokens and is the
++    same for all packages without a package.license entry. The caller only
++    tests membership, so sharing one frozenset is fine.
++    """
++    key = tuple(accept_license)
++    acceptable_licenses = _stack_accept_license_memo.get(key)
++    if acceptable_licenses is not None:
++        return acceptable_licenses
++    acceptable_licenses = set()
++    uses_licenses = False
++    for x in accept_license:
++        if x == "*":
++            uses_licenses = True
++            acceptable_licenses.update(licenses)
++        elif x == "-*":
++            acceptable_licenses.clear()
++        elif x[:1] == "-":
++            acceptable_licenses.discard(x[1:])
++        else:
++            acceptable_licenses.add(x)
++    if (
++        not uses_licenses
++        and len(_stack_accept_license_memo) < _STACK_ACCEPT_LICENSE_MEMO_MAX
++    ):
++        acceptable_licenses = frozenset(acceptable_licenses)
++        _stack_accept_license_memo[key] = acceptable_licenses
++    return acceptable_licenses
++
++
+ class LicenseManager:
+     def __init__(self, locations_manager, user_config=True):
+         self._accept_license_str = None
+@@ -188,16 +228,9 @@
+         licenses = set(use_reduce(lic, matchall=1, flat=True))
+         licenses.discard("||")
+ 
+-        acceptable_licenses = set()
+-        for x in self._getPkgAcceptLicense(cpv, slot, repo):
+-            if x == "*":
+-                acceptable_licenses.update(licenses)
+-            elif x == "-*":
+-                acceptable_licenses.clear()
+-            elif x[:1] == "-":
+-                acceptable_licenses.discard(x[1:])
+-            else:
+-                acceptable_licenses.add(x)
++        acceptable_licenses = _stack_accept_license(
++            self._getPkgAcceptLicense(cpv, slot, repo), licenses
++        )
+ 
+         license_str = lic
+         if "?" in license_str:
+--- a/lib/portage/package/ebuild/_config/UseManager.py
++++ b/lib/portage/package/ebuild/_config/UseManager.py
+@@ -31,6 +31,34 @@
+ from portage.versions import _pkg_str
+ 
+ 
++# tuple of the stacked token tuples -> frozenset of the stacked result
++_stack_use_lists_memo = {}
++_STACK_USE_LISTS_MEMO_MAX = 4096
++
++
++def _stack_use_lists(lists):
++    """
++    Return frozenset(stack_lists(lists, incremental=True)) for the lists of
++    USE flag strings that getUseMask() and getUseForce() collect. With these
++    arguments stack_lists is a pure function of the token sequences (it
++    prints nothing and reads nothing else), the tokens are plain strings and
++    the result is immutable, so the result for an equal argument is reused.
++    Nearly all packages collect the same lists (those of the profiles).
++    """
++    try:
++        key = tuple([x if x.__class__ is tuple else tuple(x) for x in lists])
++        return _stack_use_lists_memo[key]
++    except KeyError:
++        pass
++    except TypeError:
++        # Unhashable token: not memoized.
++        return frozenset(stack_lists(lists, incremental=True))
++    result = frozenset(stack_lists(lists, incremental=True))
++    if len(_stack_use_lists_memo) < _STACK_USE_LISTS_MEMO_MAX:
++        _stack_use_lists_memo[key] = result
++    return result
++
++
+ class UseManager:
+     def __init__(
+         self, repositories, profiles, abs_user_config, is_stable, user_config=True
+@@ -500,7 +528,7 @@
+                     if pkg_usemask:
+                         usemask.extend(pkg_usemask)
+ 
+-        return frozenset(stack_lists(usemask, incremental=True))
++        return _stack_use_lists(usemask)
+ 
+     def getUseForce(self, pkg=None, stable=None):
+         if pkg is None:
+@@ -558,7 +586,7 @@
+                     if pkg_useforce:
+                         useforce.extend(pkg_useforce)
+ 
+-        return frozenset(stack_lists(useforce, incremental=True))
++        return _stack_use_lists(useforce)
+ 
+     def getPUSE(self, pkg):
+         cp = getattr(pkg, "cp", None)
+--- a/lib/portage/package/ebuild/config.py
++++ b/lib/portage/package/ebuild/config.py
+@@ -2395,22 +2395,21 @@
+                     )
+                     restrict = use_reduce(raw_restrict, uselist=built_use, flat=True)
+                 else:
++                    # Both calls used to build this same set: nothing
++                    # changes USE or IUSE between them.
++                    restrict_uselist = frozenset(
++                        x
++                        for x in self["USE"].split()
++                        if x in explicit_iuse or iuse_implicit_match(x)
++                    )
+                     properties = use_reduce(
+                         raw_properties,
+-                        uselist=frozenset(
+-                            x
+-                            for x in self["USE"].split()
+-                            if x in explicit_iuse or iuse_implicit_match(x)
+-                        ),
++                        uselist=restrict_uselist,
+                         flat=True,
+                     )
+                     restrict = use_reduce(
+                         raw_restrict,
+-                        uselist=frozenset(
+-                            x
+-                            for x in self["USE"].split()
+-                            if x in explicit_iuse or iuse_implicit_match(x)
+-                        ),
++                        uselist=restrict_uselist,
+                         flat=True,
+                     )
+             except PortageException:
+@@ -3570,8 +3569,6 @@
+                 return ""
+ 
+     def _getitem(self, mykey):
+-        from portage.data import portage_gid
+-
+         if mykey in self._constant_keys:
+             # These two point to temporary values when
+             # portage plans to update itself.
+@@ -3597,9 +3594,28 @@
+                 return ":".join(value)
+ 
+             if mykey == "PORTAGE_GID":
++                from portage.data import portage_gid
++
+                 return f"{portage_gid}"
+ 
+         for d in self.lookuplist:
++            # For the two classes that the list is made of, find out without
++            # raising and catching KeyError that d[mykey] would raise it:
++            # a dict raises it iff the key is not in it, and
++            # LazyItemsDict.__getitem__ looks into lazy_items and then into
++            # data, nowhere else. A lookup of a missing key walks the whole
++            # list, and regenerate() does that for every USE_EXPAND variable.
++            d_class = d.__class__
++            if d_class is dict:
++                if mykey in d:
++                    return d[mykey]
++                continue
++            if (
++                d_class is LazyItemsDict
++                and mykey not in d.data
++                and mykey not in d.lazy_items
++            ):
++                continue
+             try:
+                 return d[mykey]
+             except KeyError:

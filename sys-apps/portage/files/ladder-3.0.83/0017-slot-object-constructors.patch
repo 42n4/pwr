@@ -1,5 +1,7 @@
 SlotObject: set ordinary slots directly; explicit constructors for Dependency and _dep_choice
 
+Sub-series: F (slot-object constructors) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
+
 SlotObject.__init__ probed every slot with getattr() before setting it.
 For a class whose slots are all ordinary (named once, no property or class
 attribute in front of them; checked once per class) the probe of a new

@@ -1,5 +1,8 @@
 depgraph: one-node shortcut in find_smallest_cycle
 
+Sub-series: B (cycle search and frontier) - patch 3 of 6; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs none: it also applies to 3.0.83 by itself.
+
 A candidate with no child at the current level is its own closure, and
 no closure is smaller than one node, so the search can stop there.
 Alone on 3.0.83: start 119.6 -> 110.0; no effect on short merge lists.

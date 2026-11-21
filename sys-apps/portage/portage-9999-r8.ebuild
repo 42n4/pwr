@@ -18,12 +18,13 @@ HOMEPAGE="https://wiki.gentoo.org/wiki/Project:Portage"
 # series (most valuable change first) that shows where the resolver speed-up
 # comes from. The highest revision, -r9, is the complete build and the one in
 # daily use; the lower revisions are comparison steps, installed only by their
-# exact atom to measure them. Port the series, not the two large patches of
+# exact atom to measure them. The patches form 13 independent sub-series
+# (files/ladder-3.0.83/README). Port the series, not the two large patches of
 # portage-9998, to a new Portage release.
 #   9999 none, -r1 0001, -r2 0001-0003, -r3 0001-0009, -r4 0001-0011,
-#   -r5 0001-0014, -r6 0001-0016, -r7 0001-0018, -r8 0001-0025 (all Python),
+#   -r5 0001-0014, -r6 0001-0016, -r7 0001-0018, -r8 0001-0030 (all Python),
 #   -r9 all Python + C modules
-# This step: patches 0001-0025, all Python changes (93.0 s, -79 %); the patched sources
+# This step: patches 0001-0030, all Python changes (93.0 s, -79 %); the patched sources
 # equal those of the first tested Python-only build byte for byte.
 # Figures: resolve seconds summed over six test states; see the patch headers.
 # The patches come from agent runs (stated in the header of each patch).
@@ -128,10 +129,15 @@ PATCHES=(
 	"${FILESDIR}"/ladder-3.0.83/0019-pretend-gc-off-fast-exit.patch
 	"${FILESDIR}"/ladder-3.0.83/0020-flat-dep-lists.patch
 	"${FILESDIR}"/ladder-3.0.83/0021-atom-matching-caches.patch
-	"${FILESDIR}"/ladder-3.0.83/0022-probe-certain-atoms.patch
+	"${FILESDIR}"/ladder-3.0.83/0022-required-use-memo.patch
 	"${FILESDIR}"/ladder-3.0.83/0023-priority-copy.patch
 	"${FILESDIR}"/ladder-3.0.83/0024-frontier-mergeable-set-node-removal.patch
-	"${FILESDIR}"/ladder-3.0.83/0025-config-trims-and-leftovers.patch
+	"${FILESDIR}"/ladder-3.0.83/0025-config-trims.patch
+	"${FILESDIR}"/ladder-3.0.83/0026-flatten-atoms-memo.patch
+	"${FILESDIR}"/ladder-3.0.83/0027-leftovers.patch
+	"${FILESDIR}"/ladder-3.0.83/0028-atom-key-caches.patch
+	"${FILESDIR}"/ladder-3.0.83/0029-probe-certain-atoms.patch
+	"${FILESDIR}"/ladder-3.0.83/0030-use-reduce-store-rewrap.patch
 )
 
 pkg_pretend() {

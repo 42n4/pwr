@@ -1,5 +1,7 @@
 depgraph, sets: match one atom against one package without a package set
 
+Sub-series: E (single-atom lookups) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
+
 The resolver asks "does this one atom match this package" by building an
 InternalPackageSet of one atom and calling findAtomForPackage(), and it
 asks the argument, --exclude and similar sets about every package although
@@ -37,8 +39,7 @@ package count as unpatched 3.0.83.
      _build_id_separator,
      _repo_separator,
      _slot_separator,
-@@ -373,6 +374,41 @@
-             items.append(item)
+@@ -374,4 +375,39 @@
  
  
 +def _find_single_atom(atom, pkg, modified_use=None):
@@ -78,7 +79,6 @@ package count as unpatched 3.0.83.
 +
  class _frozen_depgraph_config:
      def __init__(self, settings, trees, myopts, params, spinner):
-         self.settings = settings
 @@ -2646,10 +2682,19 @@
                          # by backtracking if necessary.
                          continue
@@ -154,8 +154,7 @@ package count as unpatched 3.0.83.
  
              # descending order
              cp_list.reverse()
-@@ -7611,9 +7691,15 @@
-                         # Also, parts of the match that require metadata access
+@@ -7612,7 +7692,13 @@
                          # are deferred until we have cached the metadata in a
                          # Package instance.
 -                        if not atom_set.findAtomForPackage(
@@ -172,7 +171,6 @@ package count as unpatched 3.0.83.
 +                        if not atom_found:
                              continue
                          matched_something = True
-                         yield cp_list_index + 1, pkg
 --- a/lib/portage/_sets/base.py
 +++ b/lib/portage/_sets/base.py
 @@ -123,6 +123,59 @@

@@ -1,5 +1,7 @@
 emerge --pretend: no cyclic GC during the run, no heap teardown at exit
 
+Sub-series: D (garbage collector) - patch 2 of 2; applies to 3.0.83 with only the earlier patches of this sub-series.
+
 An `emerge --pretend` process only computes and prints a merge list. When
 the process is the emerge program itself and the action is a plain
 --pretend, the cyclic garbage collector is switched off for the whole run

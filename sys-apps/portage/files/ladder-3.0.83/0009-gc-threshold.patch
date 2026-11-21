@@ -1,5 +1,7 @@
 depgraph: raise the garbage collector threshold during backtrack_depgraph
 
+Sub-series: D (garbage collector) - patch 1 of 2; applies to 3.0.83 with only the earlier patches of this sub-series.
+
 Alone on 3.0.83: start 119.6 -> 116.1, masks 91.0 -> 89.2. Changes only
 when unreachable cycles are freed.
 Patches 0001-0009 together, sum of six states: 447.5 -> 239.6 s (-46 %):

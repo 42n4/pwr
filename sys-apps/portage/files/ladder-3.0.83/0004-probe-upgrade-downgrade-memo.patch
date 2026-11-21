@@ -1,5 +1,8 @@
 depgraph: extend the probe memo to _upgrade_available and the downgrade probe
 
+Sub-series: A (probe, match and config memos) - patch 3 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs 0001 only.
+
 Same lifetime and argument as patch 0001, two more repeated questions.
 Over 0001 alone (three states): masks 72.0 -> 67.9, base 24.5 -> 23.6,
 start inside noise. Lock-step: 92,180 and 45,253 hits, 0 mismatches.

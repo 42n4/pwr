@@ -15,7 +15,7 @@ HOMEPAGE="https://wiki.gentoo.org/wiki/Project:Portage"
 
 # REFERENCE ONLY: this is the former portage-9999-r4, kept under 9998 so that
 # it sorts below the patch-series ebuilds. Its two large patches give the same
-# patched sources, byte for byte, as portage-9999-r9 (ladder patches 0001-0025
+# patched sources, byte for byte, as portage-9999-r9 (ladder patches 0001-0030
 # plus the native fast paths). History of the former revisions follows.
 # NOT a git checkout: this is the 3.0.83 release (same tarball and patch as
 # ::gentoo's 3.0.83-r1) plus the resolver speed patch produced by the

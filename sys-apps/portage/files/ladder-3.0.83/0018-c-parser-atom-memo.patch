@@ -1,5 +1,7 @@
 dep: atom memo in the C parser glue, C parser for use_reduce() calls with is_valid_flag
 
+Sub-series: C (use_reduce parser) - patch 2 of 3; applies to 3.0.83 with only the earlier patches of this sub-series.
+
 _c_atom_from_c() built an Atom from a C parser token and then interned it;
 about nine of ten tokens had been seen before (the implementers' count).
 The interned, unevaluated Atom is now remembered per (token string, EAPI),

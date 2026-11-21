@@ -1,5 +1,8 @@
 DepPriority: copy priorities slot by slot, build them from templates
 
+Sub-series: J (priority copy) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
+Unchanged, but the patch before it is now required-use-memo (probe-certain-atoms, the old 0022, is 0029); the step figures below are those of the old order.
+
 A priority object is created or copied for every dependency.
 AbstractDepPriority.copy() does what copy.copy() does for a slots-only
 class without the __reduce_ex__ detour, DepPriority.copy() assigns its ten
@@ -121,18 +124,14 @@ package count as unpatched 3.0.83.
          Note: These priorities are only used for measuring hardness
 --- a/lib/_emerge/depgraph.py
 +++ b/lib/_emerge/depgraph.py
-@@ -305,6 +305,10 @@
-         self.mergelist = mergelist
- 
- 
+@@ -305,1 +305,5 @@
+-        self.mergelist = mergelist
++        self.mergelist = mergelist
++
++
 +# (priority class, keyword arguments) -> instance, see depgraph._priority.
 +_priority_templates = {}
-+
-+
- class _ProbeMemo:
-     """
-     Memo tables for the probe helpers that _slot_operator_trigger_reinstalls
-@@ -5390,7 +5394,22 @@
+@@ -5274,7 +5278,22 @@
              priority_constructor = UnmergeDepPriority
          else:
              priority_constructor = DepPriority
