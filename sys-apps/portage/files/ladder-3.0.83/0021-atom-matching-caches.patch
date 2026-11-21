@@ -1,0 +1,382 @@
+dep, depgraph: one-atom match path, string-keyed atom caches, slot reads, unbounded version caches
+
+Five caches are keyed by (atom, atom.unevaluated_atom): the match caches
+of PackageTracker, PackageVirtualDbapi and the composite db, the cross-run
+match memo and _highest_pkg_cache. An Atom hashes and compares by its
+string through Python-level methods; for plain Atoms the key now holds the
+two strings, which finds the same entries without those calls.
+PackageVirtualDbapi.match() also skips dep_expand() for a plain
+non-virtual Atom (it would return the atom as it is), and
+PackageTracker.match() reads the slots of a plain Atom directly.
+
+match_from_list() with one plain Atom and a one-element list is the
+resolver's most frequent match. A short path (_match_single) performs the
+same tests in the same order for the common atom kinds (no operator, or
+> >= < <=, with or without slot) and leaves blockers, wildcards, repo
+atoms, = =* ~ and USE dependencies to the original code. The kind of an
+atom is computed once and kept in a new slot (_match_kind).
+
+vercmp() and catpkgsplit() get unbounded lru caches (they had 1,024 and
+10,240 entries, fewer than the distinct arguments of one run). Both are
+pure functions of their arguments.
+
+Fifteen Atom properties that only return one slot (cp, cpv, slot,
+operator, use, unevaluated_atom, ...) are replaced on the class by the slot
+descriptors themselves, so reading them needs no Python call.
+
+On top of patches 0001-0020, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 25.7 -> 24.0, holds 12.9 -> 12.2, masks 27.2 -> 25.4,
+  py313 15.8 -> 15.1, bdeps 18.5 -> 17.5, policykit 13.2 -> 12.4
+  sum of six 113.3 -> 106.6 (-6.6 s, -1.5 % of the stock sum 447.5)
+Patches 0001-0021 together: 447.5 -> 106.6 s (-76 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Four pieces grouped by theme (matching one atom, and the caches keyed by
+atoms); alone on 0001-0009 none of them was distinguishable from noise on
+the start state.
+
+Weak spots and what was not checked:
+* Relies on Atom.__eq__/__hash__ using the string alone; subclasses keep
+  Atom keys.
+* A second implementation of part of match_from_list() that has to be kept
+  in step with it.
+* The two caches now grow without bound for the life of the process (a
+  concern for long-running API users, not for emerge).
+* The attributes become assignable: a property without a setter raised
+  AttributeError on assignment, a slot descriptor does not. Whether any code
+  assigns them was not searched.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+--- a/lib/_emerge/PackageVirtualDbapi.py
++++ b/lib/_emerge/PackageVirtualDbapi.py
+@@ -3,6 +3,7 @@
+ 
+ from portage.dbapi import dbapi
+ from portage.dbapi.dep_expand import dep_expand
++from portage.dep import Atom
+ 
+ 
+ class PackageVirtualDbapi(dbapi):
+@@ -73,8 +74,27 @@
+             self._match_cache = {}
+ 
+     def match(self, origdep, use_cache=1):
+-        atom = dep_expand(origdep, mydb=self, settings=self.settings)
+-        cache_key = (atom, atom.unevaluated_atom)
++        if (
++            origdep.__class__ is Atom
++            and not origdep.cp.startswith("virtual/")
++            and origdep.cp != "virtual"
++        ):
++            # dep_expand() returns an Atom of another category than
++            # "virtual" as it is, without looking at anything else.
++            atom = origdep
++        else:
++            atom = dep_expand(origdep, mydb=self, settings=self.settings)
++        unevaluated_atom = atom.unevaluated_atom
++        if atom.__class__ is Atom and unevaluated_atom.__class__ is Atom:
++            # Atoms compare equal, and hash, by their string alone
++            # (Atom.__eq__, Atom.__hash__), so a key made of the strings of
++            # two plain Atoms finds the same cache entries as a key made of
++            # the Atoms (and as the string keys of cp_list() below, like
++            # before). It is hashed and compared without a Python level
++            # call per Atom.
++            cache_key = (atom._string, unevaluated_atom._string)
++        else:
++            cache_key = (atom, unevaluated_atom)
+         result = self._match_cache.get(cache_key)
+         if result is not None:
+             return result[:]
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -374,6 +374,21 @@
+             items.append(item)
+ 
+ 
++def _atom_key(atom):
++    """
++    What stands for an atom in the key of a cache dict: the string of a
++    plain Atom, anything else as it is. Atoms compare equal, and hash, by
++    their string alone (Atom.__eq__, Atom.__hash__; an Atom equals its
++    string, too), so a key with the string in place of the Atom finds
++    exactly the same dict entries. The string is hashed and compared
++    without a Python level call, and the resolver makes these lookups
++    several hundred thousand times per run.
++    """
++    if atom.__class__ is Atom:
++        return atom._string
++    return atom
++
++
+ def _find_single_atom(atom, pkg, modified_use=None):
+     """
+     For an atom that is an instance of exactly Atom without extended
+@@ -7606,11 +7621,12 @@
+         use_changes = self._dynamic_config._needed_use_config_changes
+         start = 0
+         if not (onlydeps or use_changes):
++            # The two atoms are keyed by their strings, see _atom_key().
+             memo_key = (
+                 root_config,
+                 pkg_type,
+-                atom,
+-                atom.unevaluated_atom,
++                _atom_key(atom),
++                _atom_key(atom.unevaluated_atom),
+                 "remove" in self._dynamic_config.myparams,
+             )
+             memo = self._frozen_config._match_pkgs_atom_memo.get(memo_key)
+@@ -7821,10 +7837,11 @@
+ 
+     def _select_pkg_highest_available(self, root, atom, onlydeps=False, parent=None):
+         if atom.package:
++            # The two atoms are keyed by their strings, see _atom_key().
+             cache_key = (
+                 root,
+-                atom,
+-                atom.unevaluated_atom,
++                _atom_key(atom),
++                _atom_key(atom.unevaluated_atom),
+                 onlydeps,
+                 self._dynamic_config._autounmask,
+             )
+@@ -12655,7 +12672,8 @@
+         return ret
+ 
+     def match_pkgs(self, atom):
+-        cache_key = (atom, atom.unevaluated_atom)
++        # The two atoms are keyed by their strings, see _atom_key().
++        cache_key = (_atom_key(atom), _atom_key(atom.unevaluated_atom))
+         ret = self._match_cache.get(cache_key)
+         if ret is not None:
+             for pkg in ret:
+--- a/lib/_emerge/resolver/package_tracker.py
++++ b/lib/_emerge/resolver/package_tracker.py
+@@ -234,11 +234,26 @@
+         packages may also be returned.
+         """
+ 
+-        if atom.soname:
+-            return iter(self._provides_index.get((root, atom), []))
+-
+-        cp_key = root, atom.cp
+-        cache_key = root, atom, atom.unevaluated_atom, installed
++        if atom.__class__ is Atom:
++            # A plain Atom is not an soname atom (Atom.soname is False), and
++            # its cp and unevaluated_atom properties return these attributes.
++            cp_key = root, atom._cp
++            unevaluated_atom = atom._unevaluated_atom
++        else:
++            if atom.soname:
++                return iter(self._provides_index.get((root, atom), []))
++            cp_key = root, atom.cp
++            unevaluated_atom = atom.unevaluated_atom
++        if atom.__class__ is Atom and unevaluated_atom.__class__ is Atom:
++            # Atoms compare equal, and hash, by their string alone
++            # (Atom.__eq__, Atom.__hash__), so a key made of the strings of
++            # two plain Atoms finds the same cache entries as a key made of
++            # the Atoms. It is hashed and compared without a Python level
++            # call per Atom; this lookup is made several hundred thousand
++            # times per run.
++            cache_key = root, atom._string, unevaluated_atom._string, installed
++        else:
++            cache_key = root, atom, unevaluated_atom, installed
+         try:
+             return iter(self._match_cache.get(cp_key, {})[cache_key])
+         except KeyError:
+--- a/lib/portage/dep/__init__.py
++++ b/lib/portage/dep/__init__.py
+@@ -1892,6 +1892,7 @@
+         "_eapi",
+         "_extended_syntax",
+         "_intern_key",
++        "_match_kind",
+         "_operator",
+         "_orig_atom",
+         "_repo",
+@@ -2645,6 +2646,32 @@
+         return bool(match_from_list(self, (pkg,)))
+ 
+ 
++# The properties of Atom that only return the value of one slot are replaced
++# by the descriptor of that slot, which the interpreter reads without calling
++# a Python function (these attributes are read millions of times per
++# resolver run). Reading gives the same value, and raises AttributeError in
++# the same case (slot not set). The property definitions in the class body
++# remain as the documentation of the attributes.
++for _atom_property, _atom_slot in (
++    ("cp", "_cp"),
++    ("cpv", "_cpv"),
++    ("version", "_version"),
++    ("repo", "_repo"),
++    ("slot", "_slot"),
++    ("sub_slot", "_sub_slot"),
++    ("slot_operator", "_slot_operator"),
++    ("operator", "_operator"),
++    ("blocker", "_blocker_obj"),
++    ("eapi", "_eapi"),
++    ("extended_syntax", "_extended_syntax"),
++    ("build_id", "_build_id"),
++    ("use", "_use"),
++    ("unevaluated_atom", "_unevaluated_atom"),
++    ("orig_atom", "_orig_atom"),
++):
++    setattr(Atom, _atom_property, Atom.__dict__[_atom_slot])
++del _atom_property, _atom_slot
++
+ _extended_cp_re_cache = {}
+ 
+ 
+@@ -3197,6 +3224,93 @@
+     return bestm
+ 
+ 
++_match_kinds = {">": 2, ">=": 3, "<": 4, "<=": 5}
++
++
++def _match_kind_init(mydep):
++    """
++    Classify an Atom for _match_single() and remember the class in the
++    atom: 1 if match_from_list() takes its "operator is None" branch for
++    it, 2 to 5 for the operators > >= < <=, and 0 if _match_single() is
++    not to be used (blockers, wildcard atoms, atoms with a repository, the
++    operators = =* ~, and the atoms for which match_from_list() raises or
++    prints a message). These are the statements of match_from_list() up to
++    its branch on the operator; they depend on nothing but the atom, which
++    is immutable.
++    """
++    kind = 0
++    if not mydep.blocker and not mydep.extended_syntax and not mydep.repo:
++        mycpv = mydep.cpv
++        mycpv_cps = catpkgsplit(mycpv)
++        if not mycpv_cps:
++            kind = 1
++        elif mydep != mycpv:
++            if mycpv_cps[2] and mycpv_cps[3]:
++                kind = _match_kinds.get(mydep.operator, 0)
++            else:
++                kind = 1
++    mydep._match_kind = kind
++    return kind
++
++
++def _match_single(mydep, x, kind):
++    """
++    Whether match_from_list(mydep, [x]) returns [x] (True) or [] (False),
++    for an Atom of a kind that _match_kind_init() accepts and a candidate
++    that has a cp attribute (a _pkg_str, a Package, an Atom); None if that
++    has to be found out by match_from_list() itself. The resolver matches
++    one atom against one package several hundred thousand times per run.
++
++    This performs, for the one candidate, the tests of match_from_list() in
++    their order: the cp ("operator is None" branch) or the cp and the
++    version comparison (> >= < <=), then the slot, then USE, and nothing
++    else, since the atom has no repository. Only attributes are read that
++    match_from_list() reads at the same point for a candidate that got as
++    far (in particular the "use" attribute, which a Package computes
++    lazily). The USE dependencies themselves are left to
++    match_from_list(), as is everything unusual.
++    """
++    try:
++        cp = x.cp
++    except AttributeError:
++        return None
++    if cp != mydep._cp:
++        return False
++    if kind != 1:
++        try:
++            result = vercmp(x.version, mydep._version)
++        except ValueError:
++            return None
++        if result is None:
++            return False
++        if kind == 2:
++            if not result > 0:
++                return False
++        elif kind == 3:
++            if not result >= 0:
++                return False
++        elif kind == 4:
++            if not result < 0:
++                return False
++        elif not result <= 0:
++            return False
++    if mydep._slot is not None:
++        try:
++            x.cpv
++        except AttributeError:
++            return None
++        try:
++            x.slot
++        except AttributeError:
++            pass
++        else:
++            if not _match_slot(mydep, x):
++                return False
++    if mydep._unevaluated_atom._use and hasattr(x, "use"):
++        return None
++    return True
++
++
+ def match_from_list(mydep: Union[str, Atom], candidate_list):
+     """
+     Searches list for entries that matches the package.
+@@ -3211,6 +3325,25 @@
+     if not candidate_list:
+         return []
+ 
++    # match-single begin
++    if (
++        mydep.__class__ is Atom
++        and candidate_list.__class__ is list
++        and len(candidate_list) == 1
++    ):
++        # See _match_single().
++        try:
++            kind = mydep._match_kind
++        except AttributeError:
++            kind = _match_kind_init(mydep)
++        if kind:
++            verdict = _match_single(mydep, candidate_list[0], kind)
++            if verdict is not None:
++                if verdict:
++                    return [candidate_list[0]]
++                return []
++    # match-single end
++
+     if isinstance(mydep, Atom):
+         if mydep.blocker:
+             mydep = Atom(str(mydep).lstrip("!"), allow_wildcard=True, allow_repo=True)
+--- a/lib/portage/versions.py
++++ b/lib/portage/versions.py
+@@ -110,7 +110,11 @@
+     return False
+ 
+ 
+-@lru_cache(1024)
++# Unbounded (it was 1024 entries): the resolver compares many more distinct
++# pairs of versions than that, again and again, and the function is a pure
++# function of its arguments (no caller passes silent=0, the only thing
++# that makes it print), so a larger cache returns the same values.
++@lru_cache(None)
+ def vercmp(ver1: str, ver2: str, silent: int = 1) -> Optional[int]:
+     """
+     Compare two versions
+@@ -312,7 +316,9 @@
+ _missing_cat = "null"
+ 
+ 
+-@lru_cache(10240)
++# Unbounded (it was 10240 entries, fewer than the cpvs that one resolver run
++# splits): a pure function of its arguments, silent is not used.
++@lru_cache(None)
+ def catpkgsplit(
+     mydata: Union[str, "_pkg_str"],
+     silent: int = 1,

@@ -13,16 +13,29 @@ inherit meson linux-info python-r1 tmpfiles
 DESCRIPTION="The package management and distribution system for Gentoo"
 HOMEPAGE="https://wiki.gentoo.org/wiki/Project:Portage"
 
-# NOT a git checkout and NOT meant for daily use: one step of a comparison
-# ladder that shows where the speed-up of sys-apps/portage-9999-r4::pwr comes
-# from. All steps are the 3.0.83 release (same tarball and patch as ::gentoo's
-# 3.0.83-r1) plus the first N patches of files/ladder-3.0.83/, ordered from
-# the most valuable change down. 9998 sorts below 9999, so nothing upgrades to
-# a ladder step; install one by its exact atom to measure it.
-#   9998 baseline, -r1 patch 0001, -r2 0001-0003, -r3 0001-0009,
-#   -r4 all Python changes, -r5 all Python changes + C modules (= 9999-r4)
-# This step: the unpatched baseline: the 3.0.83 release exactly as ::gentoo's 3.0.83-r1.
-# The patches come from agent runs (see the header of each patch).
+# REFERENCE ONLY: this is the former portage-9999-r4, kept under 9998 so that
+# it sorts below the patch-series ebuilds. Its two large patches give the same
+# patched sources, byte for byte, as portage-9999-r9 (ladder patches 0001-0025
+# plus the native fast paths). History of the former revisions follows.
+# NOT a git checkout: this is the 3.0.83 release (same tarball and patch as
+# ::gentoo's 3.0.83-r1) plus the resolver speed patch produced by the
+# emerge-fast agent job (stage 3, round 3 winner). The 9999 version keeps it
+# above every ::gentoo release, so it stays until it is removed by hand.
+# Same plan, same merge order, same number of backtracking attempts as the
+# unpatched resolver on every tested state; six states 365 s -> 73 s.
+# -r1: C base types for the hash and equality of Task (Package, Blocker) and
+# Atom (portage.util._hashbase, built with USE=native-extensions; the Python
+# methods stay as the fallback). Same plans; emptytree resolve about 3 % faster.
+# -r2: portage.util._cfast: slot dict lookups (package metadata) and the
+# conversion of the C parser's result to Atoms; about 1.6 % more. Both modules
+# are optional: without their .so files the Python code runs as before.
+# -r3: comparisons that C code calls for every element: the ordering of
+# Package, the comparisons of the dependency priorities and cmp_sort_key;
+# about 1.6 % more. (Atom matching was ported too and measured SLOWER than
+# the Python it replaced, so it is not here.)
+# -r4: three string functions: the _pkg_str constructor, vercmp and
+# catpkgsplit (plain ASCII input; the Python functions for the rest). By
+# instruction count 1.4 % less on an emptytree resolve, 3.1 % on a world update.
 MY_P="${PN}-3.0.83"
 SRC_URI="https://gitweb.gentoo.org/proj/portage.git/snapshot/${MY_P}.tar.bz2"
 S="${WORKDIR}/${MY_P}"
@@ -103,6 +116,8 @@ PDEPEND="
 
 PATCHES=(
 	"${FILESDIR}"/0001-bintree-provide-an-empty-default-for-USER_PATCHES.patch
+	"${FILESDIR}"/portage-3.0.83-emerge-fast-resolver.patch
+	"${FILESDIR}"/portage-3.0.83-native-fastpaths.patch
 )
 
 pkg_pretend() {

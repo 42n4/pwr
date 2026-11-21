@@ -13,25 +13,19 @@ inherit meson linux-info python-r1 tmpfiles
 DESCRIPTION="The package management and distribution system for Gentoo"
 HOMEPAGE="https://wiki.gentoo.org/wiki/Project:Portage"
 
-# NOT a git checkout: this is the 3.0.83 release (same tarball and patch as
-# ::gentoo's 3.0.83-r1) plus the resolver speed patch produced by the
-# emerge-fast agent job (stage 3, round 3 winner). The 9999 version keeps it
-# above every ::gentoo release, so it stays until it is removed by hand.
-# Same plan, same merge order, same number of backtracking attempts as the
-# unpatched resolver on every tested state; six states 365 s -> 73 s.
-# -r1: C base types for the hash and equality of Task (Package, Blocker) and
-# Atom (portage.util._hashbase, built with USE=native-extensions; the Python
-# methods stay as the fallback). Same plans; emptytree resolve about 3 % faster.
-# -r2: portage.util._cfast: slot dict lookups (package metadata) and the
-# conversion of the C parser's result to Atoms; about 1.6 % more. Both modules
-# are optional: without their .so files the Python code runs as before.
-# -r3: comparisons that C code calls for every element: the ordering of
-# Package, the comparisons of the dependency priorities and cmp_sort_key;
-# about 1.6 % more. (Atom matching was ported too and measured SLOWER than
-# the Python it replaced, so it is not here.)
-# -r4: three string functions: the _pkg_str constructor, vercmp and
-# catpkgsplit (plain ASCII input; the Python functions for the rest). By
-# instruction count 1.4 % less on an emptytree resolve, 3.1 % on a world update.
+# NOT a git checkout: the 3.0.83 release (same tarball and patch as ::gentoo's
+# 3.0.83-r1) plus the first N patches of files/ladder-3.0.83/, an ordered
+# series (most valuable change first) that shows where the resolver speed-up
+# comes from. The highest revision, -r9, is the complete build and the one in
+# daily use; the lower revisions are comparison steps, installed only by their
+# exact atom to measure them. Port the series, not the two large patches of
+# portage-9998, to a new Portage release.
+#   9999 none, -r1 0001, -r2 0001-0003, -r3 0001-0009, -r4 0001-0011,
+#   -r5 0001-0014, -r6 0001-0016, -r7 0001-0018, -r8 0001-0025 (all Python),
+#   -r9 all Python + C modules
+# This step: patches 0001-0011, adds the cycle-closure tracker (about -54 %).
+# Figures: resolve seconds summed over six test states; see the patch headers.
+# The patches come from agent runs (stated in the header of each patch).
 MY_P="${PN}-3.0.83"
 SRC_URI="https://gitweb.gentoo.org/proj/portage.git/snapshot/${MY_P}.tar.bz2"
 S="${WORKDIR}/${MY_P}"
@@ -112,8 +106,17 @@ PDEPEND="
 
 PATCHES=(
 	"${FILESDIR}"/0001-bintree-provide-an-empty-default-for-USER_PATCHES.patch
-	"${FILESDIR}"/portage-3.0.83-emerge-fast-resolver.patch
-	"${FILESDIR}"/portage-3.0.83-native-fastpaths.patch
+	"${FILESDIR}"/ladder-3.0.83/0001-probe-memo.patch
+	"${FILESDIR}"/ladder-3.0.83/0002-match-replay.patch
+	"${FILESDIR}"/ladder-3.0.83/0003-mergeable-from-frontier.patch
+	"${FILESDIR}"/ladder-3.0.83/0004-probe-upgrade-downgrade-memo.patch
+	"${FILESDIR}"/ladder-3.0.83/0005-probe-similar-lazy-replay.patch
+	"${FILESDIR}"/ladder-3.0.83/0006-empty-cycle-search-memo.patch
+	"${FILESDIR}"/ladder-3.0.83/0007-one-node-cycle-shortcut.patch
+	"${FILESDIR}"/ladder-3.0.83/0008-use-reduce-store.patch
+	"${FILESDIR}"/ladder-3.0.83/0009-gc-threshold.patch
+	"${FILESDIR}"/ladder-3.0.83/0010-frontier-leaf-sets.patch
+	"${FILESDIR}"/ladder-3.0.83/0011-gather-ok-tracker.patch
 )
 
 pkg_pretend() {

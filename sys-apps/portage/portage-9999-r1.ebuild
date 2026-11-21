@@ -13,16 +13,19 @@ inherit meson linux-info python-r1 tmpfiles
 DESCRIPTION="The package management and distribution system for Gentoo"
 HOMEPAGE="https://wiki.gentoo.org/wiki/Project:Portage"
 
-# NOT a git checkout and NOT meant for daily use: one step of a comparison
-# ladder that shows where the speed-up of sys-apps/portage-9999-r4::pwr comes
-# from. All steps are the 3.0.83 release (same tarball and patch as ::gentoo's
-# 3.0.83-r1) plus the first N patches of files/ladder-3.0.83/, ordered from
-# the most valuable change down. 9998 sorts below 9999, so nothing upgrades to
-# a ladder step; install one by its exact atom to measure it.
-#   9998 baseline, -r1 patch 0001, -r2 0001-0003, -r3 0001-0009,
-#   -r4 all Python changes, -r5 all Python changes + C modules (= 9999-r4)
-# This step: the nine isolated resolver changes (ladder patches 0001-0009).
-# The patches come from agent runs (see the header of each patch).
+# NOT a git checkout: the 3.0.83 release (same tarball and patch as ::gentoo's
+# 3.0.83-r1) plus the first N patches of files/ladder-3.0.83/, an ordered
+# series (most valuable change first) that shows where the resolver speed-up
+# comes from. The highest revision, -r9, is the complete build and the one in
+# daily use; the lower revisions are comparison steps, installed only by their
+# exact atom to measure them. Port the series, not the two large patches of
+# portage-9998, to a new Portage release.
+#   9999 none, -r1 0001, -r2 0001-0003, -r3 0001-0009, -r4 0001-0011,
+#   -r5 0001-0014, -r6 0001-0016, -r7 0001-0018, -r8 0001-0025 (all Python),
+#   -r9 all Python + C modules
+# This step: patch 0001, the probe memo (372.7 s, -17 %).
+# Figures: resolve seconds summed over six test states; see the patch headers.
+# The patches come from agent runs (stated in the header of each patch).
 MY_P="${PN}-3.0.83"
 SRC_URI="https://gitweb.gentoo.org/proj/portage.git/snapshot/${MY_P}.tar.bz2"
 S="${WORKDIR}/${MY_P}"
@@ -104,14 +107,6 @@ PDEPEND="
 PATCHES=(
 	"${FILESDIR}"/0001-bintree-provide-an-empty-default-for-USER_PATCHES.patch
 	"${FILESDIR}"/ladder-3.0.83/0001-probe-memo.patch
-	"${FILESDIR}"/ladder-3.0.83/0002-match-replay.patch
-	"${FILESDIR}"/ladder-3.0.83/0003-mergeable-from-frontier.patch
-	"${FILESDIR}"/ladder-3.0.83/0004-probe-upgrade-downgrade-memo.patch
-	"${FILESDIR}"/ladder-3.0.83/0005-probe-similar-lazy-replay.patch
-	"${FILESDIR}"/ladder-3.0.83/0006-empty-cycle-search-memo.patch
-	"${FILESDIR}"/ladder-3.0.83/0007-one-node-cycle-shortcut.patch
-	"${FILESDIR}"/ladder-3.0.83/0008-use-reduce-store.patch
-	"${FILESDIR}"/ladder-3.0.83/0009-gc-threshold.patch
 )
 
 pkg_pretend() {
