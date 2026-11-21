@@ -1,0 +1,46 @@
+Resolver patch series on upstream Portage commit 73646c35d (2026-11-22)
+======================================================================
+
+Base: git commit 73646c35dc3a6ca874a8b12cded662bf7829b85e of proj/portage.git
+(155 commits after the 3.0.83 tag), fetched as a snapshot tarball. Used by
+sys-apps/portage-9999-r10::pwr.
+
+  0001-0030   the series of ../ladder-3.0.83/ (13 sub-series A-M, see its README for
+              what each sub-series is, what it needs and what it gives alone), ported:
+              22 patches unchanged, 3 with context changes only (0002 0013 0019),
+              5 adapted (0005 0014 0015 0016 0026; two hunks of 0015 dropped because
+              upstream has them). Every header has a line "Ported to upstream 73646c35d".
+  0031        sub-series N, stage 4 round 1: five resolver shortcuts recovered from the
+              stage 3 runner-up plus one new; depgraph.py only; needs 0001-0030.
+  0032-0034   sub-series O, stage 4 round 2: keyword-rejected ebuilds stay lazy (needs
+              0031), aux_get() without the event loop (alone), USE stack layer effects
+              (needs 0012).
+  ../portage-73646c35d-native-fastpaths.patch   the C modules _hashbase and _cfast.
+
+All 34 files in numeric order, then the C patch (patch -p1 -F0), give the tree that
+was judged; checked 2026-11-22 against the judged candidate: only the five files that
+the build fills in at install time differ.
+
+Six-state sum of `emerge -p -uND @world` wall seconds, six resolves in parallel, merge
+list in order and backtracking attempts equal to unpatched 73646c35d in every run:
+
+  unpatched 73646c35d                 464.3 s
+  0001-0030 + C modules                96.5 s   (re-measured beside its challengers: 99.5, 89.3)
+  + 0031                               90.1 s   (-9.4 % beside 99.5)
+  + 0032-0034                          82.2 s   (-8 % beside 89.3; my four passes: 88.6 -> 83.4)
+
+About 14 s of every figure, unpatched included, is a test-bed artefact: fresh state
+copies lack metadata cache entries for 27 overlay ebuilds and regenerate them.
+
+NOT included: the metadata prefetch that won stage 4 round 2 (78.5 s). Its whole gain is
+that artefact; with a valid cache it gives nothing, and it starts up to one bash per CPU.
+It is kept in /mnt/db1/qagent/emerge-fast4/r02/c2/ on the build host.
+
+Known differences from unpatched head that do not touch the merge list:
+  * lib/portage/tests/sets/base/test_internal_package_set.py::testFindAtomForPackage
+    fails (patch 0015): the result is equal, the test also asserts that
+    best_match_to_list() was called and the shortcut does not call it.
+  * with FEATURES=strict and an overlay without thin manifests, unpatched head prints
+    one "Manifest not found" line for an older ebuild that the series never asks for.
+
+Origin: every patch was written by AI agents (Claude); see the header of each patch.

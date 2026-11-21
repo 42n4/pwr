@@ -1,0 +1,242 @@
+emerge --pretend: no cyclic GC during the run, no heap teardown at exit
+
+Sub-series: D (garbage collector) - patch 2 of 2; applies to 3.0.83 with only the earlier patches of this sub-series.
+Ported to upstream 73646c35d: context only (the emerge_main hunk follows upstream's new verbose_level() lines)
+
+An `emerge --pretend` process only computes and prints a merge list. When
+the process is the emerge program itself and the action is a plain
+--pretend, the cyclic garbage collector is switched off for the whole run
+(reference counting still frees everything that is not in a cycle);
+_backtrack_depgraph collects once between attempts when more than six
+million net container allocations have piled up, which bounds the memory
+held by the graphs of failed attempts. After run_action() has returned, an
+atexit hook runs the other exit hooks, flushes stdout and stderr and ends
+the process with os._exit(), skipping the heap teardown of about a second.
+It stands back when the return value is not a plain status, when an
+exception was reported, or when flushing fails. The literal threshold of
+patch 0009 becomes a named constant; other callers keep the 0009
+behaviour.
+
+On top of patches 0001-0018, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 28.0 -> 26.9, holds 13.9 -> 13.6, masks 30.7 -> 28.7,
+  py313 16.9 -> 17.0, bdeps 20.1 -> 19.7, policykit 14.3 -> 13.9
+  sum of six 123.9 -> 119.8 (-4.1 s, -0.9 % of the stock sum 447.5)
+Patches 0001-0019 together: 447.5 -> 119.8 s (-73 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Kept as its own patch whatever its size: it changes process behaviour
+(collector off, os._exit) instead of the resolver, and a reviewer may want
+to take or leave it alone. Its step depends on what precedes it: about 11 s
+in the first order that was measured (chain-prelim, single runs, before the
+parser and constructor patches) and about 7 s in the second (chain-prelim2,
+five states). Presumably the collector has less to do once the other patches
+create fewer container objects; that was not verified.
+
+Weak spots and what was not checked:
+* Peak memory of a --pretend run rises (no collection below six million
+  allocations). os._exit() skips interpreter teardown: anything that relied
+  on destructors or on atexit hooks registered after this one would not run.
+  Applies only when __main__ is the emerge script.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -13936,6 +13936,22 @@
+             world_set.unlock()
+ 
+ 
++# Net container allocations between two collections of the youngest garbage
++# collector generation while backtrack_depgraph runs.
++_RESOLVE_GC_THRESHOLD = 500000
++
++
++# For a --pretend run of the emerge program, _emerge.main switches the garbage
++# collector off for the whole process and sets _pretend_gc_limit to
++# _PRETEND_GC_LIMIT (see main._pretend_disable_gc). _backtrack_depgraph then
++# collects by hand between two backtracking attempts when more net container
++# allocations than this have piled up, so that the depgraphs of failed
++# attempts (reference cycles) do not stay in memory without bound. None
++# everywhere else.
++_PRETEND_GC_LIMIT = 6000000
++_pretend_gc_limit = None
++
++
+ def backtrack_depgraph(
+     settings: portage.package.ebuild.config.config,
+     trees: portage._trees_dict,
+@@ -13954,12 +13970,15 @@
+     start_time = time.monotonic()
+     _start_resolution_display(spinner, myopts)
+     # The resolver allocates container objects much faster than it frees
+-    # them, so with the default threshold the cyclic garbage collector runs
+-    # every 2000 net allocations and its full collections walk the whole heap
+-    # again and again. This only changes when unreachable cycles are freed.
++    # them while it builds a graph, so with the default threshold the cyclic
++    # garbage collector starts a collection every 2000 net allocations, and
++    # its full collections walk the whole heap (package cache, graph) over
++    # and over. Let it wait longer between collections while resolving. This
++    # only changes when unreachable cycles (mostly the depgraph of the
++    # previous backtracking run) are freed, not what the resolver computes.
+     gc_threshold = gc.get_threshold()
+-    if 0 < gc_threshold[0] < 500000:
+-        gc.set_threshold(500000, *gc_threshold[1:])
++    if 0 < gc_threshold[0] < _RESOLVE_GC_THRESHOLD:
++        gc.set_threshold(_RESOLVE_GC_THRESHOLD, *gc_threshold[1:])
+     try:
+         success, mydepgraph, favorites, backtracked, max_retries = _backtrack_depgraph(
+             settings, trees, myopts, myparams, myaction, myfiles, spinner
+@@ -14005,6 +14024,15 @@
+             )
+             mydepgraph.display_problems()
+ 
++        if (
++            _pretend_gc_limit is not None
++            and not gc.isenabled()
++            and gc.get_count()[0] > _pretend_gc_limit
++        ):
++            # See _PRETEND_GC_LIMIT. This frees unreachable cycles only, so
++            # it cannot change what the next attempt computes.
++            gc.collect()
++
+         backtrack_parameters = backtracker.get()
+         if debug and backtrack_parameters.runtime_pkg_mask:
+             writemsg_level(
+--- a/lib/_emerge/main.py
++++ b/lib/_emerge/main.py
+@@ -2,6 +2,8 @@
+ # Distributed under the terms of the GNU General Public License v2
+ 
+ import argparse
++import atexit
++import gc
+ import locale
+ import logging
+ import os
+@@ -1257,6 +1259,100 @@
+     return os.EX_OK
+ 
+ 
++def _pretend_shortcuts_wanted(action, opts):
++    """
++    True if this process is the emerge program itself (not some other program
++    that calls emerge_main() as a library function) and it was asked to
++    --pretend a merge (no other action). Such a process only computes a
++    merge list and prints it: nothing is built or merged, and it ends as
++    soon as emerge_main() has returned. That allows two shortcuts which do
++    not change anything it prints, see _pretend_disable_gc() and
++    _pretend_arm_fast_exit().
++    """
++    if action is not None or "--pretend" not in opts:
++        return False
++    main_module = sys.modules.get("__main__")
++    main_file = getattr(main_module, "__file__", None)
++    return (
++        getattr(portage, "_internal_caller", False) is True
++        and isinstance(main_file, str)
++        and os.path.basename(main_file) == "emerge"
++        and getattr(main_module, "emerge_main", None) is emerge_main
++    )
++
++
++def _pretend_disable_gc():
++    """
++    Keep the cyclic garbage collector switched off for the rest of this
++    --pretend process. The resolver builds millions of long-lived container
++    objects, so every collection walks a large heap to free comparatively
++    little, and the process ends right after the result is printed.
++    Reference counting still frees everything that is not part of a
++    reference cycle. This only changes when the memory of unreachable cycles
++    is returned, not what is computed. To bound the memory held by such
++    cycles (mostly the depgraph of each failed backtracking attempt),
++    _backtrack_depgraph() collects once whenever _pretend_gc_limit net
++    container allocations have piled up since the last collection.
++    """
++    from _emerge import depgraph
++
++    if gc.isenabled():
++        gc.disable()
++        depgraph._pretend_gc_limit = depgraph._PRETEND_GC_LIMIT
++
++
++# Set while the interpreter runs the exit hook below.
++_pretend_fast_exit_running = False
++
++
++def _pretend_arm_fast_exit(retval):
++    """
++    Called when run_action() has returned retval in a --pretend run of the
++    emerge program: all that is left to do is to end the process with that
++    status. A normal interpreter shutdown first walks and frees the whole
++    heap (package cache, dependency graphs), which takes about a second and
++    has no visible effect. The hook registered here runs when the interpreter
++    starts to shut down, i.e. after the emerge script has called
++    sys.exit(retval) and has closed its event loop. It runs the exit hooks
++    registered by everybody else, flushes stdout and stderr, and ends the
++    process with the status that sys.exit(retval) gives, without the heap
++    teardown.
++
++    It stands back, and the normal shutdown goes on, if retval is not a
++    plain status, if an exception was reported after emerge_main() returned
++    (then the status is not retval), or if flushing fails.
++    """
++    if retval is None:
++        status = 0
++    elif type(retval) is int and 0 <= retval <= 255:
++        status = retval
++    else:
++        return
++
++    def fast_exit():
++        global _pretend_fast_exit_running
++        if _pretend_fast_exit_running:
++            # Called again by atexit._run_exitfuncs() below.
++            return
++        if (
++            getattr(sys, "last_exc", None) is not None
++            or getattr(sys, "last_value", None) is not None
++        ):
++            return
++        _pretend_fast_exit_running = True
++        try:
++            # The other exit hooks, in their usual order (this one was
++            # registered last, so it is the first one to be called).
++            atexit._run_exitfuncs()
++            sys.stdout.flush()
++            sys.stderr.flush()
++        except BaseException:
++            return
++        os._exit(status)
++
++    atexit.register(fast_exit)
++
++
+ def emerge_main(args: Optional[list[str]] = None):
+     """
+     Entry point of emerge
+@@ -1431,8 +1527,18 @@
+             emerge_config.opts["--verbose"], myopts.get("--verbose", 0)
+         )
+ 
++    # See _pretend_shortcuts_wanted().
++    pretend_shortcuts = _pretend_shortcuts_wanted(
++        emerge_config.action, emerge_config.opts
++    )
++    if pretend_shortcuts:
++        _pretend_disable_gc()
++
+     try:
+-        return run_action(emerge_config)
++        retval = run_action(emerge_config)
++        if pretend_shortcuts:
++            _pretend_arm_fast_exit(retval)
++        return retval
+     finally:
+         # Call destructors for our portdbapi instances.
+         for x in emerge_config.trees.values():

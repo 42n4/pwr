@@ -1,0 +1,188 @@
+depgraph: one memo table per slot-operator probe (no functional change)
+
+Sub-series: A (probe, match and config memos) - patch 6 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs 0001, 0004, 0005 only.
+Ported to upstream 73646c35d: context only (the similar_available hunk, after the adaptation of 0005)
+
+The probe memo of patches 0001, 0004 and 0005 was one dict with tagged
+tuple keys. It becomes an object with one dict per probe
+(_ProbeMemo: select_atoms_probe, upgrade_available, downgrade_probe,
+similar_available), which is the form the tested build has and the form the
+probe changes below extend. Same keys, same lifetime (one
+_slot_operator_trigger_reinstalls call), no change in what is remembered.
+
+On top of patches 0001-0012, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 41.8 -> 41.2, holds 24.1 -> 23.5, masks 45.2 -> 44.5,
+  py313 27.2 -> 27.0, bdeps 31.9 -> 31.9, policykit 24.2 -> 24.0
+  sum of six 194.4 -> 192.2 (-2.2 s, -0.5 % of the stock sum 447.5)
+Patches 0001-0013 together: 447.5 -> 192.2 s (-57 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Kept apart from 0014 so that the functional change there is not mixed with a
+restructuring. This is the replacement of the reduced forms of 0001, 0004
+and 0005. The small step is plausibly the single dict lookup per probe (the
+tagged tuple keys were hashed twice per hit); it was not investigated.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -304,6 +304,27 @@
+         self.mergelist = mergelist
+ 
+ 
++class _ProbeMemo:
++    """
++    Memo tables for the probe helpers that _slot_operator_trigger_reinstalls
++    calls again and again with the same arguments. An instance lives for one
++    call of that method only, see there.
++    """
++
++    __slots__ = (
++        "select_atoms_probe",
++        "upgrade_available",
++        "downgrade_probe",
++        "similar_available",
++    )
++
++    def __init__(self):
++        self.select_atoms_probe = {}
++        self.upgrade_available = {}
++        self.downgrade_probe = {}
++        self.similar_available = {}
++
++
+ class _ReplayIter:
+     """
+     Iterable over the items of the generator that factory() returns. The
+@@ -943,7 +964,9 @@
+ 
+         self._virt_deps_visible_recursion = set()
+         self._virtual_cycle = None
+-        # Only set while _slot_operator_trigger_reinstalls runs.
++
++        # Memo tables of the probe helpers, only set while
++        # _slot_operator_trigger_reinstalls runs (see there).
+         self._probe_memo = None
+ 
+     def _index_binpkgs(self):
+@@ -3279,8 +3302,11 @@
+         within the same slot.
+         """
+         memo = self._probe_memo
+-        if memo is not None and ("upgrade", pkg) in memo:
+-            return memo[("upgrade", pkg)]
++        if memo is not None:
++            try:
++                return memo.upgrade_available[pkg]
++            except KeyError:
++                pass
+         result = False
+         for available_pkg in self._iter_similar_available(pkg, pkg.slot_atom):
+             if available_pkg > pkg:
+@@ -3288,7 +3314,7 @@
+                 break
+ 
+         if memo is not None:
+-            memo[("upgrade", pkg)] = result
++            memo.upgrade_available[pkg] = result
+         return result
+ 
+     def _downgrade_probe(self, pkg):
+@@ -3297,8 +3323,11 @@
+         desirable due to the current version being masked or unavailable.
+         """
+         memo = self._probe_memo
+-        if memo is not None and ("downgrade", pkg) in memo:
+-            return memo[("downgrade", pkg)]
++        if memo is not None:
++            try:
++                return memo.downgrade_probe[pkg]
++            except KeyError:
++                pass
+         available_pkg = None
+         result = None
+         for available_pkg in self._iter_similar_available(pkg, pkg.slot_atom):
+@@ -3311,17 +3340,19 @@
+         if result is None:
+             result = available_pkg is not None
+         if memo is not None:
+-            memo[("downgrade", pkg)] = result
++            memo.downgrade_probe[pkg] = result
+         return result
+ 
+     def _select_atoms_probe(self, root, pkg):
+         memo = self._probe_memo
+-        if memo is None:
+-            return self._select_atoms_probe_imp(root, pkg)
+-        key = ("select_atoms", root, pkg)
+-        result = memo.get(key)
+-        if result is None:
+-            result = memo[key] = self._select_atoms_probe_imp(root, pkg)
++        if memo is not None:
++            try:
++                return memo.select_atoms_probe[(root, pkg)]
++            except KeyError:
++                pass
++        result = self._select_atoms_probe_imp(root, pkg)
++        if memo is not None:
++            memo.select_atoms_probe[(root, pkg)] = result
+         return result
+ 
+     def _select_atoms_probe_imp(self, root, pkg):
+@@ -3406,16 +3437,18 @@
+                 graph_pkg, atom, autounmask_level, selectable_built
+             )
+         # The generator uses graph_pkg only for its root_config and its cp.
++        # The atom is keyed like _highest_pkg_cache keys it. The memo replays
++        # the items lazily, so that no package is examined that the
++        # generator would not have examined for the same consumer.
+         key = (
+-            "similar",
+             graph_pkg.root_config,
+             graph_pkg.cp,
+             atom,
+             atom.unevaluated_atom,
+         )
+-        replay = memo.get(key)
++        replay = memo.similar_available.get(key)
+         if replay is None:
+-            replay = memo[key] = _ReplayIter(
++            replay = memo.similar_available[key] = _ReplayIter(
+                 functools.partial(
+                     self._iter_similar_available_imp, graph_pkg, atom, None, False
+                 )
+@@ -3499,13 +3532,21 @@
+         """
+ 
+         # The loop below probes every slot operator dep twice, and deps that
+-        # share a parent or a child repeat the same sub-probes many times.
+-        # Nothing that runs inside the loop changes what the probes read: it
+-        # only adds to _backtrack_infos and sets _need_restart. So during
+-        # this call a repeated probe can be answered from a memo, which is
+-        # dropped when the loop is done.
++        # share a parent or a child repeat the same sub-probes many times:
++        # _select_atoms_probe for one replacement parent, _upgrade_available
++        # and _downgrade_probe for one package, _iter_similar_available for
++        # one cp and atom. Nothing that runs inside the loop changes what
++        # these four read (the graph, the package tracker, the parent atoms,
++        # the blockers, the runtime masks and autounmask changes, the package
++        # databases): the loop only adds to _backtrack_infos and sets
++        # _need_restart, which the probes do not look at (_select_atoms runs
++        # with _autounmask disabled, and only the autounmask path reads
++        # _need_restart), and it fills caches. So during this call each of
++        # them is a pure function of its arguments, and a repeated call can
++        # be answered from a memo. The memo is dropped when the loop is done,
++        # and everywhere else these helpers run as before.
+         memo_backup = self._probe_memo
+-        self._probe_memo = {}
++        self._probe_memo = _ProbeMemo()
+         try:
+             self._slot_operator_trigger_reinstalls_imp()
+         finally:
