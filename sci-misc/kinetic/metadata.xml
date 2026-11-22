@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+  <longdescription>
+    Inference engine written in Rust that reads GGUF files and stands in
+    for llama-server, llama-cli, llama-bench and llama-quantize with their
+    flags. Runs on the CPU, on NVIDIA GPUs through CUDA and on other GPUs
+    through Vulkan; models larger than the GPU are split by layer or, for
+    mixture-of-experts models, served from an expert cache. Speculative
+    decoding is exact: the output equals plain decoding token for token.
+  </longdescription>
+  <use>
+    <flag name="cuda">Build the CUDA kernels for NVIDIA GPUs (needs nvcc at build time)</flag>
+    <flag name="vulkan">Build the Vulkan backend for AMD, Intel and NVIDIA GPUs</flag>
+  </use>
+  <upstream>
+    <remote-id type="github">Veloresearch/kinetic</remote-id>
+  </upstream>
+</pkgmetadata>

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+  <longdescription>
+    Engine of Kintsugi-27B, a fork of llama.cpp: Escha W2 / EXL3 trellis
+    weight files, a tiered K/V cache split between VRAM and system RAM, a
+    two-stage output head, and MTP, prompt-lookup and DFlash2 block
+    drafting. Stock llama.cpp cannot load the Kintsugi model file.
+    Installed under /opt/llama-kintsugi with kintsugi- prefixed symlinks
+    in /usr/bin to coexist with sci-misc/llama-cpp.
+  </longdescription>
+  <use>
+    <flag name="openssl">Serve and fetch over HTTPS with <pkg>dev-libs/openssl</pkg></flag>
+  </use>
+  <upstream>
+    <remote-id type="github">professorpalmer/Kintsugi-27B</remote-id>
+  </upstream>
+</pkgmetadata>
