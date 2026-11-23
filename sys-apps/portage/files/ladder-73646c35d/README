@@ -3,7 +3,9 @@ Resolver patch series on upstream Portage commit 73646c35d (2026-11-22)
 
 Base: git commit 73646c35dc3a6ca874a8b12cded662bf7829b85e of proj/portage.git
 (155 commits after the 3.0.83 tag), fetched as a snapshot tarball. Used by
-sys-apps/portage-9999-r10::pwr.
+sys-apps/portage-9999-r10::pwr and -r11 (-r11 adds, outside this series,
+../portage-73646c35d-env-update-below-unmerge-group.patch: env-update no longer
+hangs below a parallel unmerge).
 
   0001-0030   the series of ../ladder-3.0.83/ (13 sub-series A-M, see its README for
               what each sub-series is, what it needs and what it gives alone), ported:
