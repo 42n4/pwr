@@ -1,0 +1,201 @@
+Package, depgraph: an ebuild with unaccepted KEYWORDS is not visible; its other masks and its USE stay lazy
+
+Sub-series: O (stage 4, round 2) - patch 1 of 3; needs 0001-0031 (the depgraph hunks touch code of 0031).
+Base: upstream 73646c35d.
+
+Package.visible asks _getMissingKeywords() first. An ebuild that is not
+installed and has unaccepted KEYWORDS is not visible whatever its other masks
+are (_eval_visibility), so the answer is given without the rest of
+_eval_masks(): validating the dependency strings and computing the USE that
+the conditionals in LICENSE, PROPERTIES and RESTRICT need. About a third of the
+ebuilds a resolve looks at end this way. The masks property still computes the
+complete dict by the unchanged _eval_masks() for whoever asks (autounmask,
+messages). In depgraph.py the places that computed USE for such a package only
+to pass it along now leave it alone.
+
+Judge, four alternating passes, medians: 0001-0031 + 0033 + 0034 85.3 s -> with
+this patch 83.4 s (about -2 s). Alone on 0001-0031 it is inside the noise
+(87.9 against 87.2 s, three passes).
+Origin: written by AI agents (Claude) in stage 4 of the emerge-fast job, 2026-11-21, on
+upstream commit 73646c35d with patches 0001-0030 and the C modules applied. Not a
+human-written change. Judge: `emerge -p -uND @world` on six states of one system image, six
+resolves in parallel, wall seconds summed; every run gave the same merge list in the same
+order and the same number of backtracking attempts as unpatched 73646c35d. Black-box
+testers (invented states, reference against candidate): 0 differences.
+
+The author of patches 0032-0034 was killed by the kernel (memory limit) at its
+last step and left NO report; the description above is from its code comments
+and from a line-by-line review. Its lock-step outputs survive: 35 runs on about
+20 states, 59,111 visibility and mask comparisons, 42,017 USE comparisons,
+0 mismatches. Tester: 12 probes on 0031-0034 together.
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -3945,6 +3945,9 @@
+             matches = self._iter_match_pkgs_any_newer(
+                 graph_pkg.root_config, atom, newer_than, or_equal
+             )
++        # stage4: see _pkgset_inert(); the set cannot change during this
++        # call.
++        excluded_inert = _pkgset_inert(self._frozen_config.excluded_pkgs)
+         for pkg in matches:
+             if pkg.cp != graph_pkg.cp:
+                 # discard old-style virtual match
+@@ -3953,7 +3956,15 @@
+                 continue
+             if pkg in self._dynamic_config._runtime_pkg_mask:
+                 continue
+-            if self._frozen_config.excluded_pkgs.findAtomForPackage(
++            if excluded_inert:
++                # stage4: the call below would return None, see
++                # _pkgset_inert. The USE that its argument computes stays
++                # lazy for an ebuild that was rejected for its KEYWORDS
++                # (Package.visible); the visibility check below drops
++                # most of these.
++                if pkg._use is None and not pkg._keyword_rejected:
++                    pkg.use
++            elif self._frozen_config.excluded_pkgs.findAtomForPackage(
+                 pkg, modified_use=self._pkg_use_enabled(pkg)
+             ):
+                 continue
+@@ -8459,9 +8470,26 @@
+                         # are deferred until we have cached the metadata in a
+                         # Package instance.
+                         if atom_set is None:
+-                            atom_found = _find_single_atom(
+-                                atom, pkg, modified_use=self._pkg_use_enabled(pkg)
+-                            )
++                            if (
++                                pkg._use is None
++                                and pkg._keyword_rejected
++                                and not atom.unevaluated_atom.use
++                                and not self._dynamic_config._needed_use_config_changes
++                            ):
++                                # stage4: USE is not computed for an ebuild
++                                # rejected for its KEYWORDS just to be
++                                # passed along here. _pkg_use_enabled(pkg)
++                                # would return pkg.use.enabled (nothing is
++                                # recorded in _needed_use_config_changes),
++                                # with which _find_single_atom() takes pkg
++                                # as it is, and match_from_list() reads
++                                # the USE of a package only for an atom
++                                # with USE dependencies.
++                                atom_found = _find_single_atom(atom, pkg)
++                            else:
++                                atom_found = _find_single_atom(
++                                    atom, pkg, modified_use=self._pkg_use_enabled(pkg)
++                                )
+                         else:
+                             atom_found = atom_set.findAtomForPackage(
+                                 pkg, modified_use=self._pkg_use_enabled(pkg)
+@@ -9228,8 +9256,13 @@
+ 
+                     if excluded_inert:
+                         # stage4: the call below would return None, see
+-                        # _pkgset_inert.
+-                        if not pkg.installed and pkg._use is None:
++                        # _pkgset_inert. USE stays lazy for an ebuild that
++                        # was rejected for its KEYWORDS (Package.visible).
++                        if (
++                            not pkg.installed
++                            and pkg._use is None
++                            and not pkg._keyword_rejected
++                        ):
+                             pkg.use
+                     elif (
+                         not pkg.installed
+@@ -9280,8 +9313,9 @@
+ 
+                     if useoldpkg_inert:
+                         # stage4: what the call below would return, see
+-                        # _pkgset_inert.
+-                        if pkg._use is None:
++                        # _pkgset_inert. USE stays lazy for an ebuild that
++                        # was rejected for its KEYWORDS (Package.visible).
++                        if pkg._use is None and not pkg._keyword_rejected:
+                             pkg.use
+                         useoldpkg = None
+                     else:
+@@ -10240,8 +10274,12 @@
+ 
+             self._frozen_config._pkg_cache[pkg] = pkg
+ 
++            # stage4: a package that Package.visible rejected for its
++            # KEYWORDS has "KEYWORDS" in its masks, so they are not LICENSE
++            # alone, and they need not be computed to know that.
+             if (
+                 not self._pkg_visibility_check(pkg)
++                and not pkg._keyword_rejected
+                 and "LICENSE" in pkg.masks
+                 and len(pkg.masks) == 1
+             ):
+diff -ruN a/lib/_emerge/Package.py b/lib/_emerge/Package.py
+--- a/lib/_emerge/Package.py
++++ b/lib/_emerge/Package.py
+@@ -246,10 +246,42 @@
+     @property
+     def visible(self):
+         if self._visible is None:
++            if (
++                self._masks is None
++                and self.type_name == "ebuild"
++                and not self.installed
++            ):
++                # stage4: an ebuild with unaccepted KEYWORDS is not visible
++                # whatever its other masks are (_eval_visibility: "KEYWORDS"
++                # in masks and not installed), so the answer is given
++                # without the rest of _eval_masks(): validating all the
++                # dependency strings, and the USE that the conditionals in
++                # LICENSE, PROPERTIES and RESTRICT need. About a third of
++                # the ebuilds a resolve looks at are rejected this way and
++                # never looked at again. self._masks stays None: the masks
++                # property computes the complete dict, by the unchanged
++                # _eval_masks(), for whoever asks (autounmask, messages).
++                # _getMissingKeywords() reads SLOT, KEYWORDS and repository
++                # of the metadata and the configuration, nothing lazy.
++                missing_keywords = self.root_config.settings._getMissingKeywords(
++                    self.cpv, self._metadata
++                )
++                if missing_keywords:
++                    self._visible = False
++                    return False
++                self._masks = self._eval_masks(missing_keywords)
+             self._visible = self._eval_visibility(self.masks)
+         return self._visible
+ 
+     @property
++    def _keyword_rejected(self):
++        """
++        stage4: True while the visible property has answered False from
++        KEYWORDS alone and nobody has asked for the masks since.
++        """
++        return self._visible is False and self._masks is None
++
++    @property
+     def validated_atoms(self):
+         """
+         Returns *all* validated atoms from the deps, regardless
+@@ -447,7 +479,9 @@
+             type_name=self.type_name,
+         )
+ 
+-    def _eval_masks(self):
++    def _eval_masks(self, missing_keywords=None):
++        # stage4: missing_keywords is the list that the visible property
++        # got from the same _getMissingKeywords() call just before, or None.
+         masks = {}
+         settings = self.root_config.settings
+ 
+@@ -463,7 +497,8 @@
+         if portage._eapi_is_deprecated(eapi):
+             masks["EAPI.deprecated"] = eapi
+ 
+-        missing_keywords = settings._getMissingKeywords(self.cpv, self._metadata)
++        if missing_keywords is None:
++            missing_keywords = settings._getMissingKeywords(self.cpv, self._metadata)
+         if missing_keywords:
+             masks["KEYWORDS"] = missing_keywords
+ 

@@ -1,0 +1,70 @@
+depgraph: extend the probe memo to _upgrade_available and the downgrade probe
+
+Sub-series: A (probe, match and config memos) - patch 3 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs 0001 only.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+Same lifetime and argument as patch 0001, two more repeated questions.
+Over 0001 alone (three states): masks 72.0 -> 67.9, base 24.5 -> 23.6,
+start inside noise. Lock-step: 92,180 and 45,253 hits, 0 mismatches.
+Applies to upstream head unchanged.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -3279,25 +3279,41 @@
+         Detect cases where an upgrade of the given package is available
+         within the same slot.
+         """
++        memo = self._probe_memo
++        if memo is not None and ("upgrade", pkg) in memo:
++            return memo[("upgrade", pkg)]
++        result = False
+         for available_pkg in self._iter_similar_available(pkg, pkg.slot_atom):
+             if available_pkg > pkg:
+-                return True
++                result = True
++                break
+ 
+-        return False
++        if memo is not None:
++            memo[("upgrade", pkg)] = result
++        return result
+ 
+     def _downgrade_probe(self, pkg):
+         """
+         Detect cases where a downgrade of the given package is considered
+         desirable due to the current version being masked or unavailable.
+         """
++        memo = self._probe_memo
++        if memo is not None and ("downgrade", pkg) in memo:
++            return memo[("downgrade", pkg)]
+         available_pkg = None
++        result = None
+         for available_pkg in self._iter_similar_available(pkg, pkg.slot_atom):
+             if available_pkg >= pkg:
+                 # There's an available package of the same or higher
+                 # version, so downgrade seems undesirable.
+-                return False
++                result = False
++                break
+ 
+-        return available_pkg is not None
++        if result is None:
++            result = available_pkg is not None
++        if memo is not None:
++            memo[("downgrade", pkg)] = result
++        return result
+ 
+     def _invalidate_probe_caches(self):
+         """

@@ -1,0 +1,53 @@
+depgraph: raise the garbage collector threshold during backtrack_depgraph
+
+Sub-series: D (garbage collector) - patch 1 of 2; applies to 3.0.83 with only the earlier patches of this sub-series.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+Alone on 3.0.83: start 119.6 -> 116.1, masks 91.0 -> 89.2. Changes only
+when unreachable cycles are freed.
+Patches 0001-0009 together, sum of six states: 447.5 -> 239.6 s (-46 %):
+  start 63.2, holds 26.4, masks 48.8, py313 40.0, bdeps 34.5, policykit 26.7
+Applies to upstream head unchanged.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -4,6 +4,7 @@
+ import collections
+ import errno
+ import functools
++import gc
+ import json
+ import logging
+ import os
+@@ -13658,12 +13659,20 @@
+     backtracked, max_retries = -1, -1
+     start_time = time.monotonic()
+     _start_resolution_display(spinner, myopts)
++    # The resolver allocates container objects much faster than it frees
++    # them, so with the default threshold the cyclic garbage collector runs
++    # every 2000 net allocations and its full collections walk the whole heap
++    # again and again. This only changes when unreachable cycles are freed.
++    gc_threshold = gc.get_threshold()
++    if 0 < gc_threshold[0] < 500000:
++        gc.set_threshold(500000, *gc_threshold[1:])
+     try:
+         success, mydepgraph, favorites, backtracked, max_retries = _backtrack_depgraph(
+             settings, trees, myopts, myparams, myaction, myfiles, spinner
+         )
+         return (success, mydepgraph, favorites)
+     finally:
++        gc.set_threshold(*gc_threshold)
+         if spinner is not None and spinner.end_notice():
+             _show_resolution_report(start_time, backtracked, max_retries)
+ 

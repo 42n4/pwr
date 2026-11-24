@@ -1,0 +1,64 @@
+depgraph: remember _select_atoms_probe results while _slot_operator_trigger_reinstalls runs
+
+Sub-series: A (probe, match and config memos) - patch 1 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+_slot_operator_trigger_reinstalls probes every slot-operator dependency up
+to twice, and each probe runs dep_check over all dependency strings of a
+candidate parent. Dependencies that share a parent ask the same question
+again (39,858 calls with 7,517 distinct arguments per loop on the largest
+state). The loop writes only _backtrack_infos and _need_restart, which the
+probe does not read, so within one call the probe is a function of
+(root, pkg). The memo is dropped when the loop ends.
+
+Alone on 3.0.83, resolve seconds stock -> patched:
+  start 121.4 -> 108.3, holds 44.1 -> 36.8, masks 93.5 -> 75.2,
+  py313 73.3 -> 66.5, bdeps 68.5 -> 49.8, policykit 46.7 -> 36.3
+  sum of six 447.5 -> 372.7 (-17 %)
+Lock-step check (memo hit recomputed the original way and compared):
+63,455 hits on three states, 0 mismatches.
+Applies to upstream head 2237c14dd unchanged; there 114.4 -> 102.5 s on start.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -899,6 +899,8 @@
+ 
+         self._virt_deps_visible_recursion = set()
+         self._virtual_cycle = None
++        # Only set while _slot_operator_trigger_reinstalls runs.
++        self._probe_memo = None
+ 
+     def _index_binpkgs(self):
+         for root in self._frozen_config.trees:
+@@ -3462,6 +3464,20 @@
+         rebuilds if they can link to a newer slot that's in the graph.
+         """
+ 
++        # The loop below probes every slot operator dep twice, and deps that
++        # share a parent or a child repeat the same sub-probes many times.
++        # Nothing that runs inside the loop changes what the probes read: it
++        # only adds to _backtrack_infos and sets _need_restart. So during
++        # this call a repeated probe can be answered from a memo, which is
++        # dropped when the loop is done.
++        memo_backup = self._probe_memo
++        self._probe_memo = {}
++        try:
++            self._slot_operator_trigger_reinstalls_imp()
++        finally:
++            self._probe_memo = memo_backup
++
++    def _slot_operator_trigger_reinstalls_imp(self):
+         rebuild_if_new_slot = (
+             self._dynamic_config.myparams.get("rebuild_if_new_slot", "y") == "y"
+         )

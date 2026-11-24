@@ -1,0 +1,614 @@
+depgraph: put the merge order calculation off in attempts that restart
+
+Sub-series: P (stage 5) - patch 2 of 3; applies without 0035 and 0037, in any order with them.
+Base: upstream bdf046b03 with 0001-0034.
+
+_resolve() asks altlist() for the merge list before its tests for a restart,
+and in most backtracking attempts the list is thrown away with the depgraph.
+altlist() now puts _serialize_tasks() off when a graph test
+(_stage5_serialize_cannot_fail) shows that the node selection loop cannot end
+in its "no node selected" branch, the only place where _serialize_tasks()
+writes backtracking state; also required: no uninstall tasks, no blocker
+uninstalls, no pending cycle break, no --debug. The list is computed as soon
+as the depgraph is kept or anybody asks for it (_stage5_finish_serialize). The
+argument is written out in the docstring of _stage5_serialize_skippable().
+
+Lock-step check: _stage5_verify_serialize_skip (PORTAGE_STAGE5_VERIFY=1 or
+"serialize") carries out every calculation that would be put off, on the spot,
+and raises AssertionError unless it ends as predicted, leaves the backtracking
+state alone and equals the list computed later. New test:
+tests/resolver/test_serialize_deferral.py (covers the combination with 0035
+when that patch is applied too).
+
+Six-state sum, stage 5 judge, on top of 0035: 76.6 -> 74.2 s (about 3 %). Alone
+beside the unchanged series on 2026-11-24: 88.8 -> 87.2 s and 90.6 -> 92.7 s,
+i.e. within the noise of that host; the gain shows with 0035, whose reused
+attempts keep a list that was put off. Lock-step run on the six states: no
+difference.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, stage 5, 2026-11-24
+(two rounds of implementer agents, black-box tester agents and a timing judge);
+split into independent patches and re-checked on 2026-11-24. Not a human-written
+change. Base: upstream bdf046b03 with patches 0001-0034. Test: `emerge -p -uND
+@world` on six states of one system image, six resolves in parallel; every run
+gave the same merge list in order and the same number of backtracking attempts
+as unpatched bdf046b03.
+
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -130,6 +130,19 @@
+ # computation, which catches a missing _invalidate_probe_caches() call.
+ _verify_probe_caches = False
+ 
++# stage5: when True, every merge-order calculation that altlist() would put
++# off (see depgraph._stage5_serialize_skippable) is carried out on the spot
++# anyway, and an AssertionError is raised unless it ends the way the shortcut
++# assumes and leaves the backtracking state alone. For tests of the shortcut.
++# PORTAGE_STAGE5_VERIFY=1 turns this check and the one of _AttemptMemo
++# (_verify_attempt_memo) on, "serialize" only this one, "memo" only the other.
++_stage5_verify_serialize_skip = os.environ.get("PORTAGE_STAGE5_VERIFY") in (
++    "1",
++    "serialize",
++)
++# stage5: deferrals checked under that switch, by predicted outcome (tests).
++_stage5_serialize_skip_verified = collections.Counter()
++
+ # Reported with PORTAGE_SHOW_LRU_CACHE_INFO.
+ _probe_cache_hits = collections.Counter()
+ _probe_cache_misses = collections.Counter()
+@@ -861,6 +874,12 @@
+         self._circular_dependency_handler = None
+         self._serialized_tasks_cache = None
+         self._scheduler_graph = None
++        # stage5: True while altlist() has put off _serialize_tasks(), see
++        # depgraph._stage5_serialize_skippable().
++        self._stage5_serialize_deferred = False
++        # stage5: only under _stage5_verify_serialize_skip: what the
++        # calculation gave at the point where it was put off.
++        self._stage5_verify_list = None
+         self._displayed_list = None
+         self._pprovided_args = []
+         self._missing_args = []
+@@ -6737,7 +6756,8 @@
+             return 0, myfavorites
+ 
+         try:
+-            self.altlist()
++            # stage5: see altlist() and _stage5_serialize_skippable().
++            self.altlist(_stage5_may_defer=True)
+         except self._unknown_internal_error:
+             return False, myfavorites
+ 
+@@ -6832,6 +6852,10 @@
+             self._dynamic_config._need_restart = True
+             return False, myfavorites
+ 
++        # stage5: no restart: compute the merge list now if altlist() put it
++        # off above, before anything changes the graph or reads the list.
++        self._stage5_finish_serialize()
++
+         if (
+             self._dynamic_config._slot_operator_replace_installed
+             and self._eliminate_rebuilds()
+@@ -10700,9 +10724,365 @@
+ 
+         mygraph.order.sort(key=cmp_sort_key(cmp_merge_preference))
+ 
+-    def altlist(self):
++    def _stage5_serialize_skippable(self):
++        """
++        stage5: tell whether _serialize_tasks() can be put off for this graph:
++        0 if not, 1 if it can and would end with _unknown_internal_error, 2
++        if it can and would return its result.
++
++        It is called by altlist() between _resolve_conflicts() and
++        _serialize_tasks(), on behalf of the first altlist() call of
++        _resolve(), and answers 1 or 2 only if all of this holds:
++
++        1. Backtracking is allowed, and it is known how _serialize_tasks()
++           ends once it gets through its node selection loop.
++           (1) The graph has a slot conflict. Then it ends with "raise
++           self._unknown_internal_error()" (after the unsolvable blocker
++           check or after the slot conflict check), which altlist() passes
++           on to _resolve(), which returns failure at once.
++           (2) There is no slot conflict and there are no unsolvable
++           blockers. Then it returns its result, and _resolve() goes through
++           its tests for a restart (slot conflict in the backtracking
++           information, _rebuild.trigger_rebuilds(), need_restart(),
++           --buildpkgonly, --quickpkg-direct, ignored binaries, missed
++           updates). None of them reads anything that _serialize_tasks()
++           writes or writes anything that it reads: they read the graph, the
++           package tracker and the backtracking state (the ignored binaries
++           test does more, so the shortcut stands back if that test can get
++           past its first line). If one of them returns failure, the list
++           was not needed; otherwise _resolve() calls
++           _stage5_finish_serialize() before it goes on.
++           _serialize_tasks_retry is not possible in either case, because
++           it needs an uninstall task among the selected nodes (see 2).
++        2. The node selection loop cannot reach its "no node selected" end,
++           which is the only place that writes backtracking state (circular
++           dependency information, _need_restart, _skip_restart). Proof
++           sketch, with G' = the edges that DepPrioritySatisfiedRange does
++           not ignore at its ignore_medium_soft or ignore_medium level and
++           "hard" = those not ignored by ignore_medium: the loop only gives
++           up in a pass with drop_satisfied set and without asap preference,
++           after leaf selection, the runtime cycle search over the satisfied
++           range and the selection of isolated nodes have all failed. If no
++           hard edge lies on a cycle of G', every sink component C of G' has
++           no hard edge leaving any of its nodes, so all of C is "mergeable"
++           and the dependency closure of each of its nodes stays inside C;
++           the cycle search accepts such a node unless it has no parent or
++           the closure holds the blocked replacement of sys-apps/portage. A
++           component whose nodes have no parents is a single node; if all
++           remaining sinks are of that kind and nothing else is left, the
++           graph has no edges and the isolated node selection takes them. The
++           portage replacement only blocks while it has children; a child c
++           of it has a parent, and if c cannot reach the replacement in G',
++           the sinks reachable from c are free of it and not parentless.
++           These properties are inherited by every subgraph, and without
++           uninstall tasks (no blocker uninstalls, no uninstall nodes) the
++           loop only ever removes nodes from its copy of the graph.
++        3. Nothing else that _serialize_tasks() does before its final raise
++           is visible afterwards, as long as the depgraph is discarded for
++           the next backtracking attempt: no --debug output, no scheduled
++           cycle break to apply, and the one package selection it makes
++           (the RDEPEND of the running portage, which can create Package
++           instances in the cache shared by all attempts) is made here too.
++
++        The depgraph that the backtracking loop finally keeps is completed
++        by _stage5_finish_serialize() before anybody can look at it.
++        """
++        dynamic_config = self._dynamic_config
++        if not dynamic_config._allow_backtracking:
++            return 0
++        if any(dynamic_config._package_tracker.slot_conflicts()):
++            if self._accept_blocker_conflicts():
++                return 0
++            outcome = 1
++        elif dynamic_config._unsolvable_blockers or (
++            dynamic_config._needed_use_config_changes
++            and dynamic_config.ignored_binaries
++        ):
++            return 0
++        else:
++            outcome = 2
++
++        running_portage = self._stage5_serialize_cannot_fail()
++        if running_portage is None:
++            return 0
++
++        # See 3. in the docstring: the only package selection that
++        # _serialize_tasks() makes outside of its blocker handling.
++        self._serialize_tasks_portage_rdepend(
++            self._frozen_config._running_root.root, running_portage[0]
++        )
++
++        if _stage5_verify_serialize_skip:
++            self._stage5_verify_serialize_skip(outcome)
++        return outcome
++
++    def _stage5_serialize_cannot_fail(self):
++        """
++        stage5: the test of points 2 and 3 of _stage5_serialize_skippable():
++        None unless the node selection loop of _serialize_tasks() is certain
++        to select every node of the present graph, without uninstall tasks
++        and without output; else a tuple holding the running portage (or
++        None), which the test has to look up anyway.
++        """
++        dynamic_config = self._dynamic_config
++        myopts = self._frozen_config.myopts
++        if "--debug" in myopts or "--nodeps" in myopts:
++            return None
++        if dynamic_config._cycle_break:
++            return None
++        if dynamic_config._blocker_uninstalls:
++            return None
++
++        ignore_medium = DepPrioritySatisfiedRange.ignore_medium
++        ignore_medium_soft = DepPrioritySatisfiedRange.ignore_medium_soft
++        nodes = dynamic_config.digraph.nodes
++        # G' as adjacency lists (only nodes that have such an edge).
++        edges = {}
++        hard_edges = []
++        for node, node_data in nodes.items():
++            if not isinstance(node, Package):
++                if isinstance(node, DependencyArg):
++                    # Removed before the selection loop starts.
++                    continue
++                return None
++            if node.operation == "uninstall":
++                return None
++            node_edges = None
++            for child, priorities in node_data[0].items():
++                hard = False
++                medium = False
++                for priority in priorities:
++                    if not ignore_medium(priority):
++                        hard = True
++                        break
++                    if not medium and not ignore_medium_soft(priority):
++                        medium = True
++                if hard or medium:
++                    if not isinstance(child, Package):
++                        return None
++                    if node_edges is None:
++                        node_edges = edges[node] = []
++                    node_edges.append(child)
++                    if hard:
++                        if child is node:
++                            return None
++                        hard_edges.append((node, child))
++
++        # The same lookups as in _serialize_tasks().
++        running_root = self._frozen_config._running_root.root
++        running_portage = self._frozen_config.trees[running_root][
++            "vartree"
++        ].dbapi.match_pkgs(Atom(PORTAGE_PACKAGE_ATOM))
++        replacement_portage = list(
++            dynamic_config._package_tracker.match(
++                running_root, Atom(PORTAGE_PACKAGE_ATOM)
++            )
++        )
++        running_portage = running_portage[0] if running_portage else None
++        replacement_portage = replacement_portage[0] if replacement_portage else None
++        if replacement_portage == running_portage:
++            replacement_portage = None
++
++        if replacement_portage is not None and replacement_portage in nodes:
++            # No child of the replacement may reach it in G'.
++            seen = set()
++            stack = list(nodes[replacement_portage][0])
++            while stack:
++                node = stack.pop()
++                if node is replacement_portage or node == replacement_portage:
++                    return None
++                if node in seen:
++                    continue
++                seen.add(node)
++                stack.extend(edges.get(node, ()))
++
++        if hard_edges:
++            # Strongly connected components of G' (Tarjan, iterative): no
++            # hard edge may connect two nodes of the same component.
++            index = {}
++            low = {}
++            component = {}
++            on_stack = set()
++            scc_stack = []
++            counter = 0
++            for root in edges:
++                if root in index:
++                    continue
++                index[root] = low[root] = counter
++                counter += 1
++                scc_stack.append(root)
++                on_stack.add(root)
++                work = [(root, iter(edges[root]))]
++                while work:
++                    node, children = work[-1]
++                    for child in children:
++                        if child not in index:
++                            index[child] = low[child] = counter
++                            counter += 1
++                            scc_stack.append(child)
++                            on_stack.add(child)
++                            work.append((child, iter(edges.get(child, ()))))
++                            break
++                        if child in on_stack and index[child] < low[node]:
++                            low[node] = index[child]
++                    else:
++                        work.pop()
++                        if work:
++                            parent = work[-1][0]
++                            if low[node] < low[parent]:
++                                low[parent] = low[node]
++                        if low[node] == index[node]:
++                            while True:
++                                member = scc_stack.pop()
++                                on_stack.discard(member)
++                                component[member] = node
++                                if member is node:
++                                    break
++            for node, child in hard_edges:
++                if component[node] is component[child]:
++                    return None
++
++        return (running_portage,)
++
++    def _stage5_verify_serialize_skip(self, outcome):
++        """
++        stage5: carry out the calculation that _stage5_serialize_skippable()
++        just declared unnecessary and check that claim (test switch
++        _stage5_verify_serialize_skip).
++        """
++        dynamic_config = self._dynamic_config
++
++        def snapshot():
++            return (
++                dynamic_config._need_restart,
++                dynamic_config._skip_restart,
++                dynamic_config._circular_deps_for_display is None,
++                dynamic_config._circular_dependency_handler is None,
++                repr(dynamic_config._backtrack_infos),
++                repr(sorted(dynamic_config.myparams.items(), key=repr)),
++                len(self._frozen_config._pkg_cache),
++                dict(self._frozen_config._highest_license_masked),
++                dict(dynamic_config._blocked_world_pkgs),
++                len(dynamic_config.digraph.nodes),
++            )
++
++        before = snapshot()
++        ended = 2
++        try:
++            (
++                dynamic_config._serialized_tasks_cache,
++                dynamic_config._scheduler_graph,
++            ) = self._serialize_tasks()
++        except self._unknown_internal_error:
++            ended = 1
++        except self._serialize_tasks_retry:
++            ended = 3
++        after = snapshot()
++        if ended != outcome or before != after:
++            raise AssertionError(
++                f"stage5: deferred _serialize_tasks() differs: ended={ended} "
++                f"expected={outcome} before={before!r} after={after!r}"
++            )
++        if dynamic_config._serialized_tasks_cache is None:
++            raise AssertionError("stage5: deferred _serialize_tasks() left no list")
++        _stage5_serialize_skip_verified[outcome] += 1
++        # stage5: kept for _stage5_finish_serialize(), which must arrive at
++        # the same list, scheduler graph and ignored runtime deps later
++        # (after the restart tests of _resolve(), and for a depgraph that
++        # _AttemptMemo hands out again, after other attempts).
++        dynamic_config._stage5_verify_list = self._stage5_serialize_image()
++        # Back to the state that the deferral leaves behind.
++        dynamic_config._serialized_tasks_cache = None
++        dynamic_config._scheduler_graph = None
++
++    def _stage5_serialize_image(self):
++        """
++        stage5: for the lock-step check, what _serialize_tasks() left behind,
++        in iteration order.
++        """
++        dynamic_config = self._dynamic_config
++        graph = dynamic_config._scheduler_graph
++        return (
++            dynamic_config._serialized_tasks_cache,
++            None
++            if graph is None
++            else [
++                (node, list(data[0]), list(data[1]))
++                for node, data in graph.nodes.items()
++            ],
++            {
++                node: list(children)
++                for node, children in dynamic_config._ignored_runtime_deps.items()
++            },
++            dynamic_config._unsatisfied_blockers_for_display,
++        )
++
++    def _stage5_finish_serialize(self):
++        """
++        stage5: carry out the merge order calculation that altlist() put off
++        (see _stage5_serialize_skippable). It ends exactly as it would have
++        ended inside altlist(): it stores the list and the scheduler graph,
++        and either returns or raises _unknown_internal_error, which
++        _resolve() has already answered with failure. Nothing that
++        _serialize_tasks() reads has been written since then.
++
++        Together with _AttemptMemo: a depgraph that the memo hands out again
++        still carries its put-off list, and the one that is resumed after
++        its prune_rebuilds restart computes it here, in
++        _resolve_after_prune_check(), as a new depgraph with those
++        parameters would; other attempts have run in between. That changes
++        nothing, because _serialize_tasks() reads this depgraph's own graph,
++        package tracker and blockers and, of the state shared by all
++        attempts, only memo tables (it does not read Package.depth, which
++        _AttemptMemo.reuse() puts back anyway). Under
++        _stage5_verify_serialize_skip the list computed here is compared
++        with the one computed at the point of the deferral.
++        """
++        if not self._dynamic_config._stage5_serialize_deferred:
++            return
++        self._dynamic_config._stage5_serialize_deferred = False
++        try:
++            (
++                self._dynamic_config._serialized_tasks_cache,
++                self._dynamic_config._scheduler_graph,
++            ) = self._serialize_tasks()
++        except self._unknown_internal_error:
++            pass
++        except self._serialize_tasks_retry:
++            # Not reachable (no uninstall tasks, "complete" is set), but
++            # this is what altlist() would do then.
++            try:
++                self.altlist()
++            except self._unknown_internal_error:
++                pass
++        if self._dynamic_config._stage5_verify_list is not None:
++            # stage5: lock-step check, see _stage5_verify_serialize_skip().
++            expected = self._dynamic_config._stage5_verify_list
++            self._dynamic_config._stage5_verify_list = None
++            if expected != self._stage5_serialize_image():
++                raise AssertionError(
++                    "stage5: the merge list that was put off differs from "
++                    "the one computed on the spot"
++                )
++            _stage5_serialize_skip_verified["finish"] += 1
++
++    def altlist(self, _stage5_may_defer=False):
++        # stage5: a list that was put off is computed as soon as it is asked for.
++        self._stage5_finish_serialize()
+         while self._dynamic_config._serialized_tasks_cache is None:
+             self._resolve_conflicts()
++            if _stage5_may_defer:
++                # stage5: the caller, _resolve(), does not use the list
++                # before its tests for a restart are over, and in an attempt
++                # that fails the list is only needed if this depgraph is the
++                # one that is finally kept. End the way _serialize_tasks()
++                # would.
++                outcome = self._stage5_serialize_skippable()
++                if outcome:
++                    self._dynamic_config._stage5_serialize_deferred = True
++                    if outcome == 1:
++                        raise self._unknown_internal_error()
++                    return None
+             try:
+                 (
+                     self._dynamic_config._serialized_tasks_cache,
+@@ -10835,6 +11215,31 @@
+ 
+         self._process_slot_conflicts()
+ 
++    def _serialize_tasks_portage_rdepend(self, running_root, running_portage):
++        """
++        stage5: the selection of the RDEPEND atoms of the running portage,
++        taken unchanged out of _serialize_tasks().
++        """
++        if running_portage is None:
++            return {}
++        try:
++            portage_rdepend = self._select_atoms_highest_available(
++                running_root,
++                running_portage._metadata["RDEPEND"],
++                myuse=self._pkg_use_enabled(running_portage),
++                parent=running_portage,
++                strict=False,
++            )
++        except portage.exception.InvalidDependString as e:
++            portage.writemsg(
++                "!!! Invalid RDEPEND in "
++                f"'{running_root}var/db/pkg/{running_portage.cpv}/RDEPEND': {e}\n",
++                noiselevel=-1,
++            )
++            del e
++            portage_rdepend = {running_portage: []}
++        return portage_rdepend
++
+     def _serialize_tasks(self):
+         debug = "--debug" in self._frozen_config.myopts
+ 
+@@ -11026,22 +11431,11 @@
+             replacement_portage = None
+ 
+         if running_portage is not None:
+-            try:
+-                portage_rdepend = self._select_atoms_highest_available(
+-                    running_root,
+-                    running_portage._metadata["RDEPEND"],
+-                    myuse=self._pkg_use_enabled(running_portage),
+-                    parent=running_portage,
+-                    strict=False,
+-                )
+-            except portage.exception.InvalidDependString as e:
+-                portage.writemsg(
+-                    "!!! Invalid RDEPEND in "
+-                    f"'{running_root}var/db/pkg/{running_portage.cpv}/RDEPEND': {e}\n",
+-                    noiselevel=-1,
+-                )
+-                del e
+-                portage_rdepend = {running_portage: []}
++            # stage5: moved unchanged into a method of its own, which
++            # _stage5_serialize_skippable() calls as well.
++            portage_rdepend = self._serialize_tasks_portage_rdepend(
++                running_root, running_portage
++            )
+             for atoms in portage_rdepend.values():
+                 runtime_deps.update(atom for atom in atoms if not atom.blocker)
+ 
+@@ -13455,6 +13849,9 @@
+         to ensure that the user is notified of problems with the graph.
+         """
+ 
++        # stage5: for callers other than _backtrack_depgraph().
++        self._stage5_finish_serialize()
++
+         if self._dynamic_config._circular_deps_for_display is not None:
+             self._show_circular_deps(self._dynamic_config._circular_deps_for_display)
+ 
+@@ -14771,6 +15168,12 @@
+         elif backtracker:
+             backtracked += 1
+ 
++    # stage5: the depgraph that the loop ends with is looked at from here on
++    # (problem display, merge list of a failed attempt); if altlist() put off
++    # its merge order calculation, do it now. See _stage5_serialize_skippable().
++    if mydepgraph is not None:
++        mydepgraph._stage5_finish_serialize()
++
+     if backtracked and not success and not mydepgraph.need_display_problems():
+         if debug:
+             writemsg_level(
+--- a/lib/portage/tests/resolver/meson.build
++++ b/lib/portage/tests/resolver/meson.build
+@@ -77,6 +77,7 @@
+         'test_regular_slot_change_without_revbump.py',
+         'test_required_use.py',
+         'test_runtime_cycle_merge_order.py',
++        'test_serialize_deferral.py',
+         'test_simple.py',
+         'test_slot_abi.py',
+         'test_slot_abi_downgrade.py',
+--- a/lib/portage/tests/resolver/test_serialize_deferral.py
++++ b/lib/portage/tests/resolver/test_serialize_deferral.py
+@@ -0,0 +1,59 @@
++# Copyright 2026 Gentoo Authors
++# Distributed under the terms of the GNU General Public License v2
++
++# The lock-step check of the merge order deferral
++# (_emerge.depgraph.depgraph._stage5_serialize_skippable) on resolver test
++# cases that backtrack: every calculation that would be put off is carried out
++# on the spot and must end as predicted, and the list computed later must
++# equal the one computed on the spot.
++
++from unittest.mock import patch
++
++import _emerge.depgraph as depgraph_module
++from portage.tests import TestCase
++from portage.tests.resolver import test_slot_operator_complete_graph as _complete_graph
++from portage.tests.resolver import test_slot_operator_missed_update as _missed_update
++from portage.tests.resolver import (
++    test_slot_operator_runtime_pkg_mask as _runtime_pkg_mask,
++)
++
++
++class SerializeDeferralTestCase(TestCase):
++    def _run(self, case, name):
++        verified = depgraph_module._stage5_serialize_skip_verified
++        before = sum(verified.values())
++        with patch.object(depgraph_module, "_stage5_verify_serialize_skip", True):
++            getattr(case(name), name)()
++        self.assertGreater(sum(verified.values()), before)
++
++        if hasattr(depgraph_module, "_verify_attempt_memo"):
++            # With the reuse of whole backtracking attempts in the same build:
++            # a reused attempt then carries a list that was put off, and the
++            # comparison of the two depgraphs covers both lists.
++            before = sum(verified.values())
++            with patch.object(
++                depgraph_module, "_verify_attempt_memo", True
++            ), patch.object(depgraph_module, "_stage5_verify_serialize_skip", True):
++                getattr(case(name), name)()
++            self.assertGreater(sum(verified.values()), before)
++
++        # The plain run passes the case's own checks.
++        getattr(case(name), name)()
++
++    def testSlotOperatorCompleteGraph(self):
++        self._run(
++            _complete_graph.SlotOperatorCompleteGraphTestCase,
++            "testSlotOperatorCompleteGraph",
++        )
++
++    def testBacktrackMissedUpdate(self):
++        self._run(
++            _missed_update.BacktrackMissedUpdateTestCase,
++            "testBacktrackMissedUpdateTestCase",
++        )
++
++    def testSlotOperatorRuntimePkgMask(self):
++        self._run(
++            _runtime_pkg_mask.SlotOperatorRuntimePkgMaskTestCase,
++            "testSlotOperatorRuntimePkgMask",
++        )

@@ -1,0 +1,106 @@
+depgraph: one-node shortcut in find_smallest_cycle
+
+Sub-series: B (cycle search and frontier) - patch 3 of 6; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs none: it also applies to 3.0.83 by itself.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+A candidate with no child at the current level is its own closure, and
+no closure is smaller than one node, so the search can stop there.
+Alone on 3.0.83: start 119.6 -> 110.0; no effect on short merge lists.
+Read, not tested: nodes with a self-edge never become candidates.
+Applies to upstream head unchanged.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -10435,8 +10435,9 @@
+                     ):
+                         blocked_nodes = frozenset((replacement_portage,))
+ 
+-                    # Sort nodes for deterministic results.
+-                    nodes = sorted(nodes)
++                    # Sort nodes for deterministic results. The sort is done
++                    # lazily, since the shortcut below does not need it.
++                    sorted_nodes = None
+                     for priority in (
+                         local_priority_range.ignore_priority[i]
+                         for i in range(
+@@ -10444,12 +10445,46 @@
+                             local_priority_range.MEDIUM_SOFT + 1,
+                         )
+                     ):
++                        level = None
++                        if frontier is not None:
++                            level = frontier.level_of(priority)
++                        if level is not None:
++                            # A candidate without any child at this level has
++                            # the closure {itself}. No closure is smaller than
++                            # one node, and the loop below keeps the first
++                            # candidate of minimal size in sorted order, so the
++                            # result is the least such candidate. Taking the
++                            # first minimum while iterating nodes in its own
++                            # order is what the stable sort followed by that
++                            # loop returns.
++                            smallest_leaf = None
++                            graph_nodes = mygraph.nodes
++                            for node in frontier.leaves_among(nodes, level):
++                                if (
++                                    graph_nodes[node][1]
++                                    and node in mergeable_nodes
++                                    and (
++                                        blocked_nodes is None
++                                        or node not in blocked_nodes
++                                    )
++                                    and (
++                                        smallest_leaf is None or node < smallest_leaf
++                                    )
++                                ):
++                                    smallest_leaf = node
++                            if smallest_leaf is not None:
++                                smallest_cycle = frozenset((smallest_leaf,))
++                                smallest_size = 1
++                                ignore_priority = priority
++                                break
++                        if sorted_nodes is None:
++                            sorted_nodes = sorted(nodes)
+                         # Compute gather_deps success and closure size for every
+                         # candidate at this filter level in one O(V+E) pass.
+                         ok_nodes, closure_size, closure_members = _gather_deps_closures(
+                             mygraph, mergeable_nodes, priority, blocked_nodes
+                         )
+-                        for node in nodes:
++                        for node in sorted_nodes:
+                             if not mygraph.parent_nodes(node):
+                                 continue
+                             if node not in ok_nodes:
+diff -ruN a/lib/_emerge/_serialize_frontier.py b/lib/_emerge/_serialize_frontier.py
+--- a/lib/_emerge/_serialize_frontier.py
++++ b/lib/_emerge/_serialize_frontier.py
+@@ -126,6 +126,17 @@
+         counts = self._surv.get(node)
+         return counts is not None and counts[level] == 0
+ 
++    def leaves_among(self, nodes, level):
++        """Return the members of `nodes` that are leaves under `level`, in the
++        iteration order of `nodes`. Same test as is_leaf()."""
++        surv_get = self._surv.get
++        result = []
++        for node in nodes:
++            counts = surv_get(node)
++            if counts is not None and counts[level] == 0:
++                result.append(node)
++        return result
++
+     def ready_nodes(self, level):
+         """Return the nodes that are leaves under `level`, in mygraph.order.
+ 

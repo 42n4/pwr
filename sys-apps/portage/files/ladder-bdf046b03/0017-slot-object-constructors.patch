@@ -1,0 +1,260 @@
+SlotObject: set ordinary slots directly; explicit constructors for Dependency and _dep_choice
+
+Sub-series: F (slot-object constructors) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+SlotObject.__init__ probed every slot with getattr() before setting it.
+For a class whose slots are all ordinary (named once, no property or class
+attribute in front of them; checked once per class) the probe of a new
+instance is always negative, so the slots are now set directly, in the
+same order. Dependency and _dep_choice, which the resolver creates by the
+hundred thousand, get explicit keyword constructors that make the same
+assignments; subclasses and unknown keywords go through the generic
+constructor as before.
+
+On top of patches 0001-0016, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 32.3 -> 30.0, holds 16.0 -> 15.1, masks 34.7 -> 32.0,
+  py313 19.4 -> 18.4, bdeps 23.2 -> 21.9, policykit 16.5 -> 15.3
+  sum of six 142.1 -> 132.7 (-9.5 s, -2.1 % of the stock sum 447.5)
+Patches 0001-0017 together: 447.5 -> 132.7 s (-70 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Weak spots and what was not checked:
+* One documented difference: a slot given a non-None value before the
+  constructor ran and not passed as a keyword is set to None where the old
+  loop raised AssertionError.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/Dependency.py b/lib/_emerge/Dependency.py
+--- a/lib/_emerge/Dependency.py
++++ b/lib/_emerge/Dependency.py
+@@ -21,13 +21,74 @@
+         "want_update",
+     )
+ 
+-    def __init__(self, **kwargs):
+-        SlotObject.__init__(self, **kwargs)
+-        if self.priority is None:
+-            self.priority = DepPriority()
+-        if self.depth is None:
+-            self.depth = 0
+-        if self.collapsed_parent is None:
+-            self.collapsed_parent = self.parent
+-        if self.collapsed_priority is None:
+-            self.collapsed_priority = self.priority
++    def __init__(
++        self,
++        *,
++        atom=None,
++        blocker=None,
++        child=None,
++        collapsed_parent=None,
++        collapsed_priority=None,
++        depth=None,
++        onlydeps=None,
++        parent=None,
++        priority=None,
++        root=None,
++        want_update=None,
++        **kwargs,
++    ):
++        if kwargs or type(self) is not Dependency:
++            # A subclass, or a keyword that is not a slot of this class: the
++            # generic constructor as before (it raises TypeError for an
++            # unknown keyword after it has set the slots).
++            SlotObject.__init__(
++                self,
++                atom=atom,
++                blocker=blocker,
++                child=child,
++                collapsed_parent=collapsed_parent,
++                collapsed_priority=collapsed_priority,
++                depth=depth,
++                onlydeps=onlydeps,
++                parent=parent,
++                priority=priority,
++                root=root,
++                want_update=want_update,
++                **kwargs,
++            )
++            if self.priority is None:
++                self.priority = DepPriority()
++            if self.depth is None:
++                self.depth = 0
++            if self.collapsed_parent is None:
++                self.collapsed_parent = self.parent
++            if self.collapsed_priority is None:
++                self.collapsed_priority = self.priority
++            return
++
++        # For exactly this class, SlotObject.__init__ sets each of the eleven
++        # slots above to its keyword value, or to None without one (the slot
++        # names are distinct and none is overridden by a property, so its
++        # duplicate and property checks cannot trigger on a new instance).
++        # The same assignments are made here directly, with the defaults
++        # below applied first instead of afterwards. A resolver run creates
++        # hundreds of thousands of these objects.
++        if priority is None:
++            priority = DepPriority()
++        if depth is None:
++            depth = 0
++        if collapsed_parent is None:
++            collapsed_parent = parent
++        if collapsed_priority is None:
++            collapsed_priority = priority
++        self.atom = atom
++        self.blocker = blocker
++        self.child = child
++        self.collapsed_parent = collapsed_parent
++        self.collapsed_priority = collapsed_priority
++        self.depth = depth
++        self.onlydeps = onlydeps
++        self.parent = parent
++        self.priority = priority
++        self.root = root
++        self.want_update = want_update
+diff -ruN a/lib/portage/dep/dep_check.py b/lib/portage/dep/dep_check.py
+--- a/lib/portage/dep/dep_check.py
++++ b/lib/portage/dep/dep_check.py
+@@ -335,6 +335,46 @@
+         "want_update",
+     )
+ 
++    def __init__(
++        self,
++        *,
++        all_available=None,
++        all_in_graph=None,
++        all_installed_slots=None,
++        atoms=None,
++        cp_map=None,
++        new_slot_count=None,
++        slot_map=None,
++        want_update=None,
++        **kwargs,
++    ):
++        if kwargs or type(self) is not _dep_choice:
++            # A subclass or an unknown keyword: the generic constructor.
++            SlotObject.__init__(
++                self,
++                all_available=all_available,
++                all_in_graph=all_in_graph,
++                all_installed_slots=all_installed_slots,
++                atoms=atoms,
++                cp_map=cp_map,
++                new_slot_count=new_slot_count,
++                slot_map=slot_map,
++                want_update=want_update,
++                **kwargs,
++            )
++            return
++        # What SlotObject.__init__ does for exactly this class: each slot is
++        # set to its keyword value, or to None without one. dep_zapdeps
++        # creates one of these for every choice of every dependency.
++        self.all_available = all_available
++        self.all_in_graph = all_in_graph
++        self.all_installed_slots = all_installed_slots
++        self.atoms = atoms
++        self.cp_map = cp_map
++        self.new_slot_count = new_slot_count
++        self.slot_map = slot_map
++        self.want_update = want_update
++
+ 
+ def dep_zapdeps(
+     unreduced, reduced, myroot, use_binaries=0, trees=None, minimize_slots=False
+diff -ruN a/lib/portage/util/SlotObject.py b/lib/portage/util/SlotObject.py
+--- a/lib/portage/util/SlotObject.py
++++ b/lib/portage/util/SlotObject.py
+@@ -2,10 +2,81 @@
+ # Distributed under the terms of the GNU General Public License v2
+ 
+ 
++from types import MemberDescriptorType
++
++# class -> tuple of its slot names in the order in which __init__ visits
++# them, or False if the class needs the general code of __init__.
++_plain_slots = {}
++
++
++def _find_plain_slots(cls):
++    """
++    Return the slot names that SlotObject.__init__ visits for an instance of
++    cls, in its order, if every one of them is an ordinary slot: named once
++    in the __slots__ of cls and its bases, and found on cls as the slot
++    descriptor itself (no property or class attribute in front of it).
++    Return False otherwise.
++    """
++    names = []
++    classes = [cls]
++    while classes:
++        c = classes.pop()
++        if c is SlotObject:
++            continue
++        classes.extend(c.__bases__)
++        slots = getattr(c, "__slots__", None)
++        if not slots:
++            continue
++        if type(slots) not in (tuple, list):
++            return False
++        names.extend(slots)
++    if len(set(names)) != len(names):
++        return False
++    for myattr in names:
++        if type(myattr) is not str:
++            return False
++        for c in cls.__mro__:
++            if myattr in c.__dict__:
++                if type(c.__dict__[myattr]) is not MemberDescriptorType:
++                    return False
++                break
++        else:
++            return False
++    return tuple(names)
++
++
+ class SlotObject:
+     __slots__ = ("__weakref__",)
+ 
+     def __init__(self, **kwargs):
++        # Fast path for classes with ordinary slots only (see
++        # _find_plain_slots). For such a slot of a new instance, the test
++        # "getattr(self, myattr, None) is not None" below is false (the slot
++        # is empty) and setattr() cannot fail, so all that the loop below
++        # does is setattr(self, myattr, kwargs.pop(myattr, None)) in the
++        # same order. The only difference: a slot that was given a value
++        # other than None before this constructor ran, and that is not in
++        # kwargs, is set to None here where the loop below raises
++        # AssertionError.
++        cls = self.__class__
++        plain_slots = _plain_slots.get(cls)
++        if plain_slots is None:
++            plain_slots = _plain_slots[cls] = _find_plain_slots(cls)
++        if plain_slots is not False:
++            if kwargs:
++                pop = kwargs.pop
++                for myattr in plain_slots:
++                    setattr(self, myattr, pop(myattr, None))
++                if kwargs:
++                    raise TypeError(
++                        "'%s' is an invalid keyword argument for this constructor"
++                        % (next(iter(kwargs)),)
++                    )
++            else:
++                for myattr in plain_slots:
++                    setattr(self, myattr, None)
++            return
++
+         classes = [self.__class__]
+         while classes:
+             c = classes.pop()

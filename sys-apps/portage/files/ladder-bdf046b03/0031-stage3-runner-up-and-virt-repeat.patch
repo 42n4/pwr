@@ -1,0 +1,613 @@
+depgraph: five resolver shortcuts recovered from the stage 3 runner-up, one new
+
+Sub-series: N (stage 4, round 1) - patch 1 of 1; needs 0001-0030 (written on top of the full series).
+Base: upstream 73646c35d.
+
+The 30-patch ladder was cut from the winner of the last stage 3 round only; the
+runner-up (r03-c1) held five changes that the winner did not, and they were lost.
+An agent rebuilt them from the round diffs, ported them to 73646c35d and verified
+them again; it added one change of its own (the last one below).
+  * _slot_operator_update_probe: the _select_atoms_probe() test of an atom that
+    ends its candidate loop without a candidate is put off and run only if it
+    still matters (its author's estimate: 4.1 s of the six-state sum)
+  * _pkgset_inert(): the --exclude / --useoldpkg-atoms / --reinstall-atoms sets
+    are not asked about each package when they hold no atom at all (3.4 s)
+  * _iter_atoms_for_pkg: argument atoms per (root, cp, package) are kept between
+    calls; _set_args() clears the memo (2.3 s)
+  * _iter_match_pkgs_any_newer goes through the cross-attempt match memo (1.5 s)
+  * find_smallest_cycle: cheaper order of two comparisons in the leaf scan (0.2 s)
+  * new: _iter_virt_update asked _virt_deps_visible() twice in a row for the same
+    package; the second call is skipped when the first ran no package selection
+    (2.2 s)
+The per-change seconds are the author's split of the joint gain by instruction
+counts, not separate wall measurements.
+
+Judge, same load: 0001-0030 + C modules 99.5 s -> with this patch 90.1 s (-9.4 %);
+unpatched 73646c35d 464.3 s.
+Author's checks: 24 states equal to unpatched head (0-29 attempts, 0-2,578 packages,
+six ending in a resolver error, 15 option combinations); a lock-step build ran old
+and new code side by side: 96,223 skipped calls, 7.0 M empty-set and 2.6 M list
+shortcuts, 1.23 M memo hits, 653,400 deferred probes, 690,423 memoised scans,
+0 mismatches. Tester: 13 probes.
+Weak spots named by the author: _pkgset_inert() reads internals of PackageSet;
+the argument-atom memo relies on _set_args() being the only writer of the
+argument atoms; the match memo is never trimmed.
+
+Origin: written by AI agents (Claude) in stage 4 of the emerge-fast job, 2026-11-21, on
+upstream commit 73646c35d with patches 0001-0030 and the C modules applied. Not a
+human-written change. Judge: `emerge -p -uND @world` on six states of one system image, six
+resolves in parallel, wall seconds summed; every run gave the same merge list in the same
+order and the same number of backtracking attempts as unpatched 73646c35d. Black-box
+testers (invented states, reference against candidate): 0 differences.
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -436,6 +436,37 @@
+     return None
+ 
+ 
++def _pkgset_inert(pkgset):
++    """
++    stage4 (from the stage 3 candidate r03-c1): True if
++    pkgset.findAtomForPackage(pkg, modified_use=use) returns None for every
++    package and does nothing else: pkgset is a plain InternalPackageSet or
++    WildcardPackageSet that is loaded, so that _load() does nothing, and it
++    has no atom at all, which makes the first shortcut of
++    PackageSet.findAtomForPackage() return None whatever the cp of pkg is.
++    What that method does before (a copy of pkg with the modified USE,
++    cpv_getkey) has no effect outside of it. This is the state of the sets
++    of --exclude, --reinstall-atoms and --useoldpkg-atoms unless the option
++    is given, and the resolver consults them for every package it examines.
++
++    A caller that skips the call still has to do what evaluating the
++    argument self._pkg_use_enabled(pkg) and the method's own read of
++    pkg.use do besides returning a value: pkg.use is computed if that has
++    not been done yet.
++    """
++    if pkgset.__class__ is not WildcardPackageSet and (
++        pkgset.__class__ is not InternalPackageSet
++    ):
++        return False
++    atommap = pkgset._atommap
++    return (
++        pkgset._loaded
++        and atommap.__class__ is ExtendedAtomDict
++        and not atommap._extended
++        and not atommap._normal
++    )
++
++
+ class _frozen_depgraph_config:
+     def __init__(self, settings, trees, myopts, params, spinner):
+         self.settings = settings
+@@ -795,6 +826,8 @@
+         # Caches visible packages returned from _select_package, for use in
+         # depgraph._iter_atoms_for_pkg() SLOT logic.
+         self._visible_pkgs = {}
++        # stage4: see depgraph._iter_atoms_for_pkg().
++        self._arg_atoms_memo = {}
+         # contains the args created by select_files
+         self._initial_arg_list = []
+         self.digraph = portage.digraph()
+@@ -848,6 +881,11 @@
+         self._initially_unsatisfied_deps = []
+         self._ignored_deps = []
+         self._highest_pkg_cache = {}
++        # stage4: counts the executions of the miss path of
++        # _select_pkg_highest_available(), which is the only place where a
++        # package selection is computed (and recorded); only ever grows.
++        # See _dep_check_composite_db._iter_virt_update(). Changes no result.
++        self._highest_pkg_cache_misses = 0
+         self._highest_pkg_cache_cp_map = {}
+         self._changed_deps_pkgs = {}
+         # Cleared by depgraph._invalidate_probe_caches().
+@@ -3064,6 +3102,9 @@
+             replacement_candidates = []
+             # Set of all packages all atoms can agree on.
+             all_candidate_pkgs = None
++            # stage4: atoms without any candidate package whose
++            # _select_atoms_probe test was put off, see below.
++            deferred_atoms = None
+ 
+             for atom in atoms:
+                 # The _select_atoms_probe method is expensive, so initialization
+@@ -3182,6 +3223,29 @@
+                 # an soname atom which is unconditionally selected, and
+                 # _select_atoms_probe is not applicable.
+                 if atom_not_selected is None and unevaluated_atom is not None:
++                    if selected_atoms is None and self._select_atoms_probe_skippable(
++                        dep.child.root, replacement_parent
++                    ):
++                        # stage4 (from the stage 3 candidate r03-c1):
++                        # atom_not_selected is still None here, so the loop
++                        # above appended nothing: candidate_pkgs is empty.
++                        # If the probe selects this atom, all_candidate_pkgs
++                        # becomes (and stays) the empty set; if not, nothing
++                        # changes. Either way no package is offered, so the
++                        # answer only matters if the other atoms leave a
++                        # non-empty all_candidate_pkgs behind, and the test
++                        # with its expensive probe is put off until that is
++                        # known (usually it is not needed at all: most of
++                        # the time no atom has a candidate). The result of
++                        # the probe is the same then, since nothing that it
++                        # reads is changed in between (the rest of this loop
++                        # only reads the graph and fills caches), and the
++                        # empty list that is not appended to
++                        # replacement_candidates would not be looked at.
++                        if deferred_atoms is None:
++                            deferred_atoms = []
++                        deferred_atoms.append(unevaluated_atom)
++                        continue
+                     if (
+                         selected_atoms is None
+                         and unevaluated_atom
+@@ -3210,6 +3274,21 @@
+                 # any replacement child, we can't do anything.
+                 continue
+ 
++            if deferred_atoms is not None:
++                # stage4: the tests that were put off matter now: a selected
++                # atom without candidates leaves nothing to agree on.
++                if selected_atoms is None:
++                    certain_atoms = self._select_atoms_probe_certain(
++                        dep.child.root, replacement_parent
++                    )
++                    if any(atom in certain_atoms for atom in deferred_atoms):
++                        continue
++                    selected_atoms = self._select_atoms_probe(
++                        dep.child.root, replacement_parent
++                    )
++                if any(atom in selected_atoms for atom in deferred_atoms):
++                    continue
++
+             # Now select one of the pkgs as replacement. This is as easy as
+             # selecting the highest version.
+             # The more complicated part is to choose an atom for the
+@@ -3615,6 +3694,31 @@
+                 raise AssertionError(f"stale _select_atoms_probe result for {pkg}")
+         return cached
+ 
++    def _select_atoms_probe_skippable(self, root, pkg):
++        """
++        stage4 (r03-c1): whether leaving out a _select_atoms_probe(root, pkg)
++        call, or making it at a later point of the same
++        _slot_operator_update_probe() pass over one replacement parent, is
++        invisible apart from the value it returns. These are the conditions
++        that _select_atoms_probe_certain() explains (the probe only reads
++        the graph, and it does not create packages in a configuration where
++        that prints warnings); the test is moved here from there unchanged.
++        """
++        return not (
++            getattr(self._select_atoms, "__func__", None)
++            is not depgraph._select_atoms_from_graph
++            or not self._frozen_config.pkgsettings[root].local_config
++            or (
++                pkg.built
++                and self._dynamic_config.myparams.get(
++                    "ignore_built_slot_operator_deps", "n"
++                )
++                == "y"
++            )
++            or self._dynamic_config._graph_trees[root].get("virt_parent") is not None
++            or not self._probe_bounds_allowed()
++        )
++
+     def _select_atoms_probe_certain(self, root, pkg):
+         """
+         A frozenset of atoms that are certain to be in the result of
+@@ -3655,20 +3759,7 @@
+         computed at a later request than before, or not at all.
+         """
+         pkgsettings = self._frozen_config.pkgsettings[root]
+-        if (
+-            getattr(self._select_atoms, "__func__", None)
+-            is not depgraph._select_atoms_from_graph
+-            or not pkgsettings.local_config
+-            or (
+-                pkg.built
+-                and self._dynamic_config.myparams.get(
+-                    "ignore_built_slot_operator_deps", "n"
+-                )
+-                == "y"
+-            )
+-            or self._dynamic_config._graph_trees[root].get("virt_parent") is not None
+-            or not self._probe_bounds_allowed()
+-        ):
++        if not self._select_atoms_probe_skippable(root, pkg):
+             return frozenset()
+         use = self._pkg_use_enabled(pkg)
+         cache_key = (root, pkg, use)
+@@ -5387,6 +5478,8 @@
+         traversed_virt_pkgs = set()
+ 
+         reinstall_atoms = self._frozen_config.reinstall_atoms
++        # stage4: see _pkgset_inert(); the set cannot change during this call.
++        reinstall_inert = _pkgset_inert(reinstall_atoms)
+         for atom, child in self._minimize_children(
+             pkg, dep_priority, root_config, selected_atoms[pkg]
+         ):
+@@ -5410,13 +5503,20 @@
+                     if mypriority.runtime:
+                         mypriority.runtime_slot_op = True
+ 
+-                inst_pkgs = [
+-                    inst_pkg
+-                    for inst_pkg in reversed(vardb.match_pkgs(atom))
+-                    if not reinstall_atoms.findAtomForPackage(
+-                        inst_pkg, modified_use=self._pkg_use_enabled(inst_pkg)
+-                    )
+-                ]
++                if reinstall_inert:
++                    # stage4: nothing is filtered out (see _pkgset_inert).
++                    inst_pkgs = vardb.match_pkgs(atom)[::-1]
++                    for inst_pkg in inst_pkgs:
++                        if inst_pkg._use is None:
++                            inst_pkg.use
++                else:
++                    inst_pkgs = [
++                        inst_pkg
++                        for inst_pkg in reversed(vardb.match_pkgs(atom))
++                        if not reinstall_atoms.findAtomForPackage(
++                            inst_pkg, modified_use=self._pkg_use_enabled(inst_pkg)
++                        )
++                    ]
+                 # Do not allow slotted deps to be satisfied by wrong slots.
+                 # Otherwise, slot-operator-dependent packages may rebuild
+                 # before the slotted package they are dependent on.
+@@ -5877,12 +5977,45 @@
+             if not (atoms._loaded or atoms._loading):
+                 atoms._load()
+             atommap = atoms._atommap
+-            if (
+-                atommap.__class__ is ExtendedAtomDict
+-                and not atommap._extended
+-                and atommap._normal.get(cp) is None
+-            ):
+-                return iter(())
++            if atommap.__class__ is ExtendedAtomDict and not atommap._extended:
++                cp_atoms = atommap._normal.get(cp)
++                if cp_atoms is None:
++                    return iter(())
++                # stage4 (from the stage 3 candidate r03-c1): the other
++                # packages are those that the argument atoms (world, sets,
++                # command line) name, and the resolver asks for each of them
++                # many times. What the generator below yields for pkg is
++                # determined by: the atoms that the argument set has for the
++                # cp of pkg (without extended atoms, iterAtomsForPackage()
++                # looks at nothing else, and each of them has this cp), the
++                # lists that atom_arg_map has for them, the packages of that
++                # cp in _visible_pkgs[pkg.root] (all that match_pkgs() of
++                # such an atom can return), and things that do not change
++                # (the packages compared, _have_new_virt). So the items are
++                # kept per root, cp and package until one of these inputs
++                # changes: _set_args() is the only place that changes the
++                # argument atoms and atom_arg_map, and it clears the memo
++                # (in addition an entry is used only while the argument set
++                # still has the same set object of the same size for the
++                # cp); _select_pkg_highest_available() is the only place
++                # that adds to _visible_pkgs, and it drops the entries of
++                # the cp. The items are computed at once instead of lazily;
++                # computing the ones that a consumer does not read has no
++                # effect beyond filling caches.
++                memo = self._dynamic_config._arg_atoms_memo
++                memo_key = (pkg.root, cp)
++                cp_memo = memo.get(memo_key)
++                if (
++                    cp_memo is None
++                    or cp_memo[0] is not cp_atoms
++                    or cp_memo[1] != len(cp_atoms)
++                ):
++                    cp_memo = memo[memo_key] = (cp_atoms, len(cp_atoms), {})
++                entry = cp_memo[2].get(pkg)
++                if entry is None or entry[0] is not pkg:
++                    entry = (pkg, tuple(self._iter_atoms_for_pkg_imp(pkg)))
++                    cp_memo[2][pkg] = entry
++                return iter(entry[1])
+         return self._iter_atoms_for_pkg_imp(pkg)
+ 
+     def _iter_atoms_for_pkg_imp(self, pkg):
+@@ -6770,6 +6903,8 @@
+             ).clear()
+             depgraph_sets.atoms.clear()
+             depgraph_sets.atom_arg_map.clear()
++            # stage4: see _iter_atoms_for_pkg.
++            self._dynamic_config._arg_atoms_memo.clear()
+             set_atoms[root] = []
+             non_set_atoms[root] = []
+ 
+@@ -8092,16 +8227,16 @@
+             db_keys,
+         ) in self._dynamic_config._filtered_trees[root_config.root]["dbs"]:
+             if atom.package and not installed:
+-                for next_start, pkg in self._iter_match_pkgs_atom_imp(
++                # stage4 (r03-c1): _iter_match_pkgs_atom_imp() with start 0
++                # and without onlydeps, through the memo of
++                # _iter_match_pkgs_atom().
++                yield from self._iter_match_pkgs_atom(
+                     root_config,
+                     pkg_type,
+                     atom,
+-                    False,
+-                    0,
+                     newer_than=newer_than,
+                     or_equal=or_equal,
+-                ):
+-                    yield pkg
++                )
+             else:
+                 yield from self._iter_match_pkgs(root_config, pkg_type, atom)
+ 
+@@ -8125,12 +8260,23 @@
+                     cpv, pkg_type, root_config, installed=installed, onlydeps=onlydeps
+                 )
+ 
+-    def _iter_match_pkgs_atom(self, root_config, pkg_type, atom, onlydeps=False):
++    def _iter_match_pkgs_atom(
++        self,
++        root_config,
++        pkg_type,
++        atom,
++        onlydeps=False,
++        newer_than=None,
++        or_equal=False,
++    ):
+         """
+         Iterate over Package instances of pkg_type matching the given atom.
+         This does not check visibility and it also does not match USE for
+         unbuilt ebuilds since USE are lazily calculated after visibility
+         checks (to avoid the expense when possible).
++
++        With newer_than, the candidates that _iter_match_pkgs_atom_imp()
++        passes over for it are left out (see there).
+         """
+         # The packages that _iter_match_pkgs_atom_imp yields depend on the
+         # arguments, on things that are the same for every depgraph sharing
+@@ -8155,6 +8301,20 @@
+                 _atom_key(atom.unevaluated_atom),
+                 "remove" in self._dynamic_config.myparams,
+             )
++            if newer_than is not None:
++                # stage4 (from the stage 3 candidate r03-c1): the scan that
++                # leaves out candidates because of newer_than is as much a
++                # function of its arguments as the complete one: all that
++                # it reads besides is the cp, the version and the built
++                # flag of newer_than, and or_equal (pkg_type is in the key
++                # already). The slot operator probes repeat these scans in
++                # every backtracking run.
++                memo_key += (
++                    newer_than.cp,
++                    newer_than.version,
++                    newer_than.built,
++                    or_equal,
++                )
+             memo = self._frozen_config._match_pkgs_atom_memo.get(memo_key)
+             if memo is None:
+                 # [[(start index for the item after this one, pkg), ...],
+@@ -8183,7 +8343,13 @@
+             # Compute the items after those replayed, and record them unless
+             # USE changes showed up or somebody else recorded them already.
+             for next_start, pkg in self._iter_match_pkgs_atom_imp(
+-                root_config, pkg_type, atom, onlydeps, start
++                root_config,
++                pkg_type,
++                atom,
++                onlydeps,
++                start,
++                newer_than=newer_than,
++                or_equal=or_equal,
+             ):
+                 if not use_changes and i == len(items):
+                     items.append((next_start, pkg))
+@@ -8194,7 +8360,13 @@
+             return
+ 
+         for next_start, pkg in self._iter_match_pkgs_atom_imp(
+-            root_config, pkg_type, atom, onlydeps, start
++            root_config,
++            pkg_type,
++            atom,
++            onlydeps,
++            start,
++            newer_than=newer_than,
++            or_equal=or_equal,
+         ):
+             yield pkg
+ 
+@@ -8382,6 +8554,8 @@
+         ret = self._dynamic_config._highest_pkg_cache.get(cache_key)
+         if ret is not None:
+             return ret
++        # stage4: see _highest_pkg_cache_misses in _dynamic_depgraph_config.
++        self._dynamic_config._highest_pkg_cache_misses += 1
+         ret = self._select_pkg_highest_available_imp(
+             root, atom, onlydeps=onlydeps, parent=parent
+         )
+@@ -8389,7 +8563,13 @@
+         pkg, existing = ret
+         if pkg is not None:
+             if self._pkg_visibility_check(pkg) and not (pkg.installed and pkg.masks):
+-                self._dynamic_config._visible_pkgs[pkg.root].cpv_inject(pkg)
++                visible_pkgs = self._dynamic_config._visible_pkgs[pkg.root]
++                if visible_pkgs._cpv_map.get(pkg.cpv) is not pkg:
++                    # stage4: unless pkg itself is there already (then
++                    # cpv_inject() changes nothing), the visible packages of
++                    # this cp may change now: see _iter_atoms_for_pkg.
++                    self._dynamic_config._arg_atoms_memo.pop((pkg.root, pkg.cp), None)
++                visible_pkgs.cpv_inject(pkg)
+         return ret
+ 
+     def _is_argument(self, pkg):
+@@ -8434,7 +8614,11 @@
+         return not arg
+ 
+     def _want_update_pkg(self, parent, pkg):
+-        if self._frozen_config.excluded_pkgs.findAtomForPackage(
++        if _pkgset_inert(self._frozen_config.excluded_pkgs):
++            # stage4: the call below would return None, see _pkgset_inert.
++            if pkg._use is None:
++                pkg.use
++        elif self._frozen_config.excluded_pkgs.findAtomForPackage(
+             pkg, modified_use=self._pkg_use_enabled(pkg)
+         ):
+             return False
+@@ -8976,6 +9160,11 @@
+         have_usepkg_exclude = not usepkg_exclude.isEmpty()
+         have_usepkg_include = not usepkg_include.isEmpty()
+         useoldpkg_atoms = self._frozen_config.useoldpkg_atoms
++        # stage4: see _pkgset_inert(); none of these sets can change during
++        # this call.
++        excluded_inert = _pkgset_inert(self._frozen_config.excluded_pkgs)
++        useoldpkg_inert = _pkgset_inert(useoldpkg_atoms)
++        reinstall_inert = _pkgset_inert(reinstall_atoms)
+         matched_oldpkg = []
+         # Behavior of the "selective" parameter depends on
+         # whether or not a package matches an argument atom.
+@@ -9037,7 +9226,12 @@
+                         # if they're explicitly excluded, so we allow them to be selected.
+                         continue
+ 
+-                    if (
++                    if excluded_inert:
++                        # stage4: the call below would return None, see
++                        # _pkgset_inert.
++                        if not pkg.installed and pkg._use is None:
++                            pkg.use
++                    elif (
+                         not pkg.installed
+                         and self._frozen_config.excluded_pkgs.findAtomForPackage(
+                             pkg, modified_use=self._pkg_use_enabled(pkg)
+@@ -9084,9 +9278,16 @@
+                     ):
+                         continue
+ 
+-                    useoldpkg = useoldpkg_atoms.findAtomForPackage(
+-                        pkg, modified_use=self._pkg_use_enabled(pkg)
+-                    )
++                    if useoldpkg_inert:
++                        # stage4: what the call below would return, see
++                        # _pkgset_inert.
++                        if pkg._use is None:
++                            pkg.use
++                        useoldpkg = None
++                    else:
++                        useoldpkg = useoldpkg_atoms.findAtomForPackage(
++                            pkg, modified_use=self._pkg_use_enabled(pkg)
++                        )
+ 
+                     if (
+                         packages_with_invalid_use_config
+@@ -9485,7 +9686,12 @@
+                             )
+                             if reinstall_for_flags:
+                                 reinstall = True
+-                    if reinstall_atoms.findAtomForPackage(
++                    if reinstall_inert:
++                        # stage4: the call below would return None, see
++                        # _pkgset_inert.
++                        if pkg._use is None:
++                            pkg.use
++                    elif reinstall_atoms.findAtomForPackage(
+                         pkg, modified_use=self._pkg_use_enabled(pkg)
+                     ):
+                         reinstall = True
+@@ -11125,9 +11331,17 @@
+                                         continue
+                                     if smallest_leaf is None:
+                                         smallest_leaf = node
++                                    elif smallest_leaf < node:
++                                        # stage4 (r03-c1): the usual case,
++                                        # tested first. It excludes
++                                        # node < smallest_leaf
++                                        # (Package.__lt__ is asymmetric),
++                                        # so the outcome is the same in
++                                        # either order of the two tests.
++                                        pass
+                                     elif node < smallest_leaf:
+                                         smallest_leaf = node
+-                                    elif not smallest_leaf < node:
++                                    else:
+                                         unordered = True
+                                         break
+                                 if unordered:
+@@ -13949,6 +14163,8 @@
+         self._root = root
+         self._match_cache = {}
+         self._cpv_pkg_map = {}
++        # stage4: see _iter_virt_update().
++        self._virt_repetition_skip = "--debug" not in depgraph._frozen_config.myopts
+ 
+     def _clear_cache(self):
+         self._match_cache.clear()
+@@ -14063,7 +14279,14 @@
+             self._cpv_pkg_map[pkg.cpv] = pkg
+         return ret[:]
+ 
+-    def _visible(self, pkg, atom_set, avoid_slot_conflict=True, probe_virt_update=True):
++    def _visible(
++        self,
++        pkg,
++        atom_set,
++        avoid_slot_conflict=True,
++        probe_virt_update=True,
++        virt_deps_checked=False,
++    ):
+         if pkg.installed and not self._depgraph._want_installed_pkg(pkg):
+             return False
+         if pkg.installed and (
+@@ -14087,7 +14310,10 @@
+                     return False
+ 
+         if pkg.category == "virtual":
+-            if not self._depgraph._virt_deps_visible(pkg, ignore_use=True):
++            # stage4: virt_deps_checked, see _iter_virt_update().
++            if not virt_deps_checked and not self._depgraph._virt_deps_visible(
++                pkg, ignore_use=True
++            ):
+                 return False
+ 
+             if probe_virt_update and self._have_virt_update(pkg, atom_set):
+@@ -14154,9 +14380,32 @@
+                 self._depgraph._select_atoms_parent, pkg
+             )
+         ):
++            # stage4: _visible() below asks _virt_deps_visible(new_child)
++            # a second time, right after the call here answered True. The
++            # second call is skipped when the first one ran no package
++            # selection (no miss of _highest_pkg_cache; in complete mode
++            # _select_package never does). Then the first call changed
++            # nothing that a repetition reads outside of caches: all the
++            # other state that the dep_check() machinery writes
++            # (_visible_pkgs, autounmask records, ignored_binaries,
++            # _reinstall_nodes, _need_restart) is written from that miss
++            # path only, the graph and the package tracker are not written
++            # from here at all, and between the two calls only
++            # _want_installed_pkg(), Package.masks, _pkg_visibility_check()
++            # without an autounmask level and _equiv_ebuild_visible() run,
++            # which write nothing but frozen-config caches. A repetition
++            # would therefore read the same values in the same order (the
++            # same _highest_pkg_cache and _match_cache entries, now all
++            # hits), answer True again, and store nothing new: only
++            # duplicates in the _highest_pkg_cache_cp_map lists and the same
++            # _cpv_pkg_map assignments. --debug is left alone, since the
++            # repetition could print.
++            dynamic_config = self._depgraph._dynamic_config
++            skip_repetition = self._virt_repetition_skip
+             for new_child in self._depgraph._iter_similar_available(
+                 pkg, next(iter(atom_set))
+             ):
++                misses = dynamic_config._highest_pkg_cache_misses
+                 if not self._depgraph._virt_deps_visible(new_child, ignore_use=True):
+                     continue
+ 
+@@ -14165,6 +14414,8 @@
+                     atom_set,
+                     avoid_slot_conflict=False,
+                     probe_virt_update=False,
++                    virt_deps_checked=skip_repetition
++                    and dynamic_config._highest_pkg_cache_misses == misses,
+                 ):
+                     continue
+ 

@@ -1,0 +1,50 @@
+depgraph: merge order of PDEPEND children no longer depends on the hash seed
+
+Sub-series: P (stage 5) - patch 3 of 3; applies without 0035 and 0036, in any order with them.
+Base: upstream bdf046b03 with 0001-0034 (the defect is in unpatched upstream too).
+
+In _serialize_tasks(), "for child in medium_post:" iterates a set of Package
+objects whose hashes derive from str hashes, so the order in which PDEPEND
+children are appended to asap_nodes, and with it their place in the merge
+list, changed with PYTHONHASHSEED from run to run. Seen on the test image:
+llvm-core/llvmgold-23 and llvm-core/llvm-toolchain-symlinks-23 (both PDEPEND
+children of llvm-core/llvm) swapped places between runs of the same emerge,
+with unpatched upstream and with the series alike. The loop now follows the
+graph's child order. The result is one of the orders the set iteration could
+produce; nothing else reads this order.
+
+No effect on the resolve time (88.8 -> 89.1 s, 90.6 -> 91.8 s: noise).
+Reported by the agent: full merge order equal for every seed tried (0, 1, 2,
+3, 6, 7 and random) where unpatched upstream gave two orders.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, stage 5, 2026-11-24
+(two rounds of implementer agents, black-box tester agents and a timing judge);
+split into independent patches and re-checked on 2026-11-24. Not a human-written
+change. Base: upstream bdf046b03 with patches 0001-0034. Test: `emerge -p -uND
+@world` on six states of one system image, six resolves in parallel; every run
+gave the same merge list in order and the same number of backtracking attempts
+as unpatched bdf046b03.
+
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -11565,6 +11565,20 @@
+                         )
+                     )
+                     medium_post -= medium_post_satisifed
++                    if len(medium_post) > 1:
++                        # stage5: medium_post is a set of Package objects, whose
++                        # hashes derive from str hashes, so its iteration order
++                        # (and with it the order in which PDEPEND children are
++                        # appended to asap_nodes, i.e. their merge order) changed
++                        # with PYTHONHASHSEED from run to run. Iterate in the
++                        # graph's (deterministic) child order instead. The
++                        # result is one of the orders that the set iteration
++                        # could produce; nothing else reads this order.
++                        medium_post = [
++                            child
++                            for child in mygraph.child_nodes(node)
++                            if child in medium_post
++                        ]
+                     for child in medium_post:
+                         if child in selected_nodes:
+                             continue

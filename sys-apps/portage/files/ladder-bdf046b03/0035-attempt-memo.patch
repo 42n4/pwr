@@ -1,0 +1,640 @@
+depgraph: reuse whole backtracking attempts across a prune_rebuilds restart
+
+Sub-series: P (stage 5) - patch 1 of 3; applies without 0036 and 0037, in any order with them.
+Base: upstream bdf046b03 with 0001-0034.
+
+After a prune_rebuilds restart the Backtracker hands out parameter sets that
+differ from an earlier attempt in nothing except prune_rebuilds=True. The flag
+is read at one place, at the end of _resolve() (now _resolve_after_prune_check),
+after the graph is built and the merge list is serialized. _AttemptMemo keeps
+the last 8 depgraphs built with prune_rebuilds=False and, for equal parameters
+(contents and iteration order), hands the old depgraph out again or, when that
+attempt ended in the prune restart, undoes the three statements of that branch
+and runs the rest of _resolve(). Not active under --debug or without
+backtracking.
+
+Lock-step check: _verify_attempt_memo (PORTAGE_STAGE5_VERIFY=1 or "memo" in the
+environment) builds every reused attempt from nothing as well and compares the
+two depgraphs object by object (_emerge/_attempt_memo_verify.py); it raises
+AssertionError on a difference. New test: tests/resolver/test_attempt_memo.py.
+
+Six-state sum, stage 5 judge: 93.0 -> 76.3 s. Alone beside the unchanged series
+on 2026-11-24: 88.8 -> 79.7 s and 90.6 -> 87.3 s (second pass on a loaded host).
+Lock-step run on the six states: no difference.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, stage 5, 2026-11-24
+(two rounds of implementer agents, black-box tester agents and a timing judge);
+split into independent patches and re-checked on 2026-11-24. Not a human-written
+change. Base: upstream bdf046b03 with patches 0001-0034. Test: `emerge -p -uND
+@world` on six states of one system image, six resolves in parallel; every run
+gave the same merge list in order and the same number of backtracking attempts
+as unpatched bdf046b03.
+
+--- a/lib/_emerge/_attempt_memo_verify.py
++++ b/lib/_emerge/_attempt_memo_verify.py
+@@ -0,0 +1,118 @@
++# stage5: the lock-step check of depgraph._AttemptMemo. Only imported when
++# depgraph._verify_attempt_memo is set; never used by a normal run.
++#
++# attempt_memo_diff() walks two depgraphs side by side (every attribute of
++# the depgraph, its _dynamic_config and _rebuild and everything reachable
++# from them: the digraph with its edge priorities, the package tracker, the
++# parent atoms, the slot operator deps, the blockers, the backtrack infos,
++# the serialized merge list, the scheduler graph, the depth of every Package)
++# and returns the paths at which they differ. Containers are compared in
++# iteration order, so a different order of a dict, a list or a set is a
++# difference too.
++
++import types
++from collections import deque
++
++from _emerge.Package import Package
++
++# Memo tables: they hold answers to pure questions, and which questions were
++# asked differs because the reused depgraph also answered the ones of
++# need_config_change() and of the prune_rebuilds condition before its restart.
++_MEMO_ATTRS = frozenset(
++    [
++        # PackageTracker.match() cache
++        "_match_cache",
++        # depgraph._slot_operator_check_reverse_dependencies lru_cache etc.
++        "_slot_operator_check_reverse_dependencies",
++    ]
++)
++
++_ATOMIC = (str, bytes, int, float, bool, type(None), type, types.ModuleType)
++_SKIP = (
++    types.FunctionType,
++    types.MethodType,
++    types.BuiltinFunctionType,
++    types.GeneratorType,
++)
++
++
++def _attrs(obj):
++    names = []
++    for cls in type(obj).__mro__:
++        slots = cls.__dict__.get("__slots__", ())
++        if isinstance(slots, str):
++            slots = (slots,)
++        names.extend(s for s in slots if s not in ("__dict__", "__weakref__"))
++    d = getattr(obj, "__dict__", None)
++    if d is not None:
++        names.extend(d)
++    return names
++
++
++def attempt_memo_diff(a, b, limit=20, memo_attrs=_MEMO_ATTRS, stats=None):
++    """
++    @return: list of "path: what" strings, empty when a and b are equal
++    """
++    diffs = []
++    seen = {}
++    stack = [(a, b, "depgraph")]
++    count = 0
++    while stack and len(diffs) < limit:
++        x, y, path = stack.pop()
++        if x is y:
++            continue
++        count += 1
++        if type(x) is not type(y):
++            diffs.append(f"{path}: type {type(x).__name__} / {type(y).__name__}")
++            continue
++        if isinstance(x, Package):
++            # Same instance in both (the package cache is shared) unless it was
++            # made by one of the two attempts.
++            if x != y or x.depth != y.depth or x.operation != y.operation:
++                diffs.append(f"{path}: package {x} / {y}")
++            continue
++        if isinstance(x, _ATOMIC):
++            if x != y:
++                diffs.append(f"{path}: {x!r:.80} / {y!r:.80}")
++            continue
++        if isinstance(x, _SKIP) or hasattr(x, "cache_info"):
++            continue
++        if id(x) in seen:
++            if seen[id(x)] != id(y):
++                diffs.append(f"{path}: shared object paired with two objects")
++            continue
++        seen[id(x)] = id(y)
++        if isinstance(x, dict):
++            if len(x) != len(y):
++                diffs.append(f"{path}: dict size {len(x)} / {len(y)}")
++                continue
++            for i, ((k1, v1), (k2, v2)) in enumerate(zip(x.items(), y.items())):
++                stack.append((k1, k2, f"{path}.key{i}"))
++                stack.append((v1, v2, f"{path}[{k1!s:.60}]"))
++        elif isinstance(x, (list, tuple, deque, set, frozenset)):
++            if len(x) != len(y):
++                diffs.append(f"{path}: size {len(x)} / {len(y)}")
++                continue
++            for i, (v1, v2) in enumerate(zip(x, y)):
++                stack.append((v1, v2, f"{path}[{i}]"))
++        else:
++            names = _attrs(x)
++            if not names and not hasattr(x, "__dict__"):
++                if x != y:
++                    diffs.append(f"{path}: {x!r:.80} / {y!r:.80}")
++                continue
++            for name in names:
++                if name in memo_attrs:
++                    continue
++                try:
++                    v1 = getattr(x, name)
++                except AttributeError:
++                    v1 = _attrs
++                try:
++                    v2 = getattr(y, name)
++                except AttributeError:
++                    v2 = _attrs
++                stack.append((v1, v2, f"{path}.{name}"))
++    if stats is not None:
++        stats["objects"] = stats.get("objects", 0) + count
++    return diffs
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -9,6 +9,7 @@
+ import logging
+ import os
+ import stat
++import sys
+ import textwrap
+ import time
+ import warnings
+@@ -908,6 +909,12 @@
+             backtrack_parameters.slot_operator_replace_installed
+         )
+         self._prune_rebuilds = backtrack_parameters.prune_rebuilds
++        # stage5: see _AttemptMemo. _attempt_checkpoint is set by _resolve()
++        # when it restarts for prune_rebuilds; _attempt_depths records the
++        # depth that _add_pkg() gave to each package. Neither is read by the
++        # resolver itself.
++        self._attempt_checkpoint = None
++        self._attempt_depths = {}
+         self._need_restart = False
+         self._need_config_reload = False
+         # For conditions that always require user intervention, such as
+@@ -4769,6 +4776,9 @@
+                 depth = pkg.depth
+ 
+         pkg.depth = depth
++        # stage5: write-only record for _AttemptMemo (Package instances and
++        # their depth attribute are shared by all backtracking attempts).
++        self._dynamic_config._attempt_depths[pkg] = depth
+         deep = self._dynamic_config.myparams.get("deep", 0)
+         update = "--update" in self._frozen_config.myopts
+ 
+@@ -6819,6 +6829,12 @@
+                     self._dynamic_config._skip_restart = True
+                     return False, myfavorites
+ 
++        # stage5: the rest of this method is _resolve_after_prune_check(),
++        # split off unchanged so that _AttemptMemo can run it a second time.
++        # This is the only place in the resolver that reads _prune_rebuilds.
++        return self._resolve_after_prune_check(myfavorites)
++
++    def _resolve_after_prune_check(self, myfavorites):
+         if not self._dynamic_config._prune_rebuilds and (
+             self._ignored_binaries_autounmask_backtrack()
+             or (
+@@ -6827,6 +6843,13 @@
+                 and self._get_missed_updates()
+             )
+         ):
++            # stage5: what the three statements below change, for
++            # _resume_with_prune_rebuilds(). The condition above only reads
++            # (and fills the match cache of the package tracker).
++            self._dynamic_config._attempt_checkpoint = (
++                "config" in self._dynamic_config._backtrack_infos,
++                self._dynamic_config._need_restart,
++            )
+             config = self._dynamic_config._backtrack_infos.setdefault("config", {})
+             config["prune_rebuilds"] = True
+             self._dynamic_config._need_restart = True
+@@ -6865,6 +6888,26 @@
+         # We're true here unless we are missing binaries.
+         return (True, myfavorites)
+ 
++    def _resume_with_prune_rebuilds(self, myfavorites):
++        """
++        stage5: for _AttemptMemo. This depgraph was built with
++        prune_rebuilds=False and _resolve() ended in the prune_rebuilds
++        restart of _resolve_after_prune_check(). Put back what that branch
++        changed, switch the flag on and run the rest of _resolve(): this is
++        what a new depgraph with the same backtrack parameters and
++        prune_rebuilds=True computes, because nothing before that check reads
++        the flag and the check itself changes nothing else.
++        """
++        dynamic_config = self._dynamic_config
++        had_config, need_restart = dynamic_config._attempt_checkpoint
++        dynamic_config._attempt_checkpoint = None
++        del dynamic_config._backtrack_infos["config"]["prune_rebuilds"]
++        if not had_config:
++            del dynamic_config._backtrack_infos["config"]
++        dynamic_config._need_restart = need_restart
++        dynamic_config._prune_rebuilds = True
++        return self._resolve_after_prune_check(myfavorites)
++
+     def _apply_autounmask_continue_state(self):
+         """
+         Apply autounmask changes to Package instances, so that their
+@@ -14639,6 +14682,164 @@
+             world_set.unlock()
+ 
+ 
++# stage5: switches of _AttemptMemo. With _verify_attempt_memo every reused
++# attempt is also built from nothing, the two depgraphs are compared
++# (_attempt_memo_verify) and an AssertionError is raised when they differ;
++# the run then goes on with the one built from nothing.
++_attempt_memo_enabled = True
++# PORTAGE_STAGE5_VERIFY=1 (or "memo") in the environment turns it on. Unset in
++# normal use.
++_verify_attempt_memo = os.environ.get("PORTAGE_STAGE5_VERIFY") in ("1", "memo")
++# Depgraphs of failed attempts kept at most (each holds a whole graph).
++_ATTEMPT_MEMO_SIZE = 8
++
++
++def _attempt_param_image(obj):
++    """
++    stage5: an image of a backtrack parameter value that compares equal only
++    when the contents AND the iteration order are equal (and, for sets, the
++    size of the hash table), since the resolver iterates over these containers.
++    """
++    if isinstance(obj, dict):
++        return [(k, _attempt_param_image(v)) for k, v in obj.items()]
++    if isinstance(obj, (set, frozenset)):
++        return (sys.getsizeof(obj), [_attempt_param_image(x) for x in obj])
++    if isinstance(obj, (list, tuple)):
++        return [_attempt_param_image(x) for x in obj]
++    return obj
++
++
++class _AttemptMemo:
++    """
++    stage5: reuse of whole backtracking attempts.
++
++    The Backtracker never hands out two equal parameter sets, but after a
++    prune_rebuilds restart it hands out parameter sets that differ from an
++    earlier one in nothing except prune_rebuilds=True. That flag is read at
++    exactly one place, _resolve_after_prune_check(), after the graph is
++    built, the conflicts are processed and the merge list is serialized. So
++    for backtrack parameters that equal those of an earlier attempt E in
++    everything else (contents and iteration order), a new depgraph would
++    repeat E step by step up to that check, and then:
++
++    * E returned before the check, or its condition was false: the flag is
++      never looked at or makes no difference, the new attempt IS E. E is
++      handed out again as it is.
++    * E restarted there for prune_rebuilds: the new attempt skips the
++      condition and goes on. E is put back to the state before the check
++      and runs the rest of _resolve() (_resume_with_prune_rebuilds).
++
++    "Equal" leaves out the order of the packages in runtime_pkg_mask, see
++    image().
++
++    Package instances are shared by all attempts and _add_pkg() writes their
++    depth; the attempts between E and now may have changed it, so the depths
++    E assigned (the same ones the new attempt would assign) are written
++    again. Only attempts with prune_rebuilds=False are kept, only the last
++    _ATTEMPT_MEMO_SIZE of them, and an entry is used once.
++    """
++
++    __slots__ = ("_entries",)
++
++    def __init__(self):
++        self._entries = []
++
++    @staticmethod
++    def image(backtrack_parameters):
++        image = [
++            _attempt_param_image(getattr(backtrack_parameters, k))
++            for k in BacktrackParameter.__slots__
++            if k not in ("prune_rebuilds", "runtime_pkg_mask")
++        ]
++        # The order of the packages in runtime_pkg_mask is left out: a
++        # prune_rebuilds restart takes the slot_operator_mask_built entries
++        # out and later attempts put them back at the end. The resolver looks
++        # packages up in this dict and iterates over it at two places, both
++        # independent of the order as far as an attempt's course goes
++        # (_add_dep: "is there an entry that ...", _get_missed_updates: one
++        # result per slot, of which _resolve only asks whether there is any).
++        # The order of the result of _get_missed_updates is the order of the
++        # display, so reuse() hands the new dict to the reused depgraph.
++        image.append(
++            {
++                pkg: _attempt_param_image(reasons)
++                for pkg, reasons in backtrack_parameters.runtime_pkg_mask.items()
++            }
++        )
++        return image
++
++    def store(self, image, mydepgraph, success, favorites):
++        self._entries.append((image, mydepgraph, success, favorites))
++        if len(self._entries) > _ATTEMPT_MEMO_SIZE:
++            del self._entries[0]
++
++    def reuse(self, image, backtrack_parameters):
++        """
++        @param image: image(backtrack_parameters), taken before any depgraph
++                got these parameters
++        @return: (depgraph, success, favorites) of the attempt for these
++                parameters (prune_rebuilds=True), or None when no kept
++                attempt has them.
++        """
++        for i, entry in enumerate(self._entries):
++            if entry[0] == image:
++                break
++        else:
++            return None
++        del self._entries[i]
++        image, mydepgraph, success, favorites = entry
++        dynamic_config = mydepgraph._dynamic_config
++        for pkg, depth in dynamic_config._attempt_depths.items():
++            pkg.depth = depth
++        # Equal to the old one but for the order; the depgraph only reads it.
++        dynamic_config._runtime_pkg_mask = backtrack_parameters.runtime_pkg_mask
++        # select_files() leaves this None; need_config_change() of the first
++        # use may have built one, and builds the same one again.
++        dynamic_config._slot_conflict_handler = None
++        if dynamic_config._attempt_checkpoint is None:
++            dynamic_config._prune_rebuilds = True
++        else:
++            success, favorites = mydepgraph._resume_with_prune_rebuilds(favorites)
++        return mydepgraph, success, favorites
++
++
++def _attempt_memo_verify(reused, built):
++    """
++    stage5: the check behind _verify_attempt_memo.
++    """
++    from _emerge._attempt_memo_verify import attempt_memo_diff
++
++    if reused is None:
++        return
++    diffs = []
++    # A merge list that altlist() put off in both (the merge order deferral of
++    # _stage5_serialize_skippable, where this build has it) is computed now,
++    # so that the lists and the scheduler graphs are compared as well.
++    for attempt in (reused, built):
++        finish = getattr(attempt[0], "_stage5_finish_serialize", None)
++        if finish is not None:
++            finish()
++    if bool(reused[1]) != bool(built[1]):
++        diffs.append(f"success: {reused[1]} / {built[1]}")
++    if list(reused[2]) != list(built[2]):
++        diffs.append("favorites differ")
++    diffs.extend(attempt_memo_diff(reused[0], built[0], stats=_attempt_memo_verified))
++    # The depths that reuse() wrote are those the rebuilt attempt left behind.
++    for pkg, depth in built[0]._dynamic_config._attempt_depths.items():
++        if pkg.depth != depth:
++            diffs.append(f"depth of {pkg}: {pkg.depth} / {depth}")
++            break
++    _attempt_memo_verified["attempts"] = _attempt_memo_verified.get("attempts", 0) + 1
++    if diffs:
++        raise AssertionError(
++            "_AttemptMemo: reused attempt differs from the rebuilt one:\n  "
++            + "\n  ".join(diffs)
++        )
++
++
++_attempt_memo_verified = {}
++
++
+ # Net container allocations between two collections of the youngest garbage
+ # collector generation while backtrack_depgraph runs.
+ _RESOLVE_GC_THRESHOLD = 500000
+@@ -14712,6 +14913,10 @@
+     backtracker = Backtracker(max_depth)
+     backtracked = 0
+     restart_causes = collections.Counter()
++    # stage5: not under --debug, where every attempt prints its trace.
++    attempt_memo = None
++    if _attempt_memo_enabled and allow_backtracking and not debug:
++        attempt_memo = _AttemptMemo()
+ 
+     if frozen_config is None:
+         frozen_config = _frozen_depgraph_config(
+@@ -14744,17 +14949,38 @@
+                 level=logging.DEBUG,
+             )
+ 
+-        mydepgraph = depgraph(
+-            settings,
+-            trees,
+-            myopts,
+-            myparams,
+-            spinner,
+-            frozen_config=frozen_config,
+-            allow_backtracking=allow_backtracking,
+-            backtrack_parameters=backtrack_parameters,
+-        )
+-        success, favorites = mydepgraph.select_files(myfiles)
++        # stage5: see _AttemptMemo. The parameter image is taken before the
++        # depgraph gets (and adds to) the containers.
++        reused = param_image = None
++        if attempt_memo is not None:
++            param_image = attempt_memo.image(backtrack_parameters)
++            if backtrack_parameters.prune_rebuilds and not _verify_attempt_memo:
++                reused = attempt_memo.reuse(param_image, backtrack_parameters)
++
++        if reused is not None:
++            mydepgraph, success, favorites = reused
++        else:
++            mydepgraph = depgraph(
++                settings,
++                trees,
++                myopts,
++                myparams,
++                spinner,
++                frozen_config=frozen_config,
++                allow_backtracking=allow_backtracking,
++                backtrack_parameters=backtrack_parameters,
++            )
++            success, favorites = mydepgraph.select_files(myfiles)
++            if attempt_memo is None:
++                pass
++            elif not backtrack_parameters.prune_rebuilds:
++                attempt_memo.store(param_image, mydepgraph, success, favorites)
++            elif _verify_attempt_memo:
++                # Built first, as without the memo, then compared.
++                _attempt_memo_verify(
++                    attempt_memo.reuse(param_image, backtrack_parameters),
++                    (mydepgraph, success, favorites),
++                )
+ 
+         if (
+             success
+--- a/lib/_emerge/meson.build
++++ b/lib/_emerge/meson.build
+@@ -91,6 +91,7 @@
+         'show_invalid_depstring_notice.py',
+         'stdout_spinner.py',
+         'unmerge.py',
++        '_attempt_memo_verify.py',
+         '_depgraph_fork.py',
+         '_find_deep_system_runtime_deps.py',
+         '_flush_elog_mod_echo.py',
+--- a/lib/portage/tests/resolver/meson.build
++++ b/lib/portage/tests/resolver/meson.build
+@@ -3,6 +3,7 @@
+         'ResolverPlayground.py',
+         'test_alternatives_gzip.py',
+         'test_aggressive_backtrack_downgrade.py',
++        'test_attempt_memo.py',
+         'test_autounmask.py',
+         'test_autounmask_binpkg_use.py',
+         'test_autounmask_keep_keywords.py',
+--- a/lib/portage/tests/resolver/test_attempt_memo.py
++++ b/lib/portage/tests/resolver/test_attempt_memo.py
+@@ -0,0 +1,151 @@
++# Copyright 2026 Gentoo Authors
++# Distributed under the terms of the GNU General Public License v2
++
++# stage5: the lock-step check of _emerge.depgraph._AttemptMemo on the
++# resolver test cases whose backtracking comes back, after a prune_rebuilds
++# restart, to the parameters of an earlier attempt.
++
++from unittest.mock import patch
++
++import _emerge.depgraph as depgraph_module
++from portage.tests import TestCase
++from portage.tests.resolver.ResolverPlayground import (
++    ResolverPlayground,
++    ResolverPlaygroundTestCase,
++)
++from portage.tests.resolver import test_slot_operator_complete_graph as _complete_graph
++from portage.tests.resolver import test_slot_operator_missed_update as _missed_update
++from portage.tests.resolver import (
++    test_slot_operator_runtime_pkg_mask as _runtime_pkg_mask,
++)
++
++
++class AttemptMemoTestCase(TestCase):
++    def _verified(self):
++        return depgraph_module._attempt_memo_verified.get("attempts", 0)
++
++    def _run(self, case, name):
++        """
++        Run another test case with _verify_attempt_memo: every attempt that
++        the memo would hand out is also built from nothing and compared with
++        it (AssertionError on a difference), and at least one must occur.
++        """
++        before = self._verified()
++        with patch.object(depgraph_module, "_verify_attempt_memo", True):
++            getattr(case(name), name)()
++        self.assertGreater(self._verified(), before)
++
++        # And the plain runs, with and without the memo, pass the case's own
++        # checks.
++        getattr(case(name), name)()
++        with patch.object(depgraph_module, "_attempt_memo_enabled", False):
++            getattr(case(name), name)()
++
++    def testSlotOperatorCompleteGraph(self):
++        self._run(
++            _complete_graph.SlotOperatorCompleteGraphTestCase,
++            "testSlotOperatorCompleteGraph",
++        )
++
++    def testBacktrackMissedUpdate(self):
++        self._run(
++            _missed_update.BacktrackMissedUpdateTestCase,
++            "testBacktrackMissedUpdateTestCase",
++        )
++
++    def testSlotOperatorRuntimePkgMask(self):
++        self._run(
++            _runtime_pkg_mask.SlotOperatorRuntimePkgMaskTestCase,
++            "testSlotOperatorRuntimePkgMask",
++        )
++
++    def testWithAutounmaskChange(self):
++        """
++        The case of testBacktrackMissedUpdate plus a package that needs an
++        unstable keyword: the reused attempt carries autounmask state.
++        """
++        use_dep = "python_targets_pypy3? ( dev-python/pypy3:= )"
++        both = "+python_targets_pypy3 +python_targets_python2_7"
++        ebuilds = {
++            "app-misc/unstable-1": {"EAPI": "7", "KEYWORDS": "~x86"},
++            "dev-lang/python-2.7.18-r2": {
++                "EAPI": "7",
++                "IUSE": both,
++                "RDEPEND": use_dep,
++            },
++            "dev-python/pypy3-7.3.2_rc2_p37-r1": {
++                "EAPI": "7",
++                "SLOT": "0/pypy37-pp73",
++            },
++            "dev-python/pypy3-7.3.1-r3": {"EAPI": "7", "SLOT": "0/pypy36-pp73"},
++            "dev-python/setuptools-46.4.0-r2": {
++                "EAPI": "7",
++                "IUSE": both,
++                "RDEPEND": use_dep,
++            },
++            "dev-vcs/mercurial-5.5.1": {
++                "EAPI": "7",
++                "IUSE": both,
++                "RDEPEND": "dev-python/setuptools[python_targets_pypy3?,python_targets_python2_7?] python_targets_python2_7? ( dev-lang/python:2.7 ) "
++                + use_dep,
++            },
++        }
++        for version in ("50.3.0", "50.2.0", "50.1.0", "49.6.0"):
++            ebuilds[f"dev-python/setuptools-{version}"] = {
++                "EAPI": "7",
++                "IUSE": "python_targets_pypy3",
++                "RDEPEND": use_dep,
++            }
++        built_use = "python_targets_pypy3 python_targets_python2_7"
++        installed = {
++            "dev-lang/python-2.7.18-r2": {"EAPI": "7", "SLOT": "2.7"},
++            "dev-python/pypy3-7.3.1-r3": {"EAPI": "7", "SLOT": "0/pypy36-pp73"},
++            "dev-python/setuptools-46.4.0-r2": {
++                "EAPI": "7",
++                "IUSE": both,
++                "USE": built_use,
++                "RDEPEND": "dev-python/pypy3:0/pypy36-pp73=",
++            },
++            "dev-vcs/mercurial-5.5.1": {
++                "EAPI": "7",
++                "IUSE": both,
++                "USE": built_use,
++                "RDEPEND": "dev-python/setuptools[python_targets_pypy3,python_targets_python2_7] dev-python/pypy3:0/pypy36-pp73=",
++            },
++        }
++
++        def run():
++            test_case = ResolverPlaygroundTestCase(
++                [">=dev-python/pypy3-7.3.2_rc", "app-misc/unstable", "@world"],
++                options={
++                    "--autounmask": True,
++                    "--autounmask-backtrack": "y",
++                    "--backtrack": 6,
++                    "--deep": True,
++                    "--update": True,
++                },
++                success=False,
++                mergelist=[
++                    "dev-python/pypy3-7.3.2_rc2_p37-r1",
++                    "app-misc/unstable-1",
++                    "dev-python/setuptools-46.4.0-r2",
++                    "dev-vcs/mercurial-5.5.1",
++                ],
++                unstable_keywords=["app-misc/unstable-1"],
++            )
++            playground = ResolverPlayground(
++                ebuilds=ebuilds, installed=installed, world=["dev-vcs/mercurial"]
++            )
++            try:
++                playground.run_TestCase(test_case)
++                self.assertEqual(test_case.test_success, True, test_case.fail_msg)
++            finally:
++                playground.cleanup()
++
++        before = self._verified()
++        with patch.object(depgraph_module, "_verify_attempt_memo", True):
++            run()
++        self.assertGreater(self._verified(), before)
++        run()
++        with patch.object(depgraph_module, "_attempt_memo_enabled", False):
++            run()

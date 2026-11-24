@@ -1,0 +1,52 @@
+Resolver patch series on upstream Portage commit bdf046b03 (2026-11-23)
+======================================================================
+
+Base: git commit bdf046b03a28a74541c3c31c02244376f85d0790 of proj/portage.git,
+fetched as a snapshot tarball. Used by sys-apps/portage-9999-r12::pwr.
+
+  0001-0034   the series of ../ladder-73646c35d/ (its README says what each sub-series
+              A-O is, what it needs and what it gives alone), ported patch by patch:
+              after each patch every file touched so far was three-way merged (ours =
+              73646c35d + patches so far, base = 73646c35d, theirs = bdf046b03). One
+              conflict, in every step, in depgraph._select_atoms_probe(): upstream
+              80e187989abb gave that probe its own cache (_select_atoms_probe_cache).
+              Upstream's function is kept, the series' memo wrapper around it is
+              dropped, _select_atoms_probe_imp() of the series is upstream's
+              _select_atoms_probe_uncached(), and the helpers of 0029/0031 stand
+              before it. All other memos of the series are unchanged.
+  0035-0037   sub-series P, stage 5 of the agent runs (2026-11-24). Each of the three
+              applies alone, in any subset and in any order (patch -p1 -F0, checked),
+              and all three give the same tree whatever the order:
+              0035  reuse of whole backtracking attempts across a prune_rebuilds restart
+              0036  merge order calculation put off in attempts that restart
+              0037  merge order of PDEPEND children independent of the hash seed
+                    (a defect of unpatched upstream; no effect on time)
+  ../portage-bdf046b03-native-fastpaths.patch              the C modules _hashbase and _cfast
+  ../portage-bdf046b03-env-update-below-unmerge-group.patch  env-update no longer hangs
+              below a parallel unmerge (both files are the 73646c35d ones: they apply
+              with line offsets only)
+
+0001-0034 in numeric order (patch -p1 -F0) give the tree that was measured as "port" on
+2026-11-24, byte for byte. Dropping a patch of 0001-0034 follows the rules of the old
+README; the port did not make them independent of each other.
+
+Six-state sum of `emerge -p -uND @world` wall seconds, six resolves in parallel, merge
+list in order (without the two lines that 0037 fixes) and backtracking attempts equal
+to unpatched bdf046b03 in every run. Figures of one row were measured side by side;
+the host drifts by several seconds between sessions.
+
+  unpatched bdf046b03                          396.5 s
+  0001-0034 + C modules                         87.5 s   (installed -r11 beside it: 87.6)
+  + 0035                                        76.3 s   (beside 93.0)
+  + 0035 + 0036                                 74.2 s   (beside 76.6)
+  each alone, two passes (start 88.8 / 90.6):   0035 79.7 / 87.3, 0036 87.2 / 92.7,
+                                                0037 89.1 / 91.8, all three 74.1 / 76.7
+
+Lock-step runs (PORTAGE_STAGE5_VERIFY=1: every reused attempt rebuilt and compared,
+every merge list that is put off computed on the spot) on the six states with 0035
+alone, 0036 alone and all three: no difference.
+
+Known differences from unpatched head that do not touch the merge list: as in
+../ladder-73646c35d/README (testFindAtomForPackage, one "Manifest not found" line).
+
+Origin: every patch was written by AI agents (Claude); see the header of each patch.
