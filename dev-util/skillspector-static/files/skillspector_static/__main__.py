@@ -29,7 +29,7 @@ def main() -> None:
             argv[i] = os.path.realpath(arg)
         elif os.sep in arg and os.path.isdir(parent):
             argv[i] = os.path.join(os.path.realpath(parent), os.path.basename(arg))
-    if argv and argv[0] == "scan" and "--no-llm" not in argv:
+    if argv and argv[0] in {"scan", "baseline"} and "--no-llm" not in argv:
         argv.append("--no-llm")
     sys.argv = ["skillspector", *argv]
     from skillspector.cli_entry import app

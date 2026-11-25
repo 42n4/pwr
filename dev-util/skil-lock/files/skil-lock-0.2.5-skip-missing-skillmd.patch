@@ -1,0 +1,15 @@
+--- a/internal/scan/scan.go
++++ b/internal/scan/scan.go
+@@ -131,6 +131,12 @@
+ 
+ 			parsed, perr := parseFor(skillDir, root.Runtime)
+ 			if perr != nil {
++				// A directory without SKILL.md is not a skill (e.g. Codex's
++				// .codex/skills/.system container nests skills one level
++				// deeper): skip it. Real parse failures are still reported.
++				if errors.Is(perr, claude.ErrMissingSkillFile) {
++					continue
++				}
+ 				skillRel := filepath.ToSlash(filepath.Join(repoRel, claude.SkillFilename))
+ 				rep.Errors = append(rep.Errors, ScanError{
+ 					Path:  skillRel,
