@@ -20,7 +20,7 @@ def main() -> None:
         if "://" in arg or arg.startswith("git@"):
             sys.exit("skillspector-static: remote inputs need network access; this static-only build scans local paths")
     # Upstream refuses an input or output below a symlinked directory. A home directory reached through a symlink
-    # (/home/guest -> /home/pwas) would make every `~/...` argument fail, so local paths are resolved first.
+    # (for example /home/user -> /data/home/user) would make every `~/...` argument fail, so local paths are resolved first.
     for i, arg in enumerate(argv):
         if i == 0 or arg.startswith("-"):
             continue
