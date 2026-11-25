@@ -47,6 +47,13 @@ pkg_setup() {
 src_prepare() {
 	# cuda.eclass exports a src_prepare that dies without the toolkit.
 	use cuda && cuda_src_prepare
+	# Local CUDA speed-ups, A/B-tested at -ub 1024 against the unpatched
+	# engine: flat Escha GEMV for narrow projections, packed FA columns,
+	# chunked CUDA graph capture (upstream #30804) and the block-quantised
+	# K/V element count (upstream #30541). The sources are CRLF; so is
+	# the patch. eapply does not read .xz.
+	xz -dc "${FILESDIR}/${P}-kfast.patch.xz" > "${T}/${P}-kfast.patch" || die
+	eapply "${T}/${P}-kfast.patch"
 	cmake_src_prepare
 }
 
@@ -140,6 +147,8 @@ pkg_postinst() {
 	elog "  --spec-type draft-dflash -md dflash-Qwen3.8-27B-Q4_0.gguf --spec-draft-n-max 7"
 	elog "or, without the drafter file,"
 	elog "  --spec-type ngram-mod,draft-mtp --spec-draft-n-max 3"
+	elog "The local speed patch was validated at -ub 1024; -ub 2048 changes"
+	elog "answers on long prompts, with or without the patch."
 	elog "Upstream measures RTX 20/30/40 cards; other generations build with"
 	elog "CUDAARCHS set but are not covered by its tests."
 }
