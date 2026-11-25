@@ -46,7 +46,7 @@ src_install() {
 	cat > "${T}"/${PN} <<-EOF2 || die
 		#!/bin/sh
 		[ "\${CTXLINT_NOBOX:-0}" = 1 ] && exec node "${EPREFIX}/usr/share/${PN}/bin/ctxlint.js" "\$@"
-		exec bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \\
+		exec bwrap --ro-bind / / --dev /dev --proc /proc --setenv TMPDIR /dev/shm \\
 			--unshare-net --unshare-ipc --unshare-pid --die-with-parent --new-session \\
 			--chdir "\$PWD" node "${EPREFIX}/usr/share/${PN}/bin/ctxlint.js" "\$@"
 	EOF2

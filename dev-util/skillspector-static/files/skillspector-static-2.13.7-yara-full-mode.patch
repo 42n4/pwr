@@ -1,0 +1,16 @@
+diff --git a/src/skillspector/nodes/analyzers/static_yara.py b/src/skillspector/nodes/analyzers/static_yara.py
+index e698807c..5c1af7f0 100644
+--- a/src/skillspector/nodes/analyzers/static_yara.py
++++ b/src/skillspector/nodes/analyzers/static_yara.py
+@@ -1130,7 +1130,10 @@ def _match_file(
+         # YARA still evaluates full rule conditions, but stops retaining every
+         # repeated string instance after the condition is decided. Without
+         # this, one-byte custom rules can materialize millions of instances.
+-        fast=True,
++        # LOCAL: full mode. libyara 4.5.8 (the system library) returns only the FIRST instance of a string in fast
++        # mode, where the 4.5.4 bundled in upstream's wheel returned all of them; the context filters below then
++        # judge one instance instead of seven and drop real matches. Full mode gives every instance on both.
++        fast=False,
+     )
+ 
+     findings: list[AnalyzerFinding] = []

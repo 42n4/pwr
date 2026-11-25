@@ -10,5 +10,5 @@ RDEPEND=>=net-libs/nodejs-20 dev-vcs/git sys-apps/bubblewrap
 RESTRICT=network-sandbox test
 SLOT=0
 SRC_URI=https://github.com/YawLabs/ctxlint/archive/refs/tags/v0.29.0.tar.gz -> ctxlint-yaw-0.29.0.tar.gz
-_eclasses_=edob	357e125b8c5cad0deccb625e537ea831	edo	e472083829a6e7ff43a197cf536728a2
-_md5_=8081508156e5d6d72e586bf44ce39629
+_eclasses_=edo	e472083829a6e7ff43a197cf536728a2	edob	357e125b8c5cad0deccb625e537ea831
+_md5_=9672493528a71e5de3d2d640ad4e42bb

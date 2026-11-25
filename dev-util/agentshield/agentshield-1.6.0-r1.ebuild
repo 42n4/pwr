@@ -70,7 +70,7 @@ src_install() {
 		#!/bin/sh
 		[ "\${AGENTSHIELD_NOBOX:-0}" = 1 ] && exec node "${EPREFIX}/usr/share/${PN}/index.js" "\$@"
 		mkdir -p "\$HOME/.agentshield" || exit 1
-		exec bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \\
+		exec bwrap --ro-bind / / --dev /dev --proc /proc --setenv TMPDIR /dev/shm \\
 			--bind "\$HOME/.agentshield" "\$HOME/.agentshield" \\
 			--unshare-net --unshare-ipc --unshare-pid --die-with-parent --new-session \\
 			--chdir "\$PWD" node "${EPREFIX}/usr/share/${PN}/index.js" "\$@"
