@@ -50,3 +50,7 @@ Known differences from unpatched head that do not touch the merge list: as in
 ../ladder-73646c35d/README (testFindAtomForPackage, one "Manifest not found" line).
 
 Origin: every patch was written by AI agents (Claude); see the header of each patch.
+
+-r13 (2026-11-25): base moved to upstream master 278020458 (nine commits, bin/ shell helpers only).
+All files of this directory and both ../portage-bdf046b03-*.patch apply to it unchanged with
+patch -p1 -F0, so -r13 uses them from here (PATCH_BASE="bdf046b03" in the ebuild).
