@@ -1,0 +1,28 @@
+--- a/src/rules/prompt-defense.ts
++++ b/src/rules/prompt-defense.ts
+@@ -1,4 +1,6 @@
+ import type { ConfigFile, Finding, Rule, Severity } from "../types.js";
++import { homedir } from "node:os";
++import { isUserScopeFile } from "../scanner/paths.js";
+ 
+ interface DefenseCheck {
+   readonly id: string;
+@@ -155,6 +157,9 @@
+       if (!content) return [];
+ 
+       const findings: Finding[] = [];
++      // LOCAL BUILD: these defenses are written for prompts that face untrusted users (a support bot). A person's own
++      // ~/.claude/CLAUDE.md is instructions from that person to their own agent: report the gap, do not grade it.
++      const personal = isUserScopeFile(file.path, homedir());
+ 
+       for (const defense of DEFENSE_CHECKS) {
+         if (defense.pattern.test(content)) continue;
+@@ -162,7 +167,7 @@
+         const owaspNote = defense.owaspRef ? ` (OWASP LLM Top 10: ${defense.owaspRef})` : "";
+         findings.push({
+           id: `prompt-defense-missing-${defense.id}-${file.path}`,
+-          severity: defense.severity,
++          severity: personal ? "info" : defense.severity,
+           category: "injection",
+           title: `Missing prompt defense: ${defense.name}`,
+           description: `${defense.description}${owaspNote}`,
