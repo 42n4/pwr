@@ -1,0 +1,186 @@
+config: USE stacking applies the remembered effect of each configuration layer
+
+Sub-series: O (stage 4, round 2) - patch 3 of 3; needs 0012 (it calls _regenerate_use_stack() of that patch).
+Base: upstream 73646c35d.
+
+_regenerate_use_stack() replays every token of every layer (profile defaults,
+make.conf, package.use, ...) for each new combination of inputs; the make.conf
+layer alone is about 260 tokens and nine USE_EXPAND resets and is the same for
+every package. A layer without a token that prints a warning or looks at IUSE is
+a sequence of four kinds of steps (add a flag, discard a flag, discard a prefix,
+clear), each of which treats every flag independently. Its effect on any
+starting set is therefore (clear, discards, strips, adds), with adds computed by
+the unchanged loop itself from the empty set. _regenerate_use_stack_fast()
+applies that tuple per layer and hands any other layer, alone and with the
+flags so far, to the unchanged loop.
+
+Judge: see 0033 (measured together); alone 86.0 against 87.2 s (three passes,
+inside the noise). Lock-step counters of the author: 12,398 stack comparisons,
+0 mismatches. See 0032 for origin and for why there is no author report.
+Origin: written by AI agents (Claude) in stage 4 of the emerge-fast job, 2026-11-21, on
+upstream commit 73646c35d with patches 0001-0030 and the C modules applied. Not a
+human-written change. Judge: `emerge -p -uND @world` on six states of one system image, six
+resolves in parallel, wall seconds summed; every run gave the same merge list in the same
+order and the same number of backtracking attempts as unpatched 73646c35d. Black-box
+testers (invented states, reference against candidate): 0 differences.
+
+--- a/lib/portage/package/ebuild/config.py
++++ b/lib/portage/package/ebuild/config.py
+@@ -253,7 +253,7 @@
+ _REGENERATE_USE_STACK_MEMO_MAX = 4096
+ 
+ 
+-def _regenerate_use_stack(use_stack_inputs, iuse):
++def _regenerate_use_stack(use_stack_inputs, iuse, myflags=None):
+     """
+     The USE stacking loop of config.regenerate(), moved here unchanged except
+     that it works on the values that regenerate() has read from the dbs of
+@@ -275,7 +275,10 @@
+     package, and most packages have the same USE inputs as an earlier one.
+     """
+     global _regenerate_warned
+-    myflags = set()
++    # stage4: the flags to start from may be given, so that
++    # _regenerate_use_stack_fast() can run this loop for a single db.
++    if myflags is None:
++        myflags = set()
+     memoizable = True
+     for unprefixed_values, use_str, cur_use_expand, expand_values in use_stack_inputs:
+         for v in unprefixed_values:
+@@ -413,6 +416,116 @@
+     return myflags, memoizable
+ 
+ 
++# stage4: item of use_stack_inputs -> its effect, see _use_stack_layer_effect().
++_use_stack_layer_effect_memo = {}
++_USE_STACK_LAYER_MEMO_MAX = 4096
++
++
++def _use_stack_layer_effect(layer):
++    """
++    stage4: what the loop body of _regenerate_use_stack() does to the set
++    of flags for one item of use_stack_inputs, as a tuple
++    (clear, discards, strips, adds), or None if the loop itself has to run
++    for this item: it holds a token that makes the loop print a warning or
++    look at IUSE ("+flag", a "prefix_*" to enable, "-value" in a
++    non-incremental USE_EXPAND variable).
++
++    Without such a token the loop is a sequence of four kinds of steps:
++    add one flag, discard one flag, discard every flag with a given prefix
++    ("-prefix_*" and the reset of a non-incremental USE_EXPAND variable),
++    and clear ("-*"). Each of them treats every flag independently of the
++    other flags. So a flag is in the result if it is in the result that the
++    loop computes from the empty set (adds: it was added and not removed
++    afterwards), or if it was there at the start and no step removes it: no
++    clear, no discard of it (discards), no prefix that it starts with
++    (strips). A flag that some step removes is in the result only if a
++    later step adds it again, and then it is in adds. adds is computed by
++    the loop itself.
++    """
++    unprefixed_values, use_str, cur_use_expand, expand_values = layer
++    clear = False
++    discards = set()
++    strips = []
++    for v in unprefixed_values:
++        if v is None:
++            continue
++        for x in v.split():
++            if x[:1] == "-":
++                discards.add(x[1:])
++    mysplit = use_str.split()
++    if mysplit or cur_use_expand:
++        for x in mysplit:
++            if x == "-*":
++                clear = True
++            elif x[0] == "+":
++                return None
++            elif x[0] == "-":
++                if x[-2:] == "_*":
++                    strips.append(x[1:-1])
++                discards.add(x[1:])
++            elif x[-2:] == "_*":
++                return None
++        if expand_values is not None:
++            for var, (expand_value, is_not_incremental) in zip(
++                cur_use_expand, expand_values
++            ):
++                var_lower = var.lower()
++                if is_not_incremental:
++                    strips.append(var_lower + "_")
++                for x in expand_value.split():
++                    if x[0] == "+":
++                        return None
++                    if x[0] == "-":
++                        if is_not_incremental:
++                            return None
++                        discards.add(var_lower + "_" + x[1:])
++    adds, memoizable = _regenerate_use_stack((layer,), None)
++    if not memoizable:
++        # Not expected: the tokens that clear this flag were excluded above.
++        return None
++    return (clear, frozenset(discards), tuple(strips), frozenset(adds))
++
++
++def _regenerate_use_stack_fast(use_stack_inputs, iuse):
++    """
++    stage4: returns what _regenerate_use_stack(use_stack_inputs, iuse)
++    returns (an equal set of flags; both callers sort it). The loop of that
++    function handles one db after the other and carries nothing from one to
++    the next but the set of flags (and the memoizable flag, which only a
++    token that _use_stack_layer_effect() refuses can clear), so here each
++    db is either applied through its remembered effect or handed, alone and
++    with the flags so far, to that loop. The db of make.conf is the same
++    for every package and was the bulk of the work: about 260 tokens and
++    nine USE_EXPAND resets, for every new combination of IUSE defaults and
++    package.use (several hundred per resolve).
++    """
++    myflags = set()
++    memoizable = True
++    memo = _use_stack_layer_effect_memo
++    for layer in use_stack_inputs:
++        try:
++            effect = memo[layer]
++        except KeyError:
++            effect = _use_stack_layer_effect(layer)
++            if len(memo) < _USE_STACK_LAYER_MEMO_MAX:
++                memo[layer] = effect
++        if effect is None:
++            myflags, layer_memoizable = _regenerate_use_stack((layer,), iuse, myflags)
++            if not layer_memoizable:
++                memoizable = False
++            continue
++        clear, discards, strips, adds = effect
++        if clear:
++            myflags = set(adds)
++            continue
++        if discards:
++            myflags.difference_update(discards)
++        if strips:
++            myflags = {x for x in myflags if not x.startswith(strips)}
++        myflags.update(adds)
++    return myflags, memoizable
++
++
+ class config:
+     """
+     This class encompasses the main portage configuration.  Data is pulled from
+@@ -2843,7 +2956,8 @@
+             if myflags is not None:
+                 myflags = set(myflags)
+             else:
+-                myflags, memoizable = _regenerate_use_stack(
++                # stage4: see _regenerate_use_stack_fast().
++                myflags, memoizable = _regenerate_use_stack_fast(
+                     use_stack_inputs, [x.lstrip("+-") for x in iuse.split()]
+                 )
+                 if (
+@@ -3505,7 +3619,8 @@
+             # The memo holds frozensets, the code below needs its own set.
+             myflags = set(myflags)
+         else:
+-            myflags, memoizable = _regenerate_use_stack(use_stack_inputs, iuse)
++            # stage4: see _regenerate_use_stack_fast().
++            myflags, memoizable = _regenerate_use_stack_fast(use_stack_inputs, iuse)
+             if not memoizable:
+                 regenerate_quiet = False
+             if (

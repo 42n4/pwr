@@ -1,0 +1,339 @@
+depgraph: slot-operator probes pass over lower versions before creating packages
+
+Sub-series: A (probe, match and config memos) - patch 7 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+
+_upgrade_available(pkg) is true only if some candidate compares greater
+than pkg, and the loops of _slot_operator_update_probe skip every candidate
+that is less than the package they replace unless _downgrade_probe() is
+true. Yet each scan created a Package (metadata, masks, USE) for every
+version of the cp. The scans now pass over a candidate cpv with a lower
+version before a Package is made for it (newer_than / not_older_than in
+_iter_match_pkgs_atom_imp). _iter_replacement_parents and
+_iter_replacement_children yield the bounded sequence first and fall back
+to the complete one when the bounded one cannot settle the question (it
+yielded nothing, or nothing from the child's slot). Creating a Package has
+one visible effect, a repeated config warning for "+flag" values, so the
+bound is switched off once such a warning has been printed
+(_probe_bounds_allowed reads config._regenerate_warned).
+
+On top of patches 0001-0013, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 41.2 -> 37.6, holds 23.5 -> 19.7, masks 44.5 -> 42.0,
+  py313 27.0 -> 23.1, bdeps 31.9 -> 28.3, policykit 24.0 -> 20.1
+  sum of six 192.2 -> 170.8 (-21.4 s, -4.8 % of the stock sum 447.5)
+Patches 0001-0014 together: 447.5 -> 170.8 s (-62 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Weak spots and what was not checked:
+* The argument for skipping lower versions is in the two docstrings and
+  depends on how _downgrade_probe is defined; a change there must revisit
+  it. Configurations that print config warnings never take the bounded path,
+  so they were not exercised by the six states.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -2705,8 +2705,8 @@
+         want_downgrade = None
+         want_downgrade_parent = None
+ 
+-        for replacement_parent in self._iter_similar_available(
+-            dep.parent, dep.parent.slot_atom, autounmask_level=autounmask_level
++        for replacement_parent in self._iter_replacement_parents(
++            dep.parent, autounmask_level
+         ):
+             if replacement_parent is dep.parent:
+                 continue
+@@ -2772,7 +2772,9 @@
+ 
+                 candidate_pkg_atoms = []
+                 candidate_pkgs = []
+-                for pkg in self._iter_similar_available(dep.child, atom):
++                for pkg in self._iter_replacement_children(
++                    dep.child, atom, new_child_slot
++                ):
+                     if (
+                         dep.atom.package
+                         and pkg.slot == dep.child.slot
+@@ -3041,8 +3043,20 @@
+                 return memo.upgrade_available[pkg]
+             except KeyError:
+                 pass
++        # Only a package that compares greater than pkg can make this True,
++        # so the scan is told to pass over the candidates that cannot (see
++        # newer_than in _iter_match_pkgs_atom_imp) instead of examining every
++        # version of the package. The candidates that remain are examined
++        # exactly as _iter_similar_available examines them, in the same
++        # order, so the result is the same.
+         result = False
+-        for available_pkg in self._iter_similar_available(pkg, pkg.slot_atom):
++        if self._probe_bounds_allowed():
++            candidates = self._iter_similar_available_imp(
++                pkg, pkg.slot_atom, None, newer_than=pkg
++            )
++        else:
++            candidates = self._iter_similar_available(pkg, pkg.slot_atom)
++        for available_pkg in candidates:
+             if available_pkg > pkg:
+                 result = True
+                 break
+@@ -3051,6 +3065,90 @@
+             memo.upgrade_available[pkg] = result
+         return result
+ 
++    def _probe_bounds_allowed(self):
++        """
++        Whether _upgrade_available, _iter_replacement_parents and
++        _iter_replacement_children may pass over candidates that cannot
++        matter to them. Passing over a candidate means that no Package is
++        created for it here, and creating a Package has one effect that can
++        be seen: when the configuration makes config.regenerate() print a
++        warning (a value that starts with "+"), it is printed once more for
++        every package. Once such a warning has been printed, nothing is
++        passed over, so that the warnings are printed as often as before.
++        """
++        return not portage.package.ebuild.config._regenerate_warned
++
++    def _iter_replacement_parents(self, parent, autounmask_level):
++        """
++        The packages that _slot_operator_update_probe considers as a
++        replacement for parent: those of
++
++            self._iter_similar_available(
++                parent, parent.slot_atom, autounmask_level=autounmask_level)
++
++        in the same order, lazily, but without the ones that its loop passes
++        over anyway, when that can be known without creating them.
++
++        The loop skips a candidate that is less than parent unless
++        _downgrade_probe(parent) is true, and that is false as soon as the
++        sequence above (for autounmask_level None) has a member that is
++        greater than or equal to parent. Every candidate whose version is
++        not lower than that of parent is such a member, and every candidate
++        with a lower version is less than parent. So if the scan that
++        leaves out the lower versions (newer_than with or_equal, see
++        _iter_match_pkgs_atom_imp) yields anything at all, then the lower
++        versions would all be skipped, and what it yields is all that the
++        loop acts on. If it yields nothing, the complete sequence is used
++        as before; nothing has happened in the loop by then.
++        """
++        if autounmask_level is None and self._probe_bounds_allowed():
++            found = False
++            for pkg in self._iter_similar_available(
++                parent, parent.slot_atom, not_older_than=parent
++            ):
++                found = True
++                yield pkg
++            if found:
++                return
++        yield from self._iter_similar_available(
++            parent, parent.slot_atom, autounmask_level=autounmask_level
++        )
++
++    def _iter_replacement_children(self, child, atom, new_child_slot):
++        """
++        The packages that _slot_operator_update_probe considers as a
++        replacement for child: those of
++        self._iter_similar_available(child, atom), in the same order,
++        lazily, but without the ones with a lower version than child when
++        its loop is known to pass over them (see _iter_replacement_parents
++        for the reason and for the scan that leaves them out).
++
++        With new_child_slot, the loop skips every candidate that is less
++        than child, so the lower versions never matter. Otherwise it skips a
++        candidate from another slot, and one from the slot of child that is
++        less than child unless _downgrade_probe(child) is true. That is
++        false if the packages similar to child.slot_atom include one that is
++        greater than or equal to child, and a candidate of this scan that is
++        in the slot of child and has no lower version is such a package (the
++        filters of _iter_similar_available do not depend on the atom). So
++        once the scan without the lower versions has yielded a candidate
++        from the slot of child, the lower versions are all skipped. If it
++        has not, everything it yielded was from another slot and skipped
++        without effect, and the complete sequence follows (in which those
++        candidates are skipped again).
++        """
++        if atom.package and self._probe_bounds_allowed():
++            same_slot = new_child_slot
++            for pkg in self._iter_similar_available(
++                child, atom, not_older_than=child
++            ):
++                if pkg.slot == child.slot:
++                    same_slot = True
++                yield pkg
++            if same_slot:
++                return
++        yield from self._iter_similar_available(child, atom)
++
+     def _downgrade_probe(self, pkg):
+         """
+         Detect cases where a downgrade of the given package is considered
+@@ -3144,15 +3242,26 @@
+         self._dynamic_config._flatten_atoms_cache[cache_key] = atoms
+         return atoms
+ 
+-    def _iter_similar_available(self, graph_pkg, atom, autounmask_level=None):
++    def _iter_similar_available(
++        self, graph_pkg, atom, autounmask_level=None, not_older_than=None
++    ):
+         """
+         Given a package that's in the graph, do a rough check to
+         see if a similar package is available to install. The given
+         graph_pkg itself may be yielded only if it's not installed.
+         """
++        # With not_older_than (a Package; only without autounmask_level),
++        # the candidates with a lower version than that package are left
++        # out, see _iter_replacement_parents.
+         memo = self._probe_memo
+         if memo is None or autounmask_level is not None or not atom.package:
+-            return self._iter_similar_available_imp(graph_pkg, atom, autounmask_level)
++            return self._iter_similar_available_imp(
++                graph_pkg,
++                atom,
++                autounmask_level,
++                newer_than=not_older_than,
++                or_equal=True,
++            )
+         # The generator uses graph_pkg only for its root_config and its cp.
+         # The atom is keyed like _highest_pkg_cache keys it. The memo replays
+         # the items lazily, so that no package is examined that the
+@@ -3162,24 +3271,38 @@
+             graph_pkg.cp,
+             atom,
+             atom.unevaluated_atom,
++            not_older_than,
+         )
+         replay = memo.similar_available.get(key)
+         if replay is None:
+             replay = memo.similar_available[key] = _ReplayIter(
+                 functools.partial(
+-                    self._iter_similar_available_imp, graph_pkg, atom, None
++                    self._iter_similar_available_imp,
++                    graph_pkg,
++                    atom,
++                    None,
++                    newer_than=not_older_than,
++                    or_equal=True,
+                 )
+             )
+         return iter(replay)
+ 
+-    def _iter_similar_available_imp(self, graph_pkg, atom, autounmask_level):
++    def _iter_similar_available_imp(
++        self, graph_pkg, atom, autounmask_level, newer_than=None, or_equal=False
++    ):
+         usepkgonly = self._frozen_config.myopts.get("--usepkgonly") is True
+         useoldpkg_atoms = self._frozen_config.useoldpkg_atoms
+         use_ebuild_visibility = (
+             self._frozen_config.myopts.get("--use-ebuild-visibility", "n") != "n"
+         )
+ 
+-        for pkg in self._iter_match_pkgs_any(graph_pkg.root_config, atom):
++        if newer_than is None:
++            matches = self._iter_match_pkgs_any(graph_pkg.root_config, atom)
++        else:
++            matches = self._iter_match_pkgs_any_newer(
++                graph_pkg.root_config, atom, newer_than, or_equal
++            )
++        for pkg in matches:
+             if pkg.cp != graph_pkg.cp:
+                 # discard old-style virtual match
+                 continue
+@@ -7283,6 +7406,35 @@
+                 root_config, pkg_type, atom, onlydeps=onlydeps
+             )
+ 
++    def _iter_match_pkgs_any_newer(self, root_config, atom, newer_than, or_equal):
++        """
++        Like _iter_match_pkgs_any(root_config, atom), but the candidates of
++        the ebuild and binary package databases that cannot compare greater
++        than the package newer_than (with or_equal: that have a lower
++        version) are left out, see _iter_match_pkgs_atom_imp. What is
++        yielded is a subsequence of what _iter_match_pkgs_any yields.
++        """
++        for (
++            db,
++            pkg_type,
++            built,
++            installed,
++            db_keys,
++        ) in self._dynamic_config._filtered_trees[root_config.root]["dbs"]:
++            if atom.package and not installed:
++                for next_start, pkg in self._iter_match_pkgs_atom_imp(
++                    root_config,
++                    pkg_type,
++                    atom,
++                    False,
++                    0,
++                    newer_than=newer_than,
++                    or_equal=or_equal,
++                ):
++                    yield pkg
++            else:
++                yield from self._iter_match_pkgs(root_config, pkg_type, atom)
++
+     def _iter_match_pkgs(self, root_config, pkg_type, atom, onlydeps=False):
+         if atom.package:
+             return self._iter_match_pkgs_atom(
+@@ -7375,11 +7527,31 @@
+         ):
+             yield pkg
+ 
+-    def _iter_match_pkgs_atom_imp(self, root_config, pkg_type, atom, onlydeps, start):
++    def _iter_match_pkgs_atom_imp(
++        self,
++        root_config,
++        pkg_type,
++        atom,
++        onlydeps,
++        start,
++        newer_than=None,
++        or_equal=False,
++    ):
+         """
+         The body of _iter_match_pkgs_atom. It yields (next_start, pkg): with
+         next_start as start, it begins with the item that follows pkg.
+         next_start is None for an item after which nothing follows.
++
++        With a Package as newer_than, a candidate cpv is passed over, before
++        a Package is created for it, if that Package could not compare
++        greater than newer_than (Package.__gt__): same cp, and a lower
++        version, or an equal version unless both are built. With or_equal,
++        only the candidates of the same cp with a lower version are passed
++        over. Everything else is examined and yielded as without
++        newer_than. This is for callers that have no use for the other
++        candidates: creating a Package and evaluating its masks is
++        expensive, and most versions of a package are needed by nobody
++        else.
+         """
+ 
+         db = root_config.trees[self.pkg_tree_map[pkg_type]].dbapi
+@@ -7400,6 +7572,22 @@
+                 # to avoid unnecessary match_from_list comparisons on
+                 # versions that are never yielded from this method.
+                 if match_from_list(atom_exp, [cpv]):
++                    if (
++                        newer_than is not None
++                        and getattr(cpv, "cp", None) == newer_than.cp
++                    ):
++                        version = getattr(cpv, "version", None)
++                        if version is not None:
++                            version_cmp = portage.vercmp(version, newer_than.version)
++                            if version_cmp is not None and (
++                                version_cmp < 0
++                                or (
++                                    version_cmp == 0
++                                    and not or_equal
++                                    and (pkg_type == "ebuild" or not newer_than.built)
++                                )
++                            ):
++                                continue
+                     try:
+                         pkg = self._pkg(
+                             cpv,

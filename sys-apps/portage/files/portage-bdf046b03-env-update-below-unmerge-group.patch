@@ -1,0 +1,110 @@
+env-update: do not wait for the config lock that an ancestor emerge holds
+
+With --jobs above 1, emerge unmerges in parallel (_emerge/unmerge.py
+_unmerge_parallel) and holds vardbapi._fs_lock_group() until every member is
+done. A member's pkg_postrm can start a new Portage process: gcc's runs
+gcc-config, which runs env-update. That process does not inherit the lock
+state, asks for the same lock on var/lib/portage/config and waits for the
+emerge that is waiting for it: the unmerge hangs forever (seen 2026-11-22 and
+2026-11-23 with depclean of a gcc slot, 5.6 h on one host).
+
+env_update() now asks the kernel who holds the lock (fcntl.lockf locks name
+their owner). When the owner is an ancestor of this process it takes only the
+group lock, as a group member does; otherwise it takes the lock as before.
+
+Tested: a leader holding _fs_lock_group() with bash -> python env_update below
+it hangs without the patch and ends in 0.5 s with it; an unrelated holder still
+makes env_update wait until the lock is released.
+
+--- a/lib/portage/dbapi/vartree.py
++++ b/lib/portage/dbapi/vartree.py
+@@ -556,6 +556,70 @@
+             self._fs_lock_obj = None
+         self._fs_lock_count -= 1
+ 
++    def _fs_lock_ancestor(self):
++        """
++        Return the pid of an ancestor process that holds the _fs_lock, or
++        None. A process started from an ebuild phase (env-update run by
++        gcc-config in pkg_postrm) does not inherit the lock state of the
++        _fs_lock_group leader, which holds the lock until all its members
++        are done: waiting for it would never end.
++
++        Only fcntl.lockf locks name their owner; with any other lock
++        function this returns None and the caller waits as before.
++        """
++        import fcntl
++        import struct
++
++        try:
++            with open(self._conf_mem_file, "rb") as f:
++                flock = fcntl.fcntl(
++                    f.fileno(),
++                    fcntl.F_GETLK,
++                    struct.pack("hhqqi", fcntl.F_WRLCK, 0, 0, 0, 0),
++                )
++            l_type, _, _, _, l_pid = struct.unpack("hhqqi", flock)
++        except (OSError, struct.error):
++            return None
++        if l_type == fcntl.F_UNLCK or l_pid <= 0:
++            return None
++        pid = os.getpid()
++        while pid > 1:
++            try:
++                with open(f"/proc/{pid}/stat", "rb") as f:
++                    pid = int(f.read().rpartition(b")")[2].split()[1])
++            except (OSError, ValueError, IndexError):
++                return None
++            if pid == l_pid:
++                return l_pid
++        return None
++
++    @contextlib.contextmanager
++    def _fs_lock_shared_with_ancestor(self):
++        """
++        The _fs_lock for a process that may run below an _fs_lock_group
++        leader without having inherited its state. When an ancestor holds
++        the lock, take only the group lock, like a member does; otherwise
++        take the _fs_lock.
++        """
++        from portage.locks import lockfile, unlockfile
++
++        if (
++            self._fs_lock_count < 1
++            and self._fs_group_leader is None
++            and self._fs_lock_ancestor() is not None
++        ):
++            group_lock = lockfile(self._conf_mem_file, wantnewlockfile=True)
++            try:
++                yield
++            finally:
++                unlockfile(group_lock)
++        else:
++            self._fs_lock()
++            try:
++                yield
++            finally:
++                self._fs_unlock()
++
+     @contextlib.contextmanager
+     def _fs_lock_group(self):
+         """
+--- a/lib/portage/util/env_update.py
++++ b/lib/portage/util/env_update.py
+@@ -77,13 +77,12 @@
+ 
+     # Lock the config memory file to prevent symlink creation
+     # in merge_contents from overlapping with env-update.
+-    vardbapi._fs_lock()
+-    try:
++    # Below an _fs_lock_group leader (env-update started by an ebuild phase
++    # of a parallel unmerge) the lock is already held for us by an ancestor.
++    with vardbapi._fs_lock_shared_with_ancestor():
+         return _env_update(
+             makelinks, target_root, prev_mtimes, contents, env, writemsg_level
+         )
+-    finally:
+-        vardbapi._fs_unlock()
+ 
+ 
+ def _env_update(makelinks, target_root, prev_mtimes, contents, env, writemsg_level):

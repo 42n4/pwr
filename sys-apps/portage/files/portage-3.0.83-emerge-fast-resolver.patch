@@ -1,0 +1,4316 @@
+diff -ruN a/lib/_emerge/AbstractDepPriority.py b/lib/_emerge/AbstractDepPriority.py
+--- a/lib/_emerge/AbstractDepPriority.py
++++ b/lib/_emerge/AbstractDepPriority.py
+@@ -2,6 +2,7 @@
+ # Distributed under the terms of the GNU General Public License v2
+ 
+ import copy
++import copyreg
+ 
+ from portage.util.SlotObject import SlotObject
+ 
+@@ -35,4 +36,45 @@
+         return self.__int__() >= other
+ 
+     def copy(self):
+-        return copy.copy(self)
++        # What copy.copy() does for an instance of a class that has only
++        # slots and no hooks of its own for copying or pickling: a new
++        # object from cls.__new__(cls), then setattr() for every slot that
++        # is set, the slot names coming from copyreg._slotnames(). Doing it
++        # here skips the detour through __reduce_ex__(), which is slow, and
++        # priorities are copied for every dependency. Any other class goes
++        # through copy.copy() as before.
++        cls = self.__class__
++        slot_names = _copy_slot_names.get(cls)
++        if slot_names is None:
++            slot_names = _copy_slot_names[cls] = _get_copy_slot_names(cls)
++        if slot_names is False:
++            return copy.copy(self)
++        result = cls.__new__(cls)
++        for name in slot_names:
++            try:
++                value = getattr(self, name)
++            except AttributeError:
++                continue
++            setattr(result, name, value)
++        return result
++
++
++# class -> tuple of slot names for AbstractDepPriority.copy(), or False if
++# the class has to be copied by copy.copy().
++_copy_slot_names = {}
++
++
++def _get_copy_slot_names(cls):
++    if (
++        cls.__dictoffset__ != 0
++        or getattr(cls, "__copy__", None) is not None
++        or cls in copyreg.dispatch_table
++        or cls.__reduce_ex__ is not object.__reduce_ex__
++        or cls.__reduce__ is not object.__reduce__
++        or cls.__getstate__ is not object.__getstate__
++        or hasattr(cls, "__setstate__")
++        or hasattr(cls, "__getnewargs__")
++        or hasattr(cls, "__getnewargs_ex__")
++    ):
++        return False
++    return tuple(copyreg._slotnames(cls))
+diff -ruN a/lib/_emerge/Dependency.py b/lib/_emerge/Dependency.py
+--- a/lib/_emerge/Dependency.py
++++ b/lib/_emerge/Dependency.py
+@@ -21,13 +21,74 @@
+         "want_update",
+     )
+ 
+-    def __init__(self, **kwargs):
+-        SlotObject.__init__(self, **kwargs)
+-        if self.priority is None:
+-            self.priority = DepPriority()
+-        if self.depth is None:
+-            self.depth = 0
+-        if self.collapsed_parent is None:
+-            self.collapsed_parent = self.parent
+-        if self.collapsed_priority is None:
+-            self.collapsed_priority = self.priority
++    def __init__(
++        self,
++        *,
++        atom=None,
++        blocker=None,
++        child=None,
++        collapsed_parent=None,
++        collapsed_priority=None,
++        depth=None,
++        onlydeps=None,
++        parent=None,
++        priority=None,
++        root=None,
++        want_update=None,
++        **kwargs,
++    ):
++        if kwargs or type(self) is not Dependency:
++            # A subclass, or a keyword that is not a slot of this class: the
++            # generic constructor as before (it raises TypeError for an
++            # unknown keyword after it has set the slots).
++            SlotObject.__init__(
++                self,
++                atom=atom,
++                blocker=blocker,
++                child=child,
++                collapsed_parent=collapsed_parent,
++                collapsed_priority=collapsed_priority,
++                depth=depth,
++                onlydeps=onlydeps,
++                parent=parent,
++                priority=priority,
++                root=root,
++                want_update=want_update,
++                **kwargs,
++            )
++            if self.priority is None:
++                self.priority = DepPriority()
++            if self.depth is None:
++                self.depth = 0
++            if self.collapsed_parent is None:
++                self.collapsed_parent = self.parent
++            if self.collapsed_priority is None:
++                self.collapsed_priority = self.priority
++            return
++
++        # For exactly this class, SlotObject.__init__ sets each of the eleven
++        # slots above to its keyword value, or to None without one (the slot
++        # names are distinct and none is overridden by a property, so its
++        # duplicate and property checks cannot trigger on a new instance).
++        # The same assignments are made here directly, with the defaults
++        # below applied first instead of afterwards. A resolver run creates
++        # hundreds of thousands of these objects.
++        if priority is None:
++            priority = DepPriority()
++        if depth is None:
++            depth = 0
++        if collapsed_parent is None:
++            collapsed_parent = parent
++        if collapsed_priority is None:
++            collapsed_priority = priority
++        self.atom = atom
++        self.blocker = blocker
++        self.child = child
++        self.collapsed_parent = collapsed_parent
++        self.collapsed_priority = collapsed_priority
++        self.depth = depth
++        self.onlydeps = onlydeps
++        self.parent = parent
++        self.priority = priority
++        self.root = root
++        self.want_update = want_update
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -4,6 +4,7 @@
+ import collections
+ import errno
+ import functools
++import gc
+ import json
+ import logging
+ import os
+@@ -13,7 +14,7 @@
+ import warnings
+ from collections import OrderedDict, deque
+ from collections.abc import Callable, Iterable
+-from itertools import chain
++from itertools import chain, islice
+ 
+ import portage
+ from portage.const import (
+@@ -30,6 +31,7 @@
+ from portage.dbapi.IndexedPortdb import IndexedPortdb
+ from portage.dep import (
+     Atom,
++    ExtendedAtomDict,
+     _build_id_separator,
+     _repo_separator,
+     _slot_separator,
+@@ -79,7 +81,11 @@
+ from portage.versions import _pkg_str, catpkgsplit
+ 
+ from _emerge._find_deep_system_runtime_deps import _find_deep_system_runtime_deps
+-from _emerge._serialize_frontier import _FrontierDigraph, _SerializeFrontier
++from _emerge._serialize_frontier import (
++    _FrontierDigraph,
++    _GatherOkTracker,
++    _SerializeFrontier,
++)
+ from _emerge.AbstractDepPriority import AbstractDepPriority
+ from _emerge.AtomArg import AtomArg
+ from _emerge.Blocker import Blocker
+@@ -299,6 +305,129 @@
+         self.mergelist = mergelist
+ 
+ 
++# (priority class, keyword arguments) -> instance, see depgraph._priority.
++_priority_templates = {}
++
++
++class _ProbeMemo:
++    """
++    Memo tables for the probe helpers that _slot_operator_trigger_reinstalls
++    calls again and again with the same arguments. An instance lives for one
++    call of that method only, see there.
++    """
++
++    __slots__ = (
++        "select_atoms_probe",
++        "upgrade_available",
++        "downgrade_probe",
++        "similar_available",
++    )
++
++    def __init__(self):
++        self.select_atoms_probe = {}
++        self.upgrade_available = {}
++        self.downgrade_probe = {}
++        self.similar_available = {}
++
++
++class _ReplayIter:
++    """
++    Iterable over the items of the generator that factory() returns. The
++    generator is advanced lazily, exactly as far as the furthest consumer
++    went, and the items it yielded are kept, so that the next consumer gets
++    the same items without running the generator again.
++    """
++
++    __slots__ = ("_factory", "_items", "_source", "_running", "_broken")
++
++    def __init__(self, factory):
++        self._factory = factory
++        self._items = []
++        self._source = factory()
++        self._running = False
++        self._broken = False
++
++    def __iter__(self):
++        items = self._items
++        i = 0
++        while True:
++            if i < len(items):
++                yield items[i]
++                i += 1
++                continue
++            source = self._source
++            if source is None:
++                return
++            if self._running or self._broken:
++                # The shared generator is being advanced further up the
++                # stack, or it raised. Iterate a private one instead, which
++                # is what happens without the memo.
++                yield from islice(self._factory(), i, None)
++                return
++            self._running = True
++            try:
++                item = next(source)
++            except StopIteration:
++                self._source = None
++                return
++            except BaseException:
++                self._broken = True
++                raise
++            finally:
++                self._running = False
++            items.append(item)
++
++
++def _atom_key(atom):
++    """
++    What stands for an atom in the key of a cache dict: the string of a
++    plain Atom, anything else as it is. Atoms compare equal, and hash, by
++    their string alone (Atom.__eq__, Atom.__hash__; an Atom equals its
++    string, too), so a key with the string in place of the Atom finds
++    exactly the same dict entries. The string is hashed and compared
++    without a Python level call, and the resolver makes these lookups
++    several hundred thousand times per run.
++    """
++    if atom.__class__ is Atom:
++        return atom._string
++    return atom
++
++
++def _find_single_atom(atom, pkg, modified_use=None):
++    """
++    For an atom that is an instance of exactly Atom without extended
++    (wildcard) syntax, return what
++
++        InternalPackageSet(initial_atoms=(atom,), allow_repo=True)
++            .findAtomForPackage(pkg, modified_use=modified_use)
++
++    returns, without building the set. Such a set accepts the atom as it is
++    and files it under its cp, and findAtomForPackage() then does this:
++    it replaces pkg by a copy with the modified USE if that is not the USE
++    of pkg; it returns None if the set has nothing for the cp of pkg, i.e.
++    if that is not the cp of the atom; and for a set with this one atom it
++    returns the atom if match_from_list() matches it with pkg, else None
++    (see the single atom shortcut in PackageSet.findAtomForPackage). The
++    resolver asks this question for every parent atom of every package it
++    probes.
++    """
++    if modified_use is not None and modified_use is not pkg.use.enabled:
++        pkg = pkg.copy()
++        pkg._metadata["USE"] = " ".join(modified_use)
++    atom_cp = atom.cp
++    if atom_cp != portage.cpv_getkey(pkg.cpv):
++        return None
++    if atom_cp != pkg.cp:
++        # Not expected (the cp of a package is that of its cpv): the
++        # general code decides.
++        return InternalPackageSet(
++            initial_atoms=(atom,), allow_repo=True
++        ).findAtomForPackage(pkg)
++    if match_from_list(atom, [pkg]):
++        return atom
++    return None
++
++
+ class _frozen_depgraph_config:
+     def __init__(self, settings, trees, myopts, params, spinner):
+         self.settings = settings
+@@ -316,6 +445,15 @@
+         self.roots = {}
+         # All Package instances
+         self._pkg_cache = {}
++        # See depgraph._iter_match_pkgs_atom.
++        self._match_pkgs_atom_memo = {}
++        # (pkg, enabled USE flags) -> bool, see depgraph._add_pkg.
++        self._required_use_sat_memo = {}
++        # (pkg, USE flags) -> frozenset of atoms, see depgraph._flatten_atoms.
++        self._flatten_atoms_cache = {}
++        # (root, pkg, USE flags) -> frozenset of atoms, see
++        # depgraph._select_atoms_probe_certain.
++        self._probe_certain_cache = {}
+         self._highest_license_masked = {}
+         # We can't know that an soname dep is unsatisfied if there are
+         # any unbuilt ebuilds in the graph, since unbuilt ebuilds have
+@@ -694,7 +832,6 @@
+         self._ignored_deps = []
+         self._highest_pkg_cache = {}
+         self._highest_pkg_cache_cp_map = {}
+-        self._flatten_atoms_cache = {}
+         self._changed_deps_pkgs = {}
+ 
+         # Binary packages that have been rejected because they
+@@ -877,6 +1014,10 @@
+         self._virt_deps_visible_recursion = set()
+         self._virtual_cycle = None
+ 
++        # Memo tables of the probe helpers, only set while
++        # _slot_operator_trigger_reinstalls runs (see there).
++        self._probe_memo = None
++
+     def _index_binpkgs(self):
+         for root in self._frozen_config.trees:
+             bindb = self._frozen_config.trees[root]["bintree"].dbapi
+@@ -906,6 +1047,9 @@
+                 # This needs to be called for the first depgraph, but not for
+                 # backtracking depgraphs that share the same frozen_config.
+                 fake_vartree.sync()
++                # The installed packages have just been loaded, so nothing
++                # that was matched against them before is valid.
++                self._frozen_config._match_pkgs_atom_memo.clear()
+ 
+                 # FakeVartree.sync() populates virtuals, and we want
+                 # self.pkgsettings to have them populated too.
+@@ -2563,10 +2707,19 @@
+                         # by backtracking if necessary.
+                         continue
+ 
+-            atom_set = InternalPackageSet(initial_atoms=(atom,), allow_repo=True)
+-            if not atom_set.findAtomForPackage(
+-                candidate_pkg, modified_use=self._pkg_use_enabled(candidate_pkg)
+-            ):
++            if atom.__class__ is Atom and not atom.extended_syntax:
++                # See _find_single_atom: the same answer without the set.
++                atom_found = _find_single_atom(
++                    atom,
++                    candidate_pkg,
++                    modified_use=self._pkg_use_enabled(candidate_pkg),
++                )
++            else:
++                atom_set = InternalPackageSet(initial_atoms=(atom,), allow_repo=True)
++                atom_found = atom_set.findAtomForPackage(
++                    candidate_pkg, modified_use=self._pkg_use_enabled(candidate_pkg)
++                )
++            if not atom_found:
+                 if debug:
+                     parent_atoms = []
+                     for (
+@@ -2622,8 +2775,8 @@
+         want_downgrade = None
+         want_downgrade_parent = None
+ 
+-        for replacement_parent in self._iter_similar_available(
+-            dep.parent, dep.parent.slot_atom, autounmask_level=autounmask_level
++        for replacement_parent in self._iter_replacement_parents(
++            dep.parent, autounmask_level
+         ):
+             if replacement_parent is dep.parent:
+                 continue
+@@ -2689,7 +2842,9 @@
+ 
+                 candidate_pkg_atoms = []
+                 candidate_pkgs = []
+-                for pkg in self._iter_similar_available(dep.child, atom):
++                for pkg in self._iter_replacement_children(
++                    dep.child, atom, new_child_slot
++                ):
+                     if (
+                         dep.atom.package
+                         and pkg.slot == dep.child.slot
+@@ -2740,11 +2895,22 @@
+                         # to see if this atom is really desirable, since
+                         # otherwise we may trigger an undesirable rebuild
+                         # as in bug #460304.
+-                        if selected_atoms is None:
+-                            selected_atoms = self._select_atoms_probe(
++                        if (
++                            selected_atoms is None
++                            and unevaluated_atom
++                            in self._select_atoms_probe_certain(
+                                 dep.child.root, replacement_parent
+                             )
+-                        atom_not_selected = unevaluated_atom not in selected_atoms
++                        ):
++                            # It is in the result of _select_atoms_probe()
++                            # for sure, see _select_atoms_probe_certain.
++                            atom_not_selected = False
++                        else:
++                            if selected_atoms is None:
++                                selected_atoms = self._select_atoms_probe(
++                                    dep.child.root, replacement_parent
++                                )
++                            atom_not_selected = unevaluated_atom not in selected_atoms
+                         if atom_not_selected:
+                             break
+ 
+@@ -2761,11 +2927,20 @@
+                 # an soname atom which is unconditionally selected, and
+                 # _select_atoms_probe is not applicable.
+                 if atom_not_selected is None and unevaluated_atom is not None:
+-                    if selected_atoms is None:
+-                        selected_atoms = self._select_atoms_probe(
++                    if (
++                        selected_atoms is None
++                        and unevaluated_atom
++                        in self._select_atoms_probe_certain(
+                             dep.child.root, replacement_parent
+                         )
+-                    atom_not_selected = unevaluated_atom not in selected_atoms
++                    ):
++                        atom_not_selected = False
++                    else:
++                        if selected_atoms is None:
++                            selected_atoms = self._select_atoms_probe(
++                                dep.child.root, replacement_parent
++                            )
++                        atom_not_selected = unevaluated_atom not in selected_atoms
+ 
+                 if atom_not_selected:
+                     continue
+@@ -2952,27 +3127,249 @@
+         Detect cases where an upgrade of the given package is available
+         within the same slot.
+         """
+-        for available_pkg in self._iter_similar_available(pkg, pkg.slot_atom):
++        memo = self._probe_memo
++        if memo is not None:
++            try:
++                return memo.upgrade_available[pkg]
++            except KeyError:
++                pass
++        # Only a package that compares greater than pkg can make this True,
++        # so the scan is told to pass over the candidates that cannot (see
++        # newer_than in _iter_match_pkgs_atom_imp) instead of examining every
++        # version of the package. The candidates that remain are examined
++        # exactly as _iter_similar_available examines them, in the same
++        # order, so the result is the same.
++        result = False
++        if self._probe_bounds_allowed():
++            candidates = self._iter_similar_available_imp(
++                pkg, pkg.slot_atom, None, newer_than=pkg
++            )
++        else:
++            candidates = self._iter_similar_available(pkg, pkg.slot_atom)
++        for available_pkg in candidates:
+             if available_pkg > pkg:
+-                return True
++                result = True
++                break
+ 
+-        return False
++        if memo is not None:
++            memo.upgrade_available[pkg] = result
++        return result
++
++    def _probe_bounds_allowed(self):
++        """
++        Whether _upgrade_available, _iter_replacement_parents and
++        _iter_replacement_children may pass over candidates that cannot
++        matter to them. Passing over a candidate means that no Package is
++        created for it here, and creating a Package has one effect that can
++        be seen: when the configuration makes config.regenerate() print a
++        warning (a value that starts with "+"), it is printed once more for
++        every package. Once such a warning has been printed, nothing is
++        passed over, so that the warnings are printed as often as before.
++        """
++        return not portage.package.ebuild.config._regenerate_warned
++
++    def _iter_replacement_parents(self, parent, autounmask_level):
++        """
++        The packages that _slot_operator_update_probe considers as a
++        replacement for parent: those of
++
++            self._iter_similar_available(
++                parent, parent.slot_atom, autounmask_level=autounmask_level)
++
++        in the same order, lazily, but without the ones that its loop passes
++        over anyway, when that can be known without creating them.
++
++        The loop skips a candidate that is less than parent unless
++        _downgrade_probe(parent) is true, and that is false as soon as the
++        sequence above (for autounmask_level None) has a member that is
++        greater than or equal to parent. Every candidate whose version is
++        not lower than that of parent is such a member, and every candidate
++        with a lower version is less than parent. So if the scan that
++        leaves out the lower versions (newer_than with or_equal, see
++        _iter_match_pkgs_atom_imp) yields anything at all, then the lower
++        versions would all be skipped, and what it yields is all that the
++        loop acts on. If it yields nothing, the complete sequence is used
++        as before; nothing has happened in the loop by then.
++        """
++        if autounmask_level is None and self._probe_bounds_allowed():
++            found = False
++            for pkg in self._iter_similar_available(
++                parent, parent.slot_atom, not_older_than=parent
++            ):
++                found = True
++                yield pkg
++            if found:
++                return
++        yield from self._iter_similar_available(
++            parent, parent.slot_atom, autounmask_level=autounmask_level
++        )
++
++    def _iter_replacement_children(self, child, atom, new_child_slot):
++        """
++        The packages that _slot_operator_update_probe considers as a
++        replacement for child: those of
++        self._iter_similar_available(child, atom), in the same order,
++        lazily, but without the ones with a lower version than child when
++        its loop is known to pass over them (see _iter_replacement_parents
++        for the reason and for the scan that leaves them out).
++
++        With new_child_slot, the loop skips every candidate that is less
++        than child, so the lower versions never matter. Otherwise it skips a
++        candidate from another slot, and one from the slot of child that is
++        less than child unless _downgrade_probe(child) is true. That is
++        false if the packages similar to child.slot_atom include one that is
++        greater than or equal to child, and a candidate of this scan that is
++        in the slot of child and has no lower version is such a package (the
++        filters of _iter_similar_available do not depend on the atom). So
++        once the scan without the lower versions has yielded a candidate
++        from the slot of child, the lower versions are all skipped. If it
++        has not, everything it yielded was from another slot and skipped
++        without effect, and the complete sequence follows (in which those
++        candidates are skipped again).
++        """
++        if atom.package and self._probe_bounds_allowed():
++            same_slot = new_child_slot
++            for pkg in self._iter_similar_available(
++                child, atom, not_older_than=child
++            ):
++                if pkg.slot == child.slot:
++                    same_slot = True
++                yield pkg
++            if same_slot:
++                return
++        yield from self._iter_similar_available(child, atom)
+ 
+     def _downgrade_probe(self, pkg):
+         """
+         Detect cases where a downgrade of the given package is considered
+         desirable due to the current version being masked or unavailable.
+         """
++        memo = self._probe_memo
++        if memo is not None:
++            try:
++                return memo.downgrade_probe[pkg]
++            except KeyError:
++                pass
+         available_pkg = None
++        result = None
+         for available_pkg in self._iter_similar_available(pkg, pkg.slot_atom):
+             if available_pkg >= pkg:
+                 # There's an available package of the same or higher
+                 # version, so downgrade seems undesirable.
+-                return False
++                result = False
++                break
+ 
+-        return available_pkg is not None
++        if result is None:
++            result = available_pkg is not None
++        if memo is not None:
++            memo.downgrade_probe[pkg] = result
++        return result
+ 
+     def _select_atoms_probe(self, root, pkg):
++        memo = self._probe_memo
++        if memo is not None:
++            try:
++                return memo.select_atoms_probe[(root, pkg)]
++            except KeyError:
++                pass
++        result = self._select_atoms_probe_imp(root, pkg)
++        if memo is not None:
++            memo.select_atoms_probe[(root, pkg)] = result
++        return result
++
++    def _select_atoms_probe_certain(self, root, pkg):
++        """
++        A frozenset of atoms that are certain to be in the result of
++        _select_atoms_probe(root, pkg), found without dep_check(): the
++        unevaluated form of every atom that stands at the top level of one
++        of the dependency lists that _select_atoms_probe_imp() hands to
++        dep_check() (use_reduce() of a dependency string with the USE of
++        pkg), i.e. outside every "||" group, and that is an instance of
++        exactly Atom, not for a virtual/ package and not for a package that
++        package.provided names.
++
++        dep_check() cannot drop such an atom: _expand_new_virtuals() copies
++        it and adds it to atom_graph as a child of the parent,
++        _overlap_dnf() passes on what is not a "||" group, dep_wordreduce()
++        (no dbapi, not in package.provided) marks it as not satisfied, and
++        dep_zapdeps() returns every top level atom that is not satisfied;
++        _select_atoms_highest_available() then lists it under the parent,
++        as a child of the parent in atom_graph that dep_check() returned.
++        Most slot operator dependencies are of this kind, so the probe,
++        which runs dep_check() on every dependency string of the package,
++        is rarely needed for them.
++
++        The set is empty where this reasoning does not hold: with
++        --ignore-built-slot-operator-deps (the atoms of a built package are
++        rewritten before dep_check), without local_config, while a virtual
++        is being expanded (virt_parent), when a dependency string is
++        invalid, and once config.regenerate() has printed a warning (see
++        _probe_bounds_allowed; dep_check can create packages). It is also
++        empty as long as _select_atoms() is not _select_atoms_from_graph():
++        before the graph is complete, dep_check() selects packages with
++        _select_pkg_highest_available(), which records what it selected
++        (_highest_pkg_cache, _visible_pkgs), so the probe is not skipped
++        then. With the graph's own trees it only reads the graph.
++
++        Within one _slot_operator_trigger_reinstalls loop the result of
++        _select_atoms_probe() for a package does not change (_probe_memo
++        relies on that), so it does not matter that the probe may now be
++        computed at a later request than before, or not at all.
++        """
++        pkgsettings = self._frozen_config.pkgsettings[root]
++        if (
++            getattr(self._select_atoms, "__func__", None)
++            is not depgraph._select_atoms_from_graph
++            or not pkgsettings.local_config
++            or (
++                pkg.built
++                and self._dynamic_config.myparams.get(
++                    "ignore_built_slot_operator_deps", "n"
++                )
++                == "y"
++            )
++            or self._dynamic_config._graph_trees[root].get("virt_parent") is not None
++            or not self._probe_bounds_allowed()
++        ):
++            return frozenset()
++        use = self._pkg_use_enabled(pkg)
++        cache_key = (root, pkg, use)
++        certain = self._frozen_config._probe_certain_cache.get(cache_key)
++        if certain is not None:
++            return certain
++        # The same use_reduce() call that _select_atoms_highest_available()
++        # makes for a dependency string of the parent pkg.
++        eapi = pkg.eapi
++        is_valid_flag = None
++        if not pkg.installed:
++            is_valid_flag = pkg.iuse.is_valid_flag
++        pprovideddict = pkgsettings.pprovideddict
++        certain = set()
++        try:
++            for k in pkg._dep_keys:
++                v = pkg._metadata.get(k)
++                if not v:
++                    continue
++                for atom in portage.dep.use_reduce(
++                    v,
++                    uselist=use,
++                    opconvert=True,
++                    token_class=Atom,
++                    is_valid_flag=is_valid_flag,
++                    eapi=eapi,
++                ):
++                    if atom.__class__ is Atom:
++                        cp = atom.cp
++                        if not cp.startswith("virtual/") and cp not in pprovideddict:
++                            certain.add(atom.unevaluated_atom)
++        except InvalidDependString:
++            certain = set()
++        certain = self._frozen_config._probe_certain_cache[cache_key] = frozenset(
++            certain
++        )
++        return certain
++
++    def _select_atoms_probe_imp(self, root, pkg):
+         selected_atoms = []
+         use = self._pkg_use_enabled(pkg)
+         for k in pkg._dep_keys:
+@@ -2997,10 +3394,16 @@
+         @return: set of evaluated atoms
+         """
+ 
++        # The result is use_reduce() of the package's dependency strings
++        # with the given USE, its IUSE and its EAPI: a pure function of
++        # (pkg, use), since the metadata of a Package does not change. So
++        # the cache is kept in _frozen_config, where all backtracking runs
++        # share it (they ask for the same packages again), instead of in
++        # _dynamic_config. Exceptions are not cached, as before.
+         cache_key = (pkg, use)
+ 
+         try:
+-            return self._dynamic_config._flatten_atoms_cache[cache_key]
++            return self._frozen_config._flatten_atoms_cache[cache_key]
+         except KeyError:
+             pass
+ 
+@@ -3024,23 +3427,70 @@
+ 
+         atoms = frozenset(atoms)
+ 
+-        self._dynamic_config._flatten_atoms_cache[cache_key] = atoms
++        self._frozen_config._flatten_atoms_cache[cache_key] = atoms
+         return atoms
+ 
+-    def _iter_similar_available(self, graph_pkg, atom, autounmask_level=None):
++    def _iter_similar_available(
++        self, graph_pkg, atom, autounmask_level=None, not_older_than=None
++    ):
+         """
+         Given a package that's in the graph, do a rough check to
+         see if a similar package is available to install. The given
+         graph_pkg itself may be yielded only if it's not installed.
+         """
++        # With not_older_than (a Package; only without autounmask_level),
++        # the candidates with a lower version than that package are left
++        # out, see _iter_replacement_parents.
++        memo = self._probe_memo
++        if memo is None or autounmask_level is not None or not atom.package:
++            return self._iter_similar_available_imp(
++                graph_pkg,
++                atom,
++                autounmask_level,
++                newer_than=not_older_than,
++                or_equal=True,
++            )
++        # The generator uses graph_pkg only for its root_config and its cp.
++        # The atom is keyed like _highest_pkg_cache keys it. The memo replays
++        # the items lazily, so that no package is examined that the
++        # generator would not have examined for the same consumer.
++        key = (
++            graph_pkg.root_config,
++            graph_pkg.cp,
++            atom,
++            atom.unevaluated_atom,
++            not_older_than,
++        )
++        replay = memo.similar_available.get(key)
++        if replay is None:
++            replay = memo.similar_available[key] = _ReplayIter(
++                functools.partial(
++                    self._iter_similar_available_imp,
++                    graph_pkg,
++                    atom,
++                    None,
++                    newer_than=not_older_than,
++                    or_equal=True,
++                )
++            )
++        return iter(replay)
+ 
++    def _iter_similar_available_imp(
++        self, graph_pkg, atom, autounmask_level, newer_than=None, or_equal=False
++    ):
+         usepkgonly = self._frozen_config.myopts.get("--usepkgonly") is True
+         useoldpkg_atoms = self._frozen_config.useoldpkg_atoms
+         use_ebuild_visibility = (
+             self._frozen_config.myopts.get("--use-ebuild-visibility", "n") != "n"
+         )
+ 
+-        for pkg in self._iter_match_pkgs_any(graph_pkg.root_config, atom):
++        if newer_than is None:
++            matches = self._iter_match_pkgs_any(graph_pkg.root_config, atom)
++        else:
++            matches = self._iter_match_pkgs_any_newer(
++                graph_pkg.root_config, atom, newer_than, or_equal
++            )
++        for pkg in matches:
+             if pkg.cp != graph_pkg.cp:
+                 # discard old-style virtual match
+                 continue
+@@ -3107,6 +3557,28 @@
+         rebuilds if they can link to a newer slot that's in the graph.
+         """
+ 
++        # The loop below probes every slot operator dep twice, and deps that
++        # share a parent or a child repeat the same sub-probes many times:
++        # _select_atoms_probe for one replacement parent, _upgrade_available
++        # and _downgrade_probe for one package, _iter_similar_available for
++        # one cp and atom. Nothing that runs inside the loop changes what
++        # these four read (the graph, the package tracker, the parent atoms,
++        # the blockers, the runtime masks and autounmask changes, the package
++        # databases): the loop only adds to _backtrack_infos and sets
++        # _need_restart, which the probes do not look at (_select_atoms runs
++        # with _autounmask disabled, and only the autounmask path reads
++        # _need_restart), and it fills caches. So during this call each of
++        # them is a pure function of its arguments, and a repeated call can
++        # be answered from a memo. The memo is dropped when the loop is done,
++        # and everywhere else these helpers run as before.
++        memo_backup = self._probe_memo
++        self._probe_memo = _ProbeMemo()
++        try:
++            self._slot_operator_trigger_reinstalls_imp()
++        finally:
++            self._probe_memo = memo_backup
++
++    def _slot_operator_trigger_reinstalls_imp(self):
+         rebuild_if_new_slot = (
+             self._dynamic_config.myparams.get("rebuild_if_new_slot", "y") == "y"
+         )
+@@ -3643,12 +4115,24 @@
+             and pkg._metadata.get("REQUIRED_USE")
+             and eapi_has_required_use(pkg.eapi)
+         ):
+-            required_use_is_sat = check_required_use(
+-                pkg._metadata["REQUIRED_USE"],
+-                self._pkg_use_enabled(pkg),
+-                pkg.iuse.is_valid_flag,
+-                eapi=pkg.eapi,
+-            )
++            # Whether REQUIRED_USE is satisfied depends on the package (its
++            # metadata does not change) and on the enabled USE flags, and
++            # only the truth value is used here. Every backtracking run adds
++            # the same packages again, so the answer is kept for all of them
++            # in _frozen_config. Exceptions are not recorded.
++            pkg_use_enabled = self._pkg_use_enabled(pkg)
++            required_use_memo = self._frozen_config._required_use_sat_memo
++            required_use_is_sat = required_use_memo.get((pkg, pkg_use_enabled))
++            if required_use_is_sat is None:
++                required_use_is_sat = bool(
++                    check_required_use(
++                        pkg._metadata["REQUIRED_USE"],
++                        pkg_use_enabled,
++                        pkg.iuse.is_valid_flag,
++                        eapi=pkg.eapi,
++                    )
++                )
++                required_use_memo[(pkg, pkg_use_enabled)] = required_use_is_sat
+             if not required_use_is_sat:
+                 if dep.atom is not None and dep.parent is not None:
+                     self._add_parent_atom(pkg, (dep.parent, dep.atom))
+@@ -4931,7 +5415,22 @@
+             priority_constructor = UnmergeDepPriority
+         else:
+             priority_constructor = DepPriority
+-        return priority_constructor(**kwargs)
++        # The constructor is a pure function of its keyword arguments, and
++        # the same few combinations of flags are asked for with every
++        # dependency. So each combination is constructed once, and after
++        # that a copy of that instance is returned, which has the same class
++        # and the same attribute values as a newly constructed one (the
++        # instance kept here is never handed out, so nobody modifies it).
++        # Only for arguments that are True, False or None: these are
++        # singletons, so an equal key means identical arguments.
++        for value in kwargs.values():
++            if value is not True and value is not False and value is not None:
++                return priority_constructor(**kwargs)
++        key = (priority_constructor, tuple(kwargs.items()))
++        template = _priority_templates.get(key)
++        if template is None:
++            template = _priority_templates[key] = priority_constructor(**kwargs)
++        return template.copy()
+ 
+     def _cross(self, eroot):
+         """
+@@ -4986,6 +5485,37 @@
+         return ret
+ 
+     def _iter_atoms_for_pkg(self, pkg):
++        # This is asked for every package that the resolver looks at, and
++        # for most of them the argument atoms have nothing: when there is no
++        # extended (wildcard) atom and no atom for the cp of pkg,
++        # iterAtomsForPackage() yields nothing after exactly the three steps
++        # made here (cpv_getkey, _load, the lookup), so the generator below
++        # would yield nothing either. In that case an empty iterator is
++        # returned without creating the two generators. Every caller
++        # consumes the result at once, so it makes no difference that these
++        # steps run at the call instead of at the first next().
++        atoms = self._dynamic_config.sets[pkg.root].atoms
++        if atoms.__class__ is InternalPackageSet:
++            # cpv_getkey(pkg.cpv) and atoms._load() as in
++            # PackageSet.findAtomForPackage: without the calls where they
++            # would only return the cp attribute and do nothing.
++            cpv = pkg.cpv
++            try:
++                cp = cpv.cp
++            except AttributeError:
++                cp = portage.cpv_getkey(cpv)
++            if not (atoms._loaded or atoms._loading):
++                atoms._load()
++            atommap = atoms._atommap
++            if (
++                atommap.__class__ is ExtendedAtomDict
++                and not atommap._extended
++                and atommap._normal.get(cp) is None
++            ):
++                return iter(())
++        return self._iter_atoms_for_pkg_imp(pkg)
++
++    def _iter_atoms_for_pkg_imp(self, pkg):
+         depgraph_sets = self._dynamic_config.sets[pkg.root]
+         atom_arg_map = depgraph_sets.atom_arg_map
+         for atom in depgraph_sets.atoms.iterAtomsForPackage(pkg):
+@@ -6056,6 +6586,9 @@
+         if trees is None:
+             trees = self._dynamic_config._filtered_trees
+         mytrees = trees[root]
++        selected_atoms = self._select_atoms_flat(depstring, pkgsettings, mytrees, parent)
++        if selected_atoms is not None:
++            return selected_atoms
+         atom_graph = digraph()
+         if True:
+             # Temporarily disable autounmask so that || preferences
+@@ -6180,6 +6713,56 @@
+ 
+         return selected_atoms
+ 
++    def _select_atoms_flat(self, depstring, pkgsettings, mytrees, parent):
++        """
++        The result of _select_atoms_highest_available() for a dependency
++        list in which dep_check() has nothing to choose, or None if the list
++        is not of that kind: a non-empty list of Atom instances only (no
++        "||" group, hence no nested list either), none of them for a
++        virtual/ package or for a package that package.provided names, with
++        local_config set and no virt_parent in mytrees.
++
++        For such a list dep_check() does the following, step by step, and
++        calls nothing that looks at the graph, the databases or the state
++        that _select_atoms_highest_available() sets up around the call:
++        _expand_new_virtuals() copies the list, and adds (atom, id(atom)) as
++        a child of parent to atom_graph for every atom, if there is a
++        parent; _overlap_dnf() returns it unchanged, since it contains no
++        disjunction; dep_wordreduce(), without a dbapi and with none of
++        the packages in package.provided, marks every atom as not satisfied; and
++        dep_zapdeps() then returns every atom, in order, in a new list.
++        Without a parent that list is the result. With a parent the result
++        is an OrderedDict with the one key parent, whose value lists the
++        atom of every child node of parent in atom_graph: every atom once
++        per object (the node of an atom object that occurs twice is the same
++        node), in the order of the first occurrences.
++        """
++        if (
++            not depstring
++            or not pkgsettings.local_config
++            or mytrees.get("virt_parent") is not None
++        ):
++            return None
++        pprovideddict = pkgsettings.pprovideddict
++        for atom in depstring:
++            if atom.__class__ is not Atom:
++                return None
++            cp = atom.cp
++            if cp.startswith("virtual/") or cp in pprovideddict:
++                return None
++        if parent is None:
++            return depstring[:]
++        child_atoms = []
++        seen = set()
++        for atom in depstring:
++            atom_id = id(atom)
++            if atom_id not in seen:
++                seen.add(atom_id)
++                child_atoms.append(atom)
++        selected_atoms = OrderedDict()
++        selected_atoms[parent] = child_atoms
++        return selected_atoms
++
+     def _expand_virt_from_graph(self, root, atom):
+         if not isinstance(atom, Atom):
+             atom = Atom(atom)
+@@ -7122,6 +7705,35 @@
+                 root_config, pkg_type, atom, onlydeps=onlydeps
+             )
+ 
++    def _iter_match_pkgs_any_newer(self, root_config, atom, newer_than, or_equal):
++        """
++        Like _iter_match_pkgs_any(root_config, atom), but the candidates of
++        the ebuild and binary package databases that cannot compare greater
++        than the package newer_than (with or_equal: that have a lower
++        version) are left out, see _iter_match_pkgs_atom_imp. What is
++        yielded is a subsequence of what _iter_match_pkgs_any yields.
++        """
++        for (
++            db,
++            pkg_type,
++            built,
++            installed,
++            db_keys,
++        ) in self._dynamic_config._filtered_trees[root_config.root]["dbs"]:
++            if atom.package and not installed:
++                for next_start, pkg in self._iter_match_pkgs_atom_imp(
++                    root_config,
++                    pkg_type,
++                    atom,
++                    False,
++                    0,
++                    newer_than=newer_than,
++                    or_equal=or_equal,
++                ):
++                    yield pkg
++            else:
++                yield from self._iter_match_pkgs(root_config, pkg_type, atom)
++
+     def _iter_match_pkgs(self, root_config, pkg_type, atom, onlydeps=False):
+         if atom.package:
+             return self._iter_match_pkgs_atom(
+@@ -7149,23 +7761,137 @@
+         unbuilt ebuilds since USE are lazily calculated after visibility
+         checks (to avoid the expense when possible).
+         """
++        # The packages that _iter_match_pkgs_atom_imp yields depend on the
++        # arguments, on things that are the same for every depgraph sharing
++        # this _frozen_config (the package databases, with the installed
++        # packages loaded once by _load_vdb, _pkg_cache, the "remove"
++        # parameter, the dbs list) and on two things that are not: onlydeps
++        # makes _pkg look into the graph, and a package listed in
++        # _needed_use_config_changes is matched with changed USE. So while
++        # neither of these two applies, the items can be replayed from a memo
++        # shared by all backtracking runs, which ask for the same atoms again
++        # and again. The memo is filled lazily, as far as the furthest
++        # consumer went, so that no Package is created that the generator
++        # would not have created.
++        use_changes = self._dynamic_config._needed_use_config_changes
++        start = 0
++        if not (onlydeps or use_changes):
++            # The two atoms are keyed by their strings, see _atom_key().
++            memo_key = (
++                root_config,
++                pkg_type,
++                _atom_key(atom),
++                _atom_key(atom.unevaluated_atom),
++                "remove" in self._dynamic_config.myparams,
++            )
++            memo = self._frozen_config._match_pkgs_atom_memo.get(memo_key)
++            if memo is None:
++                # [[(start index for the item after this one, pkg), ...],
++                #  True once the list is complete]
++                memo = self._frozen_config._match_pkgs_atom_memo[memo_key] = [
++                    [],
++                    False,
++                ]
++            items = memo[0]
++            i = 0
++            # use_changes is tested again before every item, since the
++            # consumer may have added a USE change in the meantime.
++            while not use_changes:
++                if i < len(items):
++                    start, pkg = items[i]
++                    i += 1
++                    yield pkg
++                elif memo[1]:
++                    return
++                else:
++                    break
++            if start is None:
++                # The last item replayed is one after which the generator
++                # returns.
++                return
++            # Compute the items after those replayed, and record them unless
++            # USE changes showed up or somebody else recorded them already.
++            for next_start, pkg in self._iter_match_pkgs_atom_imp(
++                root_config, pkg_type, atom, onlydeps, start
++            ):
++                if not use_changes and i == len(items):
++                    items.append((next_start, pkg))
++                i += 1
++                yield pkg
++            if not use_changes and i == len(items):
++                memo[1] = True
++            return
++
++        for next_start, pkg in self._iter_match_pkgs_atom_imp(
++            root_config, pkg_type, atom, onlydeps, start
++        ):
++            yield pkg
++
++    def _iter_match_pkgs_atom_imp(
++        self,
++        root_config,
++        pkg_type,
++        atom,
++        onlydeps,
++        start,
++        newer_than=None,
++        or_equal=False,
++    ):
++        """
++        The body of _iter_match_pkgs_atom. It yields (next_start, pkg): with
++        next_start as start, it begins with the item that follows pkg.
++        next_start is None for an item after which nothing follows.
++
++        With a Package as newer_than, a candidate cpv is passed over, before
++        a Package is created for it, if that Package could not compare
++        greater than newer_than (Package.__gt__): same cp, and a lower
++        version, or an equal version unless both are built. With or_equal,
++        only the candidates of the same cp with a lower version are passed
++        over. Everything else is examined and yielded as without
++        newer_than. This is for callers that have no use for the other
++        candidates: creating a Package and evaluating its masks is
++        expensive, and most versions of a package are needed by nobody
++        else.
++        """
+ 
+         db = root_config.trees[self.pkg_tree_map[pkg_type]].dbapi
+         atom_exp = dep_expand(atom, mydb=db, settings=root_config.settings)
+         cp_list = db.cp_list(atom_exp.cp)
+-        matched_something = False
++        # An item was yielded before the start index, if that is not 0.
++        matched_something = start > 0
+         installed = pkg_type == "installed"
+ 
+         if cp_list:
+-            atom_set = InternalPackageSet(initial_atoms=(atom,), allow_repo=True)
++            if atom.__class__ is Atom and not atom.extended_syntax:
++                # See _find_single_atom: the same answers without the set.
++                atom_set = None
++            else:
++                atom_set = InternalPackageSet(initial_atoms=(atom,), allow_repo=True)
+ 
+             # descending order
+             cp_list.reverse()
+-            for cpv in cp_list:
++            for cp_list_index in range(start, len(cp_list)):
++                cpv = cp_list[cp_list_index]
+                 # Call match_from_list on one cpv at a time, in order
+                 # to avoid unnecessary match_from_list comparisons on
+                 # versions that are never yielded from this method.
+                 if match_from_list(atom_exp, [cpv]):
++                    if (
++                        newer_than is not None
++                        and getattr(cpv, "cp", None) == newer_than.cp
++                    ):
++                        version = getattr(cpv, "version", None)
++                        if version is not None:
++                            version_cmp = portage.vercmp(version, newer_than.version)
++                            if version_cmp is not None and (
++                                version_cmp < 0
++                                or (
++                                    version_cmp == 0
++                                    and not or_equal
++                                    and (pkg_type == "ebuild" or not newer_than.built)
++                                )
++                            ):
++                                continue
+                     try:
+                         pkg = self._pkg(
+                             cpv,
+@@ -7189,12 +7915,18 @@
+                         # Also, parts of the match that require metadata access
+                         # are deferred until we have cached the metadata in a
+                         # Package instance.
+-                        if not atom_set.findAtomForPackage(
+-                            pkg, modified_use=self._pkg_use_enabled(pkg)
+-                        ):
++                        if atom_set is None:
++                            atom_found = _find_single_atom(
++                                atom, pkg, modified_use=self._pkg_use_enabled(pkg)
++                            )
++                        else:
++                            atom_found = atom_set.findAtomForPackage(
++                                pkg, modified_use=self._pkg_use_enabled(pkg)
++                            )
++                        if not atom_found:
+                             continue
+                         matched_something = True
+-                        yield pkg
++                        yield cp_list_index + 1, pkg
+ 
+         # USE=multislot can make an installed package appear as if
+         # it doesn't satisfy a slot dependency. Rebuilding the ebuild
+@@ -7255,15 +7987,16 @@
+                     # Remove the slot from the atom and verify that
+                     # the package matches the resulting atom.
+                     if atom_set.findAtomForPackage(inst_pkg):
+-                        yield inst_pkg
++                        yield None, inst_pkg
+                         return
+ 
+     def _select_pkg_highest_available(self, root, atom, onlydeps=False, parent=None):
+         if atom.package:
++            # The two atoms are keyed by their strings, see _atom_key().
+             cache_key = (
+                 root,
+-                atom,
+-                atom.unevaluated_atom,
++                _atom_key(atom),
++                _atom_key(atom.unevaluated_atom),
+                 onlydeps,
+                 self._dynamic_config._autounmask,
+             )
+@@ -7706,9 +8439,12 @@
+         """
+         if pkg.built:
+             return pkg.use.enabled
+-        needed_use_config_change = self._dynamic_config._needed_use_config_changes.get(
+-            pkg
+-        )
++        needed_use_config_changes = self._dynamic_config._needed_use_config_changes
++        if not needed_use_config_changes and target_use is None:
++            # Nothing recorded (the usual state): get(pkg) below would
++            # return None, and then this is the result.
++            return pkg.use.enabled
++        needed_use_config_change = needed_use_config_changes.get(pkg)
+ 
+         if target_use is None:
+             if needed_use_config_change is None:
+@@ -9578,18 +10314,73 @@
+                 and (node.operation != "uninstall" or node in scheduled_uninstalls)
+             ]
+ 
++        # level -> (frontier.leaf_version[level], len(scheduled_uninstalls),
++        # result) of the last frontier_leaves() call for that level.
++        frontier_leaves_memo = {}
++
+         def frontier_leaves(ignore_priority):
+             """
+             Frontier equivalent of get_nodes(ignore_priority=...): the eligible
+             leaf nodes under `ignore_priority`, in mygraph.order.
++
++            The result depends on the leaf set of the level (the frontier
++            counts its changes in leaf_version), on scheduled_uninstalls
++            (which only grows, so its size identifies its content) and on
++            node.operation, which never changes. The list computed for the
++            same state is kept, and a copy of it is returned.
+             """
+             level = frontier.level_of(ignore_priority)
+-            return [
++            memo = frontier_leaves_memo.get(level)
++            if (
++                memo is not None
++                and memo[0] == frontier.leaf_version[level]
++                and memo[1] == len(scheduled_uninstalls)
++            ):
++                return memo[2][:]
++            result = [
+                 node
+                 for node in frontier.ready_nodes(level)
+                 if isinstance(node, Package)
+                 and (node.operation != "uninstall" or node in scheduled_uninstalls)
+             ]
++            frontier_leaves_memo[level] = (
++                frontier.leaf_version[level],
++                len(scheduled_uninstalls),
++                result,
++            )
++            return result[:]
++
++        def frontier_ordered_mergeable(ignore_priority):
++            """
++            The set that the original code builds from
++            get_nodes(ignore_priority=...), with the same iteration order.
++            """
++            return set(frontier_leaves(ignore_priority))
++
++        def frontier_mergeable(ignore_priority):
++            """
++            The nodes of frontier_leaves(ignore_priority) as a new set, built
++            from the frontier's leaf set of that level without hashing every
++            node again: a copy of it, minus the nodes that the filter of
++            frontier_leaves() rejects. Only a node for which the frontier's
++            `special` predicate is true (not a Package, or an uninstall) can
++            be rejected, so only those are put to the test. The iteration
++            order of this set is not that of set(frontier_leaves(...)).
++            """
++            leaves = frontier.leaf_set(frontier.level_of(ignore_priority))
++            result = leaves.copy()
++            special_nodes = frontier.special_nodes
++            if not special_nodes.isdisjoint(leaves):
++                for node in special_nodes & leaves:
++                    if not (
++                        isinstance(node, Package)
++                        and (
++                            node.operation != "uninstall"
++                            or node in scheduled_uninstalls
++                        )
++                    ):
++                        result.discard(node)
++            return result
+ 
+         # sys-apps/portage needs special treatment if ROOT="/"
+         running_root = self._frozen_config._running_root.root
+@@ -9733,9 +10524,20 @@
+         # unresolved blockers or circular dependencies.
+ 
+         if use_frontier:
+-            frontier = _SerializeFrontier(mygraph)
++            frontier = _SerializeFrontier(
++                mygraph,
++                special=lambda node: not isinstance(node, Package)
++                or node.operation == "uninstall",
++            )
+             mygraph.frontier = frontier
+ 
++        # (local_priority_range, level index) -> _GatherOkTracker, see
++        # find_smallest_cycle.
++        ok_trackers = {}
++        # local_priority_range -> the search state for which the runtime cycle
++        # search of that range last came back empty, see below.
++        no_cycle_memo = {}
++
+         while mygraph:
+             selected_nodes = None
+             ignore_priority = None
+@@ -9838,7 +10640,17 @@
+ 
+             if not selected_nodes:
+ 
+-                def find_smallest_cycle(mergeable_nodes, local_priority_range):
++                def find_smallest_cycle(
++                    mergeable_nodes, local_priority_range, ordered_mergeable=None
++                ):
++                    # With ordered_mergeable, mergeable_nodes is the set from
++                    # frontier_mergeable(), whose iteration order is not the
++                    # original one, and ordered_mergeable() returns the same
++                    # nodes as the set that the original code builds. The
++                    # iteration order of that set decides between candidates
++                    # for which Package.__lt__ gives no order, and it is the
++                    # input order of sorted() and _gather_deps_closures(), so
++                    # these steps get the original set, see use_ordered().
+                     if prefer_asap and asap_nodes:
+                         nodes = asap_nodes
+                     else:
+@@ -9876,21 +10688,131 @@
+                     ):
+                         blocked_nodes = frozenset((replacement_portage,))
+ 
+-                    # Sort nodes for deterministic results.
+-                    nodes = sorted(nodes)
+-                    for priority in (
+-                        local_priority_range.ignore_priority[i]
+-                        for i in range(
+-                            local_priority_range.MEDIUM_POST,
+-                            local_priority_range.MEDIUM_SOFT + 1,
+-                        )
++                    # Sort nodes for deterministic results. The sort is done
++                    # lazily, since the shortcuts below do not need it.
++                    sorted_nodes = None
++                    if frontier is not None:
++                        # The nodes that gather_deps may gather.
++                        if blocked_nodes is None:
++                            valid_nodes = mergeable_nodes
++                        else:
++                            valid_nodes = mergeable_nodes - blocked_nodes
++                        graph_nodes = mygraph.nodes
++
++                    def use_ordered():
++                        # Switch to the originally ordered set of mergeable
++                        # nodes (same members, see above).
++                        nonlocal mergeable_nodes, nodes, valid_nodes
++                        nonlocal ordered_mergeable
++                        ordered = ordered_mergeable()
++                        ordered_mergeable = None
++                        if nodes is mergeable_nodes:
++                            nodes = ordered
++                        if valid_nodes is mergeable_nodes:
++                            valid_nodes = ordered
++                        mergeable_nodes = ordered
++
++                    for i in range(
++                        local_priority_range.MEDIUM_POST,
++                        local_priority_range.MEDIUM_SOFT + 1,
+                     ):
++                        priority = local_priority_range.ignore_priority[i]
++                        level = None
++                        if frontier is not None:
++                            level = frontier.level_of(priority)
++                        if level is not None:
++                            # Shortcut 1: a candidate without any child at this
++                            # level has the closure {itself}. No closure is
++                            # smaller than one node, and the loop at the end of
++                            # this block keeps the first candidate of minimal
++                            # size in sorted order, so the result is the least
++                            # such candidate. Taking the first minimum while
++                            # iterating nodes in its own order is what the
++                            # stable sort followed by that loop returns.
++                            smallest_leaf = None
++                            if (
++                                ordered_mergeable is not None
++                                and nodes is mergeable_nodes
++                            ):
++                                # The same candidates, found by intersecting
++                                # the frontier's leaf set of this level with
++                                # valid_nodes (a subset of nodes), in no
++                                # particular order. If every comparison made
++                                # here gives a strict order, the result is
++                                # less than every other candidate
++                                # (Package.__lt__ is transitive), so it is
++                                # the first minimum in any iteration order.
++                                # Otherwise the original order decides, and
++                                # the search is redone below on the
++                                # originally ordered set.
++                                unordered = False
++                                for node in frontier.leaf_set(level) & valid_nodes:
++                                    if not graph_nodes[node][1]:
++                                        continue
++                                    if smallest_leaf is None:
++                                        smallest_leaf = node
++                                    elif node < smallest_leaf:
++                                        smallest_leaf = node
++                                    elif not smallest_leaf < node:
++                                        unordered = True
++                                        break
++                                if unordered:
++                                    smallest_leaf = None
++                                    use_ordered()
++                            if (
++                                ordered_mergeable is None
++                                or nodes is not mergeable_nodes
++                            ):
++                                for node in frontier.leaves_among(nodes, level):
++                                    if (
++                                        graph_nodes[node][1]
++                                        and (
++                                            nodes is valid_nodes
++                                            or node in valid_nodes
++                                        )
++                                        and (
++                                            smallest_leaf is None
++                                            or node < smallest_leaf
++                                        )
++                                    ):
++                                        smallest_leaf = node
++                            if smallest_leaf is not None:
++                                smallest_cycle = frozenset((smallest_leaf,))
++                                smallest_size = 1
++                                ignore_priority = priority
++                                break
++
++                            # Shortcut 2: skip the closure computation when it
++                            # cannot select anything, i.e. when no candidate
++                            # that has parents would be in its ok_nodes. The
++                            # tracker maintains that same set incrementally
++                            # across iterations of the selection loop.
++                            tracker = ok_trackers.get((local_priority_range, i))
++                            if tracker is None:
++                                tracker = ok_trackers[
++                                    (local_priority_range, i)
++                                ] = _GatherOkTracker(mygraph, frontier, priority)
++                            ok_nodes = tracker.sync(valid_nodes)
++                            if nodes is mergeable_nodes:
++                                # ok_nodes is a subset of mergeable_nodes.
++                                if not any(graph_nodes[node][1] for node in ok_nodes):
++                                    continue
++                            elif not any(
++                                node in ok_nodes and graph_nodes[node][1]
++                                for node in nodes
++                            ):
++                                continue
++
++                        if ordered_mergeable is not None:
++                            use_ordered()
++                        if sorted_nodes is None:
++                            sorted_nodes = sorted(nodes)
+                         # Compute gather_deps success and closure size for every
+                         # candidate at this filter level in one O(V+E) pass.
+                         ok_nodes, closure_size, closure_members = _gather_deps_closures(
+                             mygraph, mergeable_nodes, priority, blocked_nodes
+                         )
+-                        for node in nodes:
++                        for node in sorted_nodes:
+                             if not mygraph.parent_nodes(node):
+                                 continue
+                             if node not in ok_nodes:
+@@ -9916,15 +10838,53 @@
+                     priority_ranges.append(DepPrioritySatisfiedRange)
+ 
+                 for local_priority_range in priority_ranges:
+-                    mergeable_nodes = set(
+-                        get_nodes(ignore_priority=local_priority_range.ignore_medium)
+-                    )
++                    if frontier is not None:
++                        # Everything the search below reads besides constants:
++                        # the graph (any mutation goes through the frontier
++                        # journal), scheduled_uninstalls (only grows), and the
++                        # asap/priority_range selection state. When the search
++                        # for this range found nothing in this very state, it
++                        # would find nothing again (this happens each time the
++                        # loop comes back with drop_satisfied set).
++                        search_state = (
++                            len(frontier.removed_log),
++                            frontier.add_count,
++                            len(scheduled_uninstalls),
++                            priority_range,
++                            tuple(asap_nodes) if prefer_asap and asap_nodes else None,
++                        )
++                        if no_cycle_memo.get(local_priority_range) == search_state:
++                            # What find_smallest_cycle returned then.
++                            selected_nodes, ignore_priority = None, None
++                            continue
++                        # ignore_medium is ignore_priority[MEDIUM] for both
++                        # ranges, so set(frontier_leaves(ignore_medium)) is
++                        # set(get_nodes(ignore_medium)), with the nodes in
++                        # the same order. find_smallest_cycle gets the same
++                        # nodes as a set that is cheaper to build, and
++                        # builds this one when the order matters.
++                        ignore_medium = local_priority_range.ignore_priority[
++                            local_priority_range.MEDIUM
++                        ]
++                        mergeable_nodes = frontier_mergeable(ignore_medium)
++                        ordered_mergeable = functools.partial(
++                            frontier_ordered_mergeable, ignore_medium
++                        )
++                    else:
++                        mergeable_nodes = set(
++                            get_nodes(
++                                ignore_priority=local_priority_range.ignore_medium
++                            )
++                        )
++                        ordered_mergeable = None
+                     if mergeable_nodes:
+                         selected_nodes, ignore_priority = find_smallest_cycle(
+-                            mergeable_nodes, local_priority_range
++                            mergeable_nodes, local_priority_range, ordered_mergeable
+                         )
+                         if selected_nodes:
+                             break
++                        if frontier is not None:
++                            no_cycle_memo[local_priority_range] = search_state
+ 
+                 if not selected_nodes:
+                     if prefer_asap and asap_nodes:
+@@ -10262,7 +11222,12 @@
+                 # only trigger when the graph is nearly empty and the only
+                 # remaining nodes are isolated (no parents or children). Since
+                 # the nodes must be isolated, ignore_priority is not needed.
+-                selected_nodes = get_nodes()
++                if frontier is not None:
++                    # get_nodes() without the scan of the whole graph, as
++                    # in the leaf selection above.
++                    selected_nodes = frontier_leaves(None)
++                else:
++                    selected_nodes = get_nodes()
+ 
+             if not selected_nodes and not drop_satisfied:
+                 drop_satisfied = True
+@@ -11962,7 +12927,8 @@
+         return ret
+ 
+     def match_pkgs(self, atom):
+-        cache_key = (atom, atom.unevaluated_atom)
++        # The two atoms are keyed by their strings, see _atom_key().
++        cache_key = (_atom_key(atom), _atom_key(atom.unevaluated_atom))
+         ret = self._match_cache.get(cache_key)
+         if ret is not None:
+             for pkg in ret:
+@@ -12324,6 +13290,22 @@
+             world_set.unlock()
+ 
+ 
++# Net container allocations between two collections of the youngest garbage
++# collector generation while backtrack_depgraph runs.
++_RESOLVE_GC_THRESHOLD = 500000
++
++
++# For a --pretend run of the emerge program, _emerge.main switches the garbage
++# collector off for the whole process and sets _pretend_gc_limit to
++# _PRETEND_GC_LIMIT (see main._pretend_disable_gc). _backtrack_depgraph then
++# collects by hand between two backtracking attempts when more net container
++# allocations than this have piled up, so that the depgraphs of failed
++# attempts (reference cycles) do not stay in memory without bound. None
++# everywhere else.
++_PRETEND_GC_LIMIT = 6000000
++_pretend_gc_limit = None
++
++
+ def backtrack_depgraph(
+     settings: portage.package.ebuild.config.config,
+     trees: portage._trees_dict,
+@@ -12341,12 +13323,23 @@
+     backtracked, max_retries = -1, -1
+     start_time = time.monotonic()
+     _start_resolution_display(spinner, myopts)
++    # The resolver allocates container objects much faster than it frees
++    # them while it builds a graph, so with the default threshold the cyclic
++    # garbage collector starts a collection every 2000 net allocations, and
++    # its full collections walk the whole heap (package cache, graph) over
++    # and over. Let it wait longer between collections while resolving. This
++    # only changes when unreachable cycles (mostly the depgraph of the
++    # previous backtracking run) are freed, not what the resolver computes.
++    gc_threshold = gc.get_threshold()
++    if 0 < gc_threshold[0] < _RESOLVE_GC_THRESHOLD:
++        gc.set_threshold(_RESOLVE_GC_THRESHOLD, *gc_threshold[1:])
+     try:
+         success, mydepgraph, favorites, backtracked, max_retries = _backtrack_depgraph(
+             settings, trees, myopts, myparams, myaction, myfiles, spinner
+         )
+         return (success, mydepgraph, favorites)
+     finally:
++        gc.set_threshold(*gc_threshold)
+         if spinner is not None and spinner.end_notice():
+             _show_resolution_report(start_time, backtracked, max_retries)
+ 
+@@ -12384,6 +13377,15 @@
+             )
+             mydepgraph.display_problems()
+ 
++        if (
++            _pretend_gc_limit is not None
++            and not gc.isenabled()
++            and gc.get_count()[0] > _pretend_gc_limit
++        ):
++            # See _PRETEND_GC_LIMIT. This frees unreachable cycles only, so
++            # it cannot change what the next attempt computes.
++            gc.collect()
++
+         backtrack_parameters = backtracker.get()
+         if debug and backtrack_parameters.runtime_pkg_mask:
+             writemsg_level(
+diff -ruN a/lib/_emerge/DepPriority.py b/lib/_emerge/DepPriority.py
+--- a/lib/_emerge/DepPriority.py
++++ b/lib/_emerge/DepPriority.py
+@@ -7,6 +7,31 @@
+ class DepPriority(AbstractDepPriority):
+     __slots__ = ("cross", "ignored", "optional", "satisfied")
+ 
++    def copy(self):
++        # What AbstractDepPriority.copy() does for an instance of exactly
++        # this class with all ten slots set (they are, after __init__ or
++        # copy): a new instance with the same slot values. If a slot is not
++        # set, the attribute error sends it to the generic code, which
++        # copies the slots that are set. The resolver copies a priority for
++        # every dependency it adds.
++        if self.__class__ is not DepPriority:
++            return AbstractDepPriority.copy(self)
++        result = DepPriority.__new__(DepPriority)
++        try:
++            result.buildtime = self.buildtime
++            result.buildtime_slot_op = self.buildtime_slot_op
++            result.installtime = self.installtime
++            result.runtime = self.runtime
++            result.runtime_post = self.runtime_post
++            result.runtime_slot_op = self.runtime_slot_op
++            result.cross = self.cross
++            result.ignored = self.ignored
++            result.optional = self.optional
++            result.satisfied = self.satisfied
++        except AttributeError:
++            return AbstractDepPriority.copy(self)
++        return result
++
+     def __int__(self):
+         """
+         Note: These priorities are only used for measuring hardness
+diff -ruN a/lib/_emerge/main.py b/lib/_emerge/main.py
+--- a/lib/_emerge/main.py
++++ b/lib/_emerge/main.py
+@@ -2,6 +2,8 @@
+ # Distributed under the terms of the GNU General Public License v2
+ 
+ import argparse
++import atexit
++import gc
+ import locale
+ import logging
+ import os
+@@ -1227,6 +1229,100 @@
+     return os.EX_OK
+ 
+ 
++def _pretend_shortcuts_wanted(action, opts):
++    """
++    True if this process is the emerge program itself (not some other program
++    that calls emerge_main() as a library function) and it was asked to
++    --pretend a merge (no other action). Such a process only computes a
++    merge list and prints it: nothing is built or merged, and it ends as
++    soon as emerge_main() has returned. That allows two shortcuts which do
++    not change anything it prints, see _pretend_disable_gc() and
++    _pretend_arm_fast_exit().
++    """
++    if action is not None or "--pretend" not in opts:
++        return False
++    main_module = sys.modules.get("__main__")
++    main_file = getattr(main_module, "__file__", None)
++    return (
++        getattr(portage, "_internal_caller", False) is True
++        and isinstance(main_file, str)
++        and os.path.basename(main_file) == "emerge"
++        and getattr(main_module, "emerge_main", None) is emerge_main
++    )
++
++
++def _pretend_disable_gc():
++    """
++    Keep the cyclic garbage collector switched off for the rest of this
++    --pretend process. The resolver builds millions of long-lived container
++    objects, so every collection walks a large heap to free comparatively
++    little, and the process ends right after the result is printed.
++    Reference counting still frees everything that is not part of a
++    reference cycle. This only changes when the memory of unreachable cycles
++    is returned, not what is computed. To bound the memory held by such
++    cycles (mostly the depgraph of each failed backtracking attempt),
++    _backtrack_depgraph() collects once whenever _pretend_gc_limit net
++    container allocations have piled up since the last collection.
++    """
++    from _emerge import depgraph
++
++    if gc.isenabled():
++        gc.disable()
++        depgraph._pretend_gc_limit = depgraph._PRETEND_GC_LIMIT
++
++
++# Set while the interpreter runs the exit hook below.
++_pretend_fast_exit_running = False
++
++
++def _pretend_arm_fast_exit(retval):
++    """
++    Called when run_action() has returned retval in a --pretend run of the
++    emerge program: all that is left to do is to end the process with that
++    status. A normal interpreter shutdown first walks and frees the whole
++    heap (package cache, dependency graphs), which takes about a second and
++    has no visible effect. The hook registered here runs when the interpreter
++    starts to shut down, i.e. after the emerge script has called
++    sys.exit(retval) and has closed its event loop. It runs the exit hooks
++    registered by everybody else, flushes stdout and stderr, and ends the
++    process with the status that sys.exit(retval) gives, without the heap
++    teardown.
++
++    It stands back, and the normal shutdown goes on, if retval is not a
++    plain status, if an exception was reported after emerge_main() returned
++    (then the status is not retval), or if flushing fails.
++    """
++    if retval is None:
++        status = 0
++    elif type(retval) is int and 0 <= retval <= 255:
++        status = retval
++    else:
++        return
++
++    def fast_exit():
++        global _pretend_fast_exit_running
++        if _pretend_fast_exit_running:
++            # Called again by atexit._run_exitfuncs() below.
++            return
++        if (
++            getattr(sys, "last_exc", None) is not None
++            or getattr(sys, "last_value", None) is not None
++        ):
++            return
++        _pretend_fast_exit_running = True
++        try:
++            # The other exit hooks, in their usual order (this one was
++            # registered last, so it is the first one to be called).
++            atexit._run_exitfuncs()
++            sys.stdout.flush()
++            sys.stderr.flush()
++        except BaseException:
++            return
++        os._exit(status)
++
++    atexit.register(fast_exit)
++
++
+ def emerge_main(args: Optional[list[str]] = None):
+     """
+     Entry point of emerge
+@@ -1397,8 +1493,18 @@
+         tmpcmdline
+     )
+ 
++    # See _pretend_shortcuts_wanted().
++    pretend_shortcuts = _pretend_shortcuts_wanted(
++        emerge_config.action, emerge_config.opts
++    )
++    if pretend_shortcuts:
++        _pretend_disable_gc()
++
+     try:
+-        return run_action(emerge_config)
++        retval = run_action(emerge_config)
++        if pretend_shortcuts:
++            _pretend_arm_fast_exit(retval)
++        return retval
+     finally:
+         # Call destructors for our portdbapi instances.
+         for x in emerge_config.trees.values():
+diff -ruN a/lib/_emerge/Package.py b/lib/_emerge/Package.py
+--- a/lib/_emerge/Package.py
++++ b/lib/_emerge/Package.py
+@@ -674,14 +674,18 @@
+ 
+         def _init_force_mask(self):
+             pkgsettings = self._pkg._get_pkgsettings()
+-            self._expand = _intern_frozenset(
+-                pkgsettings.get("USE_EXPAND", "").lower().split()
++            self._set_force_mask(
++                pkgsettings.get("USE_EXPAND", ""),
++                pkgsettings.get("USE_EXPAND_HIDDEN", ""),
++                pkgsettings.useforce,
++                pkgsettings.usemask,
+             )
+-            self._expand_hidden = _intern_frozenset(
+-                pkgsettings.get("USE_EXPAND_HIDDEN", "").lower().split()
+-            )
+-            self._force = _intern_frozenset(pkgsettings.useforce)
+-            self._mask = _intern_frozenset(pkgsettings.usemask)
++
++        def _set_force_mask(self, use_expand, use_expand_hidden, useforce, usemask):
++            self._expand = _intern_frozenset(use_expand.lower().split())
++            self._expand_hidden = _intern_frozenset(use_expand_hidden.lower().split())
++            self._force = _intern_frozenset(useforce)
++            self._mask = _intern_frozenset(usemask)
+ 
+         @property
+         def expand(self):
+@@ -748,15 +752,29 @@
+             except KeyError:
+                 use_str = None
+             calculated_use = False
++            fast_use = None
+             if not use_str:
+-                use_str = self._get_pkgsettings()["PORTAGE_USE"]
++                # config._pkg_use_fast() returns the five values that are
++                # read below and in _init_force_mask() after setcpv(self),
++                # without the setcpv() call, or None if it cannot.
++                fast_use = (
++                    self.root_config.trees["porttree"]
++                    .dbapi.doebuild_settings._pkg_use_fast(self)
++                )
++                if fast_use is None:
++                    use_str = self._get_pkgsettings()["PORTAGE_USE"]
++                else:
++                    use_str = fast_use[0]
+                 calculated_use = True
+             self._use = self._use_class(self, split_interned(use_str))
+             # Initialize these now, since USE access has just triggered
+             # setcpv, and we want to cache the result of the force/mask
+             # calculations that were done.
+             if calculated_use:
+-                self._use._init_force_mask()
++                if fast_use is None:
++                    self._use._init_force_mask()
++                else:
++                    self._use._set_force_mask(*fast_use[1:])
+ 
+         _PackageMetadataWrapperBase.__setitem__(self._metadata, "USE", use_str)
+ 
+@@ -836,6 +854,13 @@
+     def __len__(self):
+         return 4
+ 
++    # The truth value of a Package is asked all the time ("if pkg:"). Without
++    # __bool__ it is taken from __len__ above, a call of a Python function
++    # that always returns 4, so it is always True. (1).__bool__ is a builtin
++    # that returns True; the interpreter calls a __bool__ that is not a
++    # function without arguments, and no Python frame is needed.
++    __bool__ = (1).__bool__
++
+     def __iter__(self):
+         """
+         This is used to generate mtimedb resume mergelist entries, so we
+@@ -904,6 +929,13 @@
+ 
+ _PackageMetadataWrapperBase = slot_dict_class(_all_metadata_keys)
+ 
++# (slot name, key) for every key of the class above, in the order in which
++# its iteritems() looks at them. See _PackageMetadataWrapper.__init__.
++_metadata_slots = tuple(
++    (_PackageMetadataWrapperBase._prefix + k, k)
++    for k in _PackageMetadataWrapperBase.allowed_keys
++)
++
+ 
+ class _PackageMetadataWrapper(_PackageMetadataWrapperBase):
+     """
+@@ -927,7 +959,24 @@
+             # USE is lazy, but we want it to show up in self.keys().
+             _PackageMetadataWrapperBase.__setitem__(self, "USE", "")
+ 
+-        self.update(metadata)
++        if metadata.__class__ is _PackageMetadataWrapperBase:
++            # What self.update(metadata) does for this class, without a
++            # generator and two method calls per key: iteritems() yields
++            # the keys of allowed_keys that are set, in the iteration
++            # order of that frozenset (_metadata_slots was made from the
++            # same object), and __setitem__ stores each value in its slot
++            # and then calls the _set_* hook of a wrapped key.
++            wrapped_keys = self._wrapped_keys
++            for attr, k in _metadata_slots:
++                try:
++                    v = getattr(metadata, attr)
++                except AttributeError:
++                    continue
++                setattr(self, attr, v)
++                if k in wrapped_keys:
++                    getattr(self, "_set_" + k.lower())(k, v)
++        else:
++            self.update(metadata)
+ 
+     def __getitem__(self, k):
+         v = _PackageMetadataWrapperBase.__getitem__(self, k)
+diff -ruN a/lib/_emerge/PackageVirtualDbapi.py b/lib/_emerge/PackageVirtualDbapi.py
+--- a/lib/_emerge/PackageVirtualDbapi.py
++++ b/lib/_emerge/PackageVirtualDbapi.py
+@@ -3,6 +3,7 @@
+ 
+ from portage.dbapi import dbapi
+ from portage.dbapi.dep_expand import dep_expand
++from portage.dep import Atom
+ 
+ 
+ class PackageVirtualDbapi(dbapi):
+@@ -73,8 +74,27 @@
+             self._match_cache = {}
+ 
+     def match(self, origdep, use_cache=1):
+-        atom = dep_expand(origdep, mydb=self, settings=self.settings)
+-        cache_key = (atom, atom.unevaluated_atom)
++        if (
++            origdep.__class__ is Atom
++            and not origdep.cp.startswith("virtual/")
++            and origdep.cp != "virtual"
++        ):
++            # dep_expand() returns an Atom of another category than
++            # "virtual" as it is, without looking at anything else.
++            atom = origdep
++        else:
++            atom = dep_expand(origdep, mydb=self, settings=self.settings)
++        unevaluated_atom = atom.unevaluated_atom
++        if atom.__class__ is Atom and unevaluated_atom.__class__ is Atom:
++            # Atoms compare equal, and hash, by their string alone
++            # (Atom.__eq__, Atom.__hash__), so a key made of the strings of
++            # two plain Atoms finds the same cache entries as a key made of
++            # the Atoms (and as the string keys of cp_list() below, like
++            # before). It is hashed and compared without a Python level
++            # call per Atom.
++            cache_key = (atom._string, unevaluated_atom._string)
++        else:
++            cache_key = (atom, unevaluated_atom)
+         result = self._match_cache.get(cache_key)
+         if result is not None:
+             return result[:]
+diff -ruN a/lib/_emerge/resolver/package_tracker.py b/lib/_emerge/resolver/package_tracker.py
+--- a/lib/_emerge/resolver/package_tracker.py
++++ b/lib/_emerge/resolver/package_tracker.py
+@@ -234,11 +234,26 @@
+         packages may also be returned.
+         """
+ 
+-        if atom.soname:
+-            return iter(self._provides_index.get((root, atom), []))
+-
+-        cp_key = root, atom.cp
+-        cache_key = root, atom, atom.unevaluated_atom, installed
++        if atom.__class__ is Atom:
++            # A plain Atom is not an soname atom (Atom.soname is False), and
++            # its cp and unevaluated_atom properties return these attributes.
++            cp_key = root, atom._cp
++            unevaluated_atom = atom._unevaluated_atom
++        else:
++            if atom.soname:
++                return iter(self._provides_index.get((root, atom), []))
++            cp_key = root, atom.cp
++            unevaluated_atom = atom.unevaluated_atom
++        if atom.__class__ is Atom and unevaluated_atom.__class__ is Atom:
++            # Atoms compare equal, and hash, by their string alone
++            # (Atom.__eq__, Atom.__hash__), so a key made of the strings of
++            # two plain Atoms finds the same cache entries as a key made of
++            # the Atoms. It is hashed and compared without a Python level
++            # call per Atom; this lookup is made several hundred thousand
++            # times per run.
++            cache_key = root, atom._string, unevaluated_atom._string, installed
++        else:
++            cache_key = root, atom, unevaluated_atom, installed
+         try:
+             return iter(self._match_cache.get(cp_key, {})[cache_key])
+         except KeyError:
+diff -ruN a/lib/_emerge/_serialize_frontier.py b/lib/_emerge/_serialize_frontier.py
+--- a/lib/_emerge/_serialize_frontier.py
++++ b/lib/_emerge/_serialize_frontier.py
+@@ -13,10 +13,9 @@
+ count for L is zero. Removing a node decrements its parents' counts; adding an
+ edge increments the parent's counts.
+ 
+-Each level owns a min-heap of the order-indices of its current leaves, so leaves
+-can be enumerated in mygraph.order without an O(V) walk. Heaps use lazy deletion:
+-an entry is valid iff the node is still in the graph, still leaf under the level,
+-and the entry's index is the node's current order-index.
++Each level owns the exact set of its current leaves, so leaves can be enumerated
++(sorted by order-index, i.e. in mygraph.order) without an O(V) walk, and a
++version counter that changes whenever that set changes.
+ 
+ order-index is a node's position in mygraph.order; a node introduced later
+ (uninstall reversal / blocker edges) gets an appended index, as in digraph.add().
+@@ -25,7 +24,8 @@
+ digraph.leaf_nodes() path (frontier not built).
+ """
+ 
+-from heapq import heappop, heappush
++from bisect import bisect_left
++from collections import deque
+ 
+ from portage.util.digraph import digraph
+ 
+@@ -52,29 +52,42 @@
+ 
+ 
+ class _SerializeFrontier:
+-    """Per-node, per-level surviving-child counts and per-level ready heaps.
++    """Per-node, per-level surviving-child counts and per-level leaf sets.
+ 
+-    A node is a leaf under level L iff surv[node][L] == 0. Counts and heaps are
+-    maintained incrementally as the graph is mutated (see remove/add_edge).
++    A node is a leaf under level L iff surv[node][L] == 0. Counts and leaf sets
++    are maintained incrementally as the graph is mutated (see remove/add_edge).
++
++    `special` is a predicate; the nodes for which it is true are remembered
++    in special_nodes (see depgraph._serialize_tasks, frontier_mergeable).
+     """
+ 
+-    def __init__(self, graph):
++    def __init__(self, graph, special=None):
+         self._graph = graph
++        self._special = special
++        # Every node, ever seen in the graph, for which special() is true.
++        self.special_nodes = set()
+         self._filters, self._level_of = _build_levels()
+         self._nlevels = nlevels = len(self._filters)
+         # node -> list[int]: surviving-child count per level
+         self._surv = {}
+         # (parent, child) -> survival bitmask over levels
+         self._edge_mask = {}
+-        # node -> current order-index; index -> node
++        # node -> current order-index
+         self._index = {}
+-        self._by_index = {}
+-        # per-level min-heap of order-indices for nodes currently leaf under it
+-        self._ready = [[] for _ in range(nlevels)]
++        # per-level set of the nodes that are currently leaves under it, and
++        # a counter that is incremented whenever that set changes
++        self._leaf = [set() for _ in range(nlevels)]
++        self.leaf_version = [0] * nlevels
++        # Mutation journal, read by _GatherOkTracker and by the no-cycle memo
++        # in _serialize_tasks: every node removed from the graph (in order),
++        # and the number of add() calls. Pure bookkeeping, never read here.
++        self.removed_log = []
++        self.add_count = 0
+ 
+         for i, node in enumerate(graph.order):
+             self._index[node] = i
+-            self._by_index[i] = node
++            if special is not None and special(node):
++                self.special_nodes.add(node)
+         self._next_index = len(graph.order)
+ 
+         for node in graph.order:
+@@ -89,14 +102,12 @@
+                     m ^= lb
+             self._surv[node] = counts
+ 
+-        # Seed each level's ready heap with its initial leaves. Appending in
+-        # order-index order yields a valid min-heap without heapify.
++        # Seed each level's leaf set with its initial leaves.
+         for node in graph.order:
+             counts = self._surv[node]
+-            idx = self._index[node]
+             for L in range(nlevels):
+                 if counts[L] == 0:
+-                    self._ready[L].append(idx)
++                    self._leaf[L].add(node)
+ 
+     def _compute_mask(self, priorities):
+         """Bitmask of the levels whose filter this edge survives.
+@@ -123,36 +134,46 @@
+         counts = self._surv.get(node)
+         return counts is not None and counts[level] == 0
+ 
+-    def ready_nodes(self, level):
+-        """Return the nodes that are leaves under `level`, in mygraph.order.
+-
+-        Drains the level's heap, discarding stale/duplicate entries, and rebuilds
+-        it from the survivors. Entries pop in ascending order-index order, so the
+-        result is in mygraph.order and the rebuilt heap needs no heapify.
+-        """
+-        heap = self._ready[level]
+-        surv = self._surv
+-        index = self._index
+-        by_index = self._by_index
++    def leaves_among(self, nodes, level):
++        """Return the members of `nodes` that are leaves under `level`, in the
++        iteration order of `nodes`. Same test as is_leaf()."""
++        surv_get = self._surv.get
+         result = []
+-        seen_idx = set()
+-        while heap:
+-            idx = heappop(heap)
+-            if idx in seen_idx:
+-                continue
+-            seen_idx.add(idx)
+-            node = by_index.get(idx)
+-            if node is None:
+-                continue
+-            counts = surv.get(node)
+-            # Valid iff still in graph, still leaf here, and this is the node's
+-            # current index.
+-            if counts is None or counts[level] != 0 or index.get(node) != idx:
+-                continue
+-            result.append(node)
+-        self._ready[level] = [index[node] for node in result]
++        for node in nodes:
++            counts = surv_get(node)
++            if counts is not None and counts[level] == 0:
++                result.append(node)
+         return result
+ 
++    def ready_nodes(self, level):
++        """Return the nodes that are leaves under `level`, in mygraph.order
++        (ascending order-index; a node has exactly one current order-index)."""
++        leaves = self._leaf[level]
++        if not leaves:
++            return []
++        return sorted(leaves, key=self._index.__getitem__)
++
++    def leaf_set(self, level):
++        """The set of the nodes that are leaves under `level`: the same nodes
++        as ready_nodes(level), as a set that this object keeps up to date.
++        The caller must not modify it."""
++        return self._leaf[level]
++
++    def order_position(self, node, order):
++        """Return the position of `node` in `order` (the graph's order list) if
++        it can be found by bisection on the order-indices, else None. The
++        order-indices of the nodes in mygraph.order are strictly increasing:
++        nodes keep their relative order when others are removed, and a node
++        introduced later is appended with an index above all earlier ones."""
++        index = self._index
++        idx = index.get(node)
++        if idx is None:
++            return None
++        pos = bisect_left(order, idx, key=index.__getitem__)
++        if pos < len(order) and order[pos] is node:
++            return pos
++        return None
++
+     def remove(self, node):
+         """Account for `node` leaving the graph. Must be called while the graph
+         still contains `node` and its edges, i.e. before the digraph mutation.
+@@ -160,11 +181,12 @@
+         node_data = self._graph.nodes.get(node)
+         if node_data is None:
+             return
++        self.removed_log.append(node)
+         children, parents, _ = node_data
+         edge_mask = self._edge_mask
+         surv = self._surv
+-        index = self._index
+-        ready = self._ready
++        leaf = self._leaf
++        leaf_version = self.leaf_version
+         for parent in parents:
+             mask = edge_mask.pop((parent, node), None)
+             if mask is None:
+@@ -172,20 +194,25 @@
+             pcounts = surv.get(parent)
+             if pcounts is None:
+                 continue
+-            pidx = index.get(parent)
+             m = mask
+             while m:
+                 lb = m & -m
+                 L = lb.bit_length() - 1
+                 pcounts[L] -= 1
+-                if pcounts[L] == 0 and pidx is not None:
+-                    heappush(ready[L], pidx)
++                if pcounts[L] == 0:
++                    leaf[L].add(parent)
++                    leaf_version[L] += 1
+                 m ^= lb
+         for child in children:
+             edge_mask.pop((node, child), None)
+-        surv.pop(node, None)
+-        # Leave index/by_index in place; ready_nodes filters the stale entries.
+-        # Re-adding the node assigns it a fresh index.
++        counts = surv.pop(node, None)
++        if counts is not None:
++            for L in range(self._nlevels):
++                if counts[L] == 0:
++                    leaf[L].discard(node)
++                    leaf_version[L] += 1
++        # Leave the index in place. Re-adding the node assigns it a fresh
++        # index.
+ 
+     def difference_update(self, nodes):
+         for node in nodes:
+@@ -198,11 +225,13 @@
+             idx = self._next_index
+             self._next_index += 1
+             self._index[node] = idx
+-            self._by_index[idx] = node
+             self._surv[node] = [0] * self._nlevels
+             # A reintroduced node starts isolated, so it is a leaf everywhere.
+             for L in range(self._nlevels):
+-                heappush(self._ready[L], idx)
++                self._leaf[L].add(node)
++                self.leaf_version[L] += 1
++            if self._special is not None and self._special(node):
++                self.special_nodes.add(node)
+ 
+     def add_edge(self, node, parent, priority):
+         """Account for digraph.add(node, parent, priority), an edge from graph
+@@ -210,9 +239,10 @@
+         mutation, so the parent's priorities list is already updated.
+ 
+         Adding a priority only makes an edge survive more levels, so the parent's
+-        counts only increase. A parent may leave a level's ready set; that is
+-        handled lazily on pop.
++        counts only increase. The parent leaves the leaf set of each level where
++        its count was zero.
+         """
++        self.add_count += 1
+         self._assign_index(node)
+         if not parent:
+             return
+@@ -230,10 +260,155 @@
+         m = delta
+         while m:
+             lb = m & -m
+-            pcounts[lb.bit_length() - 1] += 1
++            L = lb.bit_length() - 1
++            if pcounts[L] == 0:
++                self._leaf[L].discard(parent)
++                self.leaf_version[L] += 1
++            pcounts[L] += 1
+             m ^= lb
+ 
+ 
++class _GatherOkTracker:
++    """Incrementally maintained set of the nodes for which gather_deps (see
++    depgraph._serialize_tasks) succeeds under one ignore_priority filter.
++
++    It yields exactly the ok_nodes set that
++    depgraph._gather_deps_closures(graph, valid, ignore_priority) computes
++    from scratch: the nodes of `valid` from which every node reachable over
++    child edges surviving `ignore_priority` is in `valid` too. Equivalently,
++    the largest subset of `valid` that is closed under those child edges.
++
++    Why it can be maintained instead of recomputed: as long as the graph only
++    loses nodes (hence edges) and `valid` only loses nodes that left the
++    graph, an ok node stays ok until it is removed, and a not-ok ("bad") node
++    stays bad as long as one particular proof of its badness survives. The
++    proof kept for each bad member of `valid` is a witness: one surviving child
++    that is itself bad. Witness chains end at a node outside `valid` (a "root",
++    bad by definition) and never loop, because a witness is only ever assigned
++    when it already has a complete chain. So only nodes whose chain was cut
++    (by a removal, or because its root became valid) have to be re-examined.
++
++    Whenever the monotonicity premise does not hold (an edge or node was added,
++    or a node left `valid` while staying in the graph) everything is rebuilt
++    from scratch, which is the same procedure applied to all of `valid`.
++    """
++
++    def __init__(self, graph, frontier, ignore_priority):
++        self._graph = graph
++        self._frontier = frontier
++        self._ignore_priority = ignore_priority
++        self._ok = set()
++        # bad member of valid -> its witness (a bad child)
++        self._wit = {}
++        # bad node -> set of the nodes that use it as their witness
++        self._deps = {}
++        self._prev_valid = None
++        self._log_pos = 0
++        self._add_count = 0
++
++    def sync(self, valid):
++        """Bring the state up to date with the graph and with `valid` (a set
++        the caller will not mutate) and return the set of ok nodes. The
++        returned set is owned by the tracker; do not mutate it."""
++        graph = self._graph
++        graph_nodes = graph.nodes
++        frontier = self._frontier
++        removed_log = frontier.removed_log
++        ok = self._ok
++        wit = self._wit
++        deps = self._deps
++        prev_valid = self._prev_valid
++
++        rebuild = prev_valid is None or frontier.add_count != self._add_count
++        if not rebuild:
++            for node in prev_valid - valid:
++                if node in graph_nodes:
++                    # Left valid without leaving the graph: not monotone.
++                    rebuild = True
++                    break
++
++        if rebuild:
++            ok.clear()
++            wit.clear()
++            deps.clear()
++            unsettled = set(valid)
++        else:
++            # Collect the nodes whose proof of badness is gone: those whose
++            # witness was removed, and former roots that became valid.
++            pending = []
++            for i in range(self._log_pos, len(removed_log)):
++                node = removed_log[i]
++                ok.discard(node)
++                witness = wit.pop(node, None)
++                if witness is not None:
++                    users = deps.get(witness)
++                    if users is not None:
++                        users.discard(node)
++                users = deps.pop(node, None)
++                if users:
++                    pending.extend(users)
++            pending.extend(valid - prev_valid)
++            # ... together with everything whose witness chain passes through
++            # one of them.
++            unsettled = set()
++            while pending:
++                node = pending.pop()
++                if node in unsettled or node not in graph_nodes:
++                    continue
++                unsettled.add(node)
++                witness = wit.pop(node, None)
++                if witness is not None:
++                    users = deps.get(witness)
++                    if users is not None:
++                        users.discard(node)
++                users = deps.pop(node, None)
++                if users:
++                    pending.extend(users)
++
++        self._prev_valid = valid
++        self._log_pos = len(removed_log)
++        self._add_count = frontier.add_count
++
++        if unsettled:
++            # Every graph node is now exactly one of: ok, settled bad (outside
++            # valid, or holding a witness), or unsettled. An unsettled node is
++            # bad iff it has a surviving child that is settled bad, or one that
++            # is unsettled and turns out bad.
++            ignore_priority = self._ignore_priority
++            queue = deque()
++            for node in unsettled:
++                for child in graph.child_nodes_iter(
++                    node, ignore_priority=ignore_priority
++                ):
++                    if child not in unsettled and child not in ok:
++                        wit[node] = child
++                        users = deps.get(child)
++                        if users is None:
++                            deps[child] = users = set()
++                        users.add(node)
++                        queue.append(node)
++                        break
++            unsettled.difference_update(queue)
++            while queue:
++                node = queue.popleft()
++                for parent in graph.parent_nodes(
++                    node, ignore_priority=ignore_priority
++                ):
++                    if parent in unsettled:
++                        unsettled.discard(parent)
++                        wit[parent] = node
++                        users = deps.get(node)
++                        if users is None:
++                            deps[node] = users = set()
++                        users.add(parent)
++                        queue.append(parent)
++            # What is left is closed under surviving child edges and inside
++            # valid, hence ok.
++            ok.update(unsettled)
++
++        return ok
++
++
+ class _FrontierDigraph(digraph):
+     """digraph that keeps an attached _SerializeFrontier in sync on every
+     mutation."""
+@@ -246,12 +421,62 @@
+         super().remove(node)
+ 
+     def difference_update(self, t):
+-        if self.frontier is not None:
++        frontier = self.frontier
++        if frontier is not None:
+             if isinstance(t, (list, tuple)) or not hasattr(t, "__contains__"):
+                 t = frozenset(t)
+-            self.frontier.difference_update(t)
++            if len(t) == 1:
++                # One node, the usual case in _serialize_tasks: do what
++                # digraph.difference_update() does for it without walking
++                # self.order and testing every graph node for membership.
++                # The position of the node in self.order is found by
++                # bisection and verified (order_position); if it cannot be
++                # found that way, the generic code below runs.
++                for node in t:
++                    break
++                node_data = self.nodes.get(node)
++                if node_data is not None:
++                    # The graph's own instance, which is what self.order
++                    # holds.
++                    node = node_data[2]
++                    pos = frontier.order_position(node, self.order)
++                    if pos is not None:
++                        frontier.remove(node)
++                        nodes = self.nodes
++                        for parent in node_data[1]:
++                            del nodes[parent][0][node]
++                        for child in node_data[0]:
++                            del nodes[child][1][node]
++                        del nodes[node]
++                        # A new list, like digraph.difference_update().
++                        order = self.order[:]
++                        del order[pos]
++                        self.order = order
++                        return
++            frontier.difference_update(t)
+         super().difference_update(t)
+ 
++    def induced_subgraph(self, nodes):
++        if self.frontier is not None and len(nodes) == 1:
++            # One node: the subgraph that digraph.induced_subgraph() builds
++            # has this node (the graph's own instance) and, if the node has
++            # an edge to itself, that edge with a copy of its priorities.
++            for node in nodes:
++                break
++            node_data = self.nodes.get(node)
++            if node_data is not None:
++                node = node_data[2]
++                sub = digraph()
++                sub_data = sub.nodes[node] = ({}, {}, node)
++                priorities = node_data[0].get(node)
++                if priorities is not None:
++                    priorities = priorities[:]
++                    sub_data[0][node] = priorities
++                    sub_data[1][node] = priorities
++                sub.order = [node]
++                return sub
++        return super().induced_subgraph(nodes)
++
+     def add(self, node, parent, priority=0):
+         super().add(node, parent, priority=priority)
+         if self.frontier is not None:
+diff -ruN a/lib/portage/dbapi/dep_expand.py b/lib/portage/dbapi/dep_expand.py
+--- a/lib/portage/dbapi/dep_expand.py
++++ b/lib/portage/dbapi/dep_expand.py
+@@ -47,7 +47,9 @@
+ 
+     if has_cat:
+         # Optimize most common cases to avoid calling cpv_expand.
+-        if mydep.category != "virtual":
++        # mydep.category != "virtual", without splitting the cp for it.
++        cp = mydep.cp
++        if not (cp.startswith("virtual/") or cp == "virtual"):
+             return mydep
+         if not hasattr(mydb, "cp_list") or mydb.cp_list(mydep.cp):
+             return mydep
+diff -ruN a/lib/portage/dep/dep_check.py b/lib/portage/dep/dep_check.py
+--- a/lib/portage/dep/dep_check.py
++++ b/lib/portage/dep/dep_check.py
+@@ -335,6 +335,46 @@
+         "want_update",
+     )
+ 
++    def __init__(
++        self,
++        *,
++        all_available=None,
++        all_in_graph=None,
++        all_installed_slots=None,
++        atoms=None,
++        cp_map=None,
++        new_slot_count=None,
++        slot_map=None,
++        want_update=None,
++        **kwargs,
++    ):
++        if kwargs or type(self) is not _dep_choice:
++            # A subclass or an unknown keyword: the generic constructor.
++            SlotObject.__init__(
++                self,
++                all_available=all_available,
++                all_in_graph=all_in_graph,
++                all_installed_slots=all_installed_slots,
++                atoms=atoms,
++                cp_map=cp_map,
++                new_slot_count=new_slot_count,
++                slot_map=slot_map,
++                want_update=want_update,
++                **kwargs,
++            )
++            return
++        # What SlotObject.__init__ does for exactly this class: each slot is
++        # set to its keyword value, or to None without one. dep_zapdeps
++        # creates one of these for every choice of every dependency.
++        self.all_available = all_available
++        self.all_in_graph = all_in_graph
++        self.all_installed_slots = all_installed_slots
++        self.atoms = atoms
++        self.cp_map = cp_map
++        self.new_slot_count = new_slot_count
++        self.slot_map = slot_map
++        self.want_update = want_update
++
+ 
+ def dep_zapdeps(
+     unreduced, reduced, myroot, use_binaries=0, trees=None, minimize_slots=False
+@@ -345,7 +385,10 @@
+     """
+     if trees is None:
+         trees = portage.db
+-    writemsg(f"ZapDeps -- {use_binaries}\n", 2)
++    # writemsg() drops a message whose noiselevel is above noiselimit; make
++    # that test before formatting it (this runs for every dependency).
++    if portage.util.noiselimit >= 2:
++        writemsg(f"ZapDeps -- {use_binaries}\n", 2)
+     if not reduced or unreduced == ["||"] or dep_eval(reduced):
+         return []
+ 
+@@ -921,9 +964,14 @@
+     if mysplit2 is None:
+         return [0, _("Invalid token")]
+ 
+-    writemsg("\n\n\n", 1)
+-    writemsg(f"mysplit:  {mysplit}\n", 1)
+-    writemsg(f"mysplit2: {mysplit2}\n", 1)
++    # writemsg() drops a message whose noiselevel is above noiselimit, but
++    # only after the f-strings below have formatted both dependency lists
++    # (the repr of every atom in them). The same test is made here first;
++    # formatting the lists has no side effects.
++    if portage.util.noiselimit >= 1:
++        writemsg("\n\n\n", 1)
++        writemsg(f"mysplit:  {mysplit}\n", 1)
++        writemsg(f"mysplit2: {mysplit2}\n", 1)
+ 
+     selected_atoms = dep_zapdeps(
+         mysplit,
+diff -ruN a/lib/portage/dep/__init__.py b/lib/portage/dep/__init__.py
+--- a/lib/portage/dep/__init__.py
++++ b/lib/portage/dep/__init__.py
+@@ -100,10 +100,39 @@
+     )
+ 
+ 
++# (token string, eapi) -> the interned Atom that _c_atom_from_c() built for
++# that token with its USE conditionals left unevaluated.
++_c_atom_memo = {}
++
++
+ def _c_atom_from_c(catom, eapi, eapi_attrs, uselist, matchall):
+-    """Construct a portage.dep.Atom from a _parser.Atom, bypassing __init__ regex."""
++    """Construct a portage.dep.Atom from a _parser.Atom, bypassing __init__ regex.
++
++    The same atom tokens come by again and again (about nine of ten calls
++    in a resolver run), so the unevaluated result is remembered per (token
++    string, eapi). Every field that is set below is a function of these
++    two: the C parser derives all attributes of catom from the token text
++    alone (build_atom_obj in src/dep_parser.c), and eapi_attrs is
++    _get_eapi_attrs(eapi). Hence a later call would build an instance with
++    the same _atom_intern_key, and _intern_atom() would hand back the
++    remembered instance, which is still in the weak intern cache because
++    the memo keeps it alive. Evaluating the USE conditionals of the
++    remembered instance instead of an equal fresh one gives an equal Atom
++    (same string, same _use, an unevaluated_atom with the same string and
++    eapi, which is all that _atom_ctor_key and _atom_intern_key look at).
++    Tokens for which the construction raises are never remembered.
++    """
++    key = (str(catom), eapi)
++    a = _c_atom_memo.get(key)
++    if a is not None:
++        if matchall:
++            return a
++        use = a._use
++        if use is None or not use.conditional:
++            return a
++        return _intern_atom(a.evaluate_conditionals(uselist))
+     a = Atom.__new__(Atom)
+-    a._string = str(catom)
++    a._string = key[0]
+     _c_fill_atom_fields(a, catom, eapi)
+     a._unevaluated_atom = a
+     use_tokens = catom.use
+@@ -123,11 +152,12 @@
+                 required=req,
+             )
+         )
+-        if not matchall and a._use.conditional:
+-            a = a.evaluate_conditionals(uselist)
+     else:
+         a._use = None
+-    return _intern_atom(a)
++    a = _c_atom_memo[key] = _intern_atom(a)
++    if not matchall and a._use is not None and a._use.conditional:
++        a = _intern_atom(a.evaluate_conditionals(uselist))
++    return a
+ 
+ 
+ def _c_convert_result(items, eapi, eapi_attrs, uselist, matchall):
+@@ -606,8 +636,218 @@
+     return " ".join(mystrparts)
+ 
+ 
++def _copy_dep_lists(dep_struct):
++    """
++    Return a copy of a use_reduce result in which every (nested) list is a
++    new list, holding the very same tokens.
++    """
++    return [
++        _copy_dep_lists(x) if x.__class__ is list else x for x in dep_struct
++    ]
++
++
++# Results of _use_reduce_parse by argument tuple. The values are private
++# copies that are never handed out, so that nobody can modify them.
++_use_reduce_parsed = {}
++
++
+ @lru_cache(1024)
+-def _use_reduce_cached(
++def _use_reduce_cached(*args):
++    """
++    The LRU cache in front of this function is unchanged, so that the calls
++    for which use_reduce returns a result that shares its nested lists with
++    an earlier result are the same ones as before. The only difference is on
++    an LRU miss for arguments that were parsed before (which happens all the
++    time, since the resolver walks many more than 1024 dep strings on every
++    backtracking run): instead of parsing the string again, the lists of the
++    earlier result are copied. _use_reduce_parse is a pure function of its
++    arguments (the LRU cache already relies on that), and the tokens are
++    immutable and already shared between results (the cache hits, the Atom
++    intern cache), so the copy equals what parsing would return. Exceptions
++    are not recorded, they are raised by parsing again like before.
++    """
++    try:
++        parsed = _use_reduce_parsed[args]
++    except KeyError:
++        result = _use_reduce_c_validated(*args)
++        if result is None:
++            result = _use_reduce_parse(*args)
++        _use_reduce_parsed[args] = _copy_dep_lists(result)
++        return result
++    return _copy_dep_lists(parsed)
++
++
++# (depstr, eapi, is_valid_flag) -> whether _use_reduce_c_matchall() accepted it.
++_use_reduce_c_valid = {}
++
++
++def _c_opconvert(seq):
++    """
++    Convert the non-flat form of a use_reduce() result (an any-of group is
++    the string "||" followed by the list of its alternatives) to the
++    opconvert form (the group is one list that starts with "||").
++    """
++    out = []
++    i = 0
++    n = len(seq)
++    while i < n:
++        item = seq[i]
++        if item.__class__ is str:
++            i += 1
++            group = [item]
++            for alt in seq[i]:
++                group.append(_c_opconvert(alt) if alt.__class__ is list else alt)
++            out.append(group)
++        elif item.__class__ is list:
++            out.append(_c_opconvert(item))
++        else:
++            out.append(item)
++        i += 1
++    return out
++
++
++def _use_reduce_c_validated(
++    depstr,
++    uselist,
++    masklist,
++    matchall,
++    excludeall,
++    is_src_uri,
++    eapi,
++    opconvert,
++    flat,
++    is_valid_flag,
++    token_class,
++    matchnone,
++    subset,
++):
++    """
++    use_reduce() leaves every call that has an is_valid_flag callable to the
++    Python parser, since the C parser knows nothing about IUSE. This covers
++    the calls of that kind which the resolver makes for the dependency
++    strings of every ebuild, with Atom tokens and an EAPI that the C
++    grammar covers: the one of Package._validate_deps() (all conditionals
++    active, flat), and the ones that evaluate the conditionals with the USE
++    of the package (flat, nested, or nested with opconvert).
++
++    The Python parser consults is_valid_flag in two places only: for the
++    flag of every "flag?" conditional (when the group is closed, whether or
++    not it is active), and (Atom._validate_conditional_flags) for the flags
++    of the USE conditionals inside every atom (every token is made an Atom,
++    whether or not its group is active). Everything else that can make it
++    raise depends on the string and the EAPI alone. So if the C parser
++    accepts the string and all of these flags are valid
++    (_use_reduce_c_matchall), the Python parser accepts it in every one of
++    these modes, and the result is what the C parser gives for the same
++    mode, like in the calls without is_valid_flag that use_reduce() hands to
++    the C parser itself; the opconvert form is derived from the nested one
++    (_c_opconvert). The tokens are the same interned Atom instances. In
++    every other case None is returned and the Python parser runs like
++    before, so it alone decides about errors and their messages. This runs
++    behind the LRU cache of _use_reduce_cached, hence the cache sees the
++    same keys in the same order as before.
++    """
++    if (
++        _c_dep_parser is None
++        or token_class is not Atom
++        or is_valid_flag is None
++        or is_src_uri
++        or subset is not None
++        or matchnone
++        or masklist
++        or excludeall
++        or eapi is None
++        or not _get_eapi_attrs(eapi).slot_operator
++    ):
++        return None
++    if matchall:
++        if opconvert or not flat:
++            return None
++        result = _use_reduce_c_matchall(depstr, eapi, is_valid_flag)
++        _use_reduce_c_valid[(depstr, eapi, is_valid_flag)] = result is not None
++        return result
++    if flat and opconvert:
++        return None
++    valid_key = (depstr, eapi, is_valid_flag)
++    valid = _use_reduce_c_valid.get(valid_key)
++    if valid is None:
++        valid = _use_reduce_c_valid[valid_key] = (
++            _use_reduce_c_matchall(depstr, eapi, is_valid_flag) is not None
++        )
++    if not valid:
++        return None
++    try:
++        result = _c_fast_use_reduce(depstr, uselist, False, eapi, flat)
++    except Exception:
++        return None
++    if opconvert:
++        result = _c_opconvert(result)
++    return result
++
++
++# (depstr, eapi) -> None if _use_reduce_c_matchall() cannot serve the string
++# whatever the IUSE, else (tokens, flags): the tuple of all tokens and the
++# tuple of the distinct flags that is_valid_flag has to accept.
++_use_reduce_c_matchall_memo = {}
++
++
++def _use_reduce_c_matchall(depstr, eapi, is_valid_flag):
++    """
++    The flat list of all tokens of depstr (all conditionals active) from the
++    C parser, if it accepts the string and is_valid_flag accepts the flag of
++    every "flag?" conditional and of every USE conditional inside an atom.
++    None otherwise.
++
++    The parse does not depend on is_valid_flag, so the tokens and the flags
++    to check are remembered per (depstr, eapi): different versions of a
++    package mostly share their dependency strings. is_valid_flag is the
++    side-effect-free IUSE test of a package, so asking it once per distinct
++    flag, in any order, gives the same verdict as asking for every
++    occurrence. The tokens are immutable interned Atoms (or "||"); each
++    call returns a new list of them.
++    """
++    key = (depstr, eapi)
++    try:
++        memo = _use_reduce_c_matchall_memo[key]
++    except KeyError:
++        memo = _use_reduce_c_matchall_memo[key] = _use_reduce_c_matchall_parse(
++            depstr, eapi
++        )
++    if memo is None:
++        return None
++    for flag in memo[1]:
++        if not is_valid_flag(flag):
++            return None
++    return list(memo[0])
++
++
++def _use_reduce_c_matchall_parse(depstr, eapi):
++    try:
++        result = _c_fast_use_reduce(depstr, frozenset(), True, eapi, True)
++    except Exception:
++        return None
++    flags = {}
++    for token in depstr.split():
++        if token[-1] == "?":
++            if token[:1] == "!":
++                flags[token[1:-1]] = None
++            else:
++                flags[token[:-1]] = None
++    for token in result:
++        if token.__class__ is Atom:
++            use = token._use
++            if use is not None and use.conditional:
++                for cond_flags in use.conditional.values():
++                    for flag in cond_flags:
++                        flags[flag] = None
++        elif token != "||":
++            # Not a token that the comparison with the Python parser
++            # was made for.
++            return None
++    return (tuple(result), tuple(flags))
++
++
++def _use_reduce_parse(
+     depstr: str,
+     uselist,
+     masklist,
+@@ -1654,6 +1894,7 @@
+         "_eapi",
+         "_extended_syntax",
+         "_intern_key",
++        "_match_kind",
+         "_operator",
+         "_orig_atom",
+         "_repo",
+@@ -2407,6 +2648,32 @@
+         return bool(match_from_list(self, (pkg,)))
+ 
+ 
++# The properties of Atom that only return the value of one slot are replaced
++# by the descriptor of that slot, which the interpreter reads without calling
++# a Python function (these attributes are read millions of times per
++# resolver run). Reading gives the same value, and raises AttributeError in
++# the same case (slot not set). The property definitions in the class body
++# remain as the documentation of the attributes.
++for _atom_property, _atom_slot in (
++    ("cp", "_cp"),
++    ("cpv", "_cpv"),
++    ("version", "_version"),
++    ("repo", "_repo"),
++    ("slot", "_slot"),
++    ("sub_slot", "_sub_slot"),
++    ("slot_operator", "_slot_operator"),
++    ("operator", "_operator"),
++    ("blocker", "_blocker_obj"),
++    ("eapi", "_eapi"),
++    ("extended_syntax", "_extended_syntax"),
++    ("build_id", "_build_id"),
++    ("use", "_use"),
++    ("unevaluated_atom", "_unevaluated_atom"),
++    ("orig_atom", "_orig_atom"),
++):
++    setattr(Atom, _atom_property, Atom.__dict__[_atom_slot])
++del _atom_property, _atom_slot
++
+ _extended_cp_re_cache = {}
+ 
+ 
+@@ -2509,6 +2776,20 @@
+ 
+         return ret
+ 
++    def get(self, cp, default=None):
++        # Upstream commit 98f5b2293 (after 3.0.83), unchanged. The inherited
++        # Mapping.get() returns default when __getitem__ raises KeyError.
++        # Without extended keys, __getitem__ raises KeyError for a str that
++        # is not a normal key: for one with "*" from the empty _extended,
++        # for any other because neither _normal nor _extended matches. Most
++        # lookups are such misses; answer them without raising and catching.
++        if not self._extended and isinstance(cp, str) and cp not in self._normal:
++            return default
++        try:
++            return self[cp]
++        except KeyError:
++            return default
++
+     def __setitem__(self, cp, val):
+         if "*" in cp:
+             self._extended[cp] = val
+@@ -2945,6 +3226,93 @@
+     return bestm
+ 
+ 
++_match_kinds = {">": 2, ">=": 3, "<": 4, "<=": 5}
++
++
++def _match_kind_init(mydep):
++    """
++    Classify an Atom for _match_single() and remember the class in the
++    atom: 1 if match_from_list() takes its "operator is None" branch for
++    it, 2 to 5 for the operators > >= < <=, and 0 if _match_single() is
++    not to be used (blockers, wildcard atoms, atoms with a repository, the
++    operators = =* ~, and the atoms for which match_from_list() raises or
++    prints a message). These are the statements of match_from_list() up to
++    its branch on the operator; they depend on nothing but the atom, which
++    is immutable.
++    """
++    kind = 0
++    if not mydep.blocker and not mydep.extended_syntax and not mydep.repo:
++        mycpv = mydep.cpv
++        mycpv_cps = catpkgsplit(mycpv)
++        if not mycpv_cps:
++            kind = 1
++        elif mydep != mycpv:
++            if mycpv_cps[2] and mycpv_cps[3]:
++                kind = _match_kinds.get(mydep.operator, 0)
++            else:
++                kind = 1
++    mydep._match_kind = kind
++    return kind
++
++
++def _match_single(mydep, x, kind):
++    """
++    Whether match_from_list(mydep, [x]) returns [x] (True) or [] (False),
++    for an Atom of a kind that _match_kind_init() accepts and a candidate
++    that has a cp attribute (a _pkg_str, a Package, an Atom); None if that
++    has to be found out by match_from_list() itself. The resolver matches
++    one atom against one package several hundred thousand times per run.
++
++    This performs, for the one candidate, the tests of match_from_list() in
++    their order: the cp ("operator is None" branch) or the cp and the
++    version comparison (> >= < <=), then the slot, then USE, and nothing
++    else, since the atom has no repository. Only attributes are read that
++    match_from_list() reads at the same point for a candidate that got as
++    far (in particular the "use" attribute, which a Package computes
++    lazily). The USE dependencies themselves are left to
++    match_from_list(), as is everything unusual.
++    """
++    try:
++        cp = x.cp
++    except AttributeError:
++        return None
++    if cp != mydep._cp:
++        return False
++    if kind != 1:
++        try:
++            result = vercmp(x.version, mydep._version)
++        except ValueError:
++            return None
++        if result is None:
++            return False
++        if kind == 2:
++            if not result > 0:
++                return False
++        elif kind == 3:
++            if not result >= 0:
++                return False
++        elif kind == 4:
++            if not result < 0:
++                return False
++        elif not result <= 0:
++            return False
++    if mydep._slot is not None:
++        try:
++            x.cpv
++        except AttributeError:
++            return None
++        try:
++            x.slot
++        except AttributeError:
++            pass
++        else:
++            if not _match_slot(mydep, x):
++                return False
++    if mydep._unevaluated_atom._use and hasattr(x, "use"):
++        return None
++    return True
++
++
+ def match_from_list(mydep: Union[str, Atom], candidate_list):
+     """
+     Searches list for entries that matches the package.
+@@ -2959,6 +3327,25 @@
+     if not candidate_list:
+         return []
+ 
++    # match-single begin
++    if (
++        mydep.__class__ is Atom
++        and candidate_list.__class__ is list
++        and len(candidate_list) == 1
++    ):
++        # See _match_single().
++        try:
++            kind = mydep._match_kind
++        except AttributeError:
++            kind = _match_kind_init(mydep)
++        if kind:
++            verdict = _match_single(mydep, candidate_list[0], kind)
++            if verdict is not None:
++                if verdict:
++                    return [candidate_list[0]]
++                return []
++    # match-single end
++
+     if isinstance(mydep, Atom):
+         if mydep.blocker:
+             mydep = Atom(str(mydep).lstrip("!"), allow_wildcard=True, allow_repo=True)
+diff -ruN a/lib/portage/package/ebuild/_config/LicenseManager.py b/lib/portage/package/ebuild/_config/LicenseManager.py
+--- a/lib/portage/package/ebuild/_config/LicenseManager.py
++++ b/lib/portage/package/ebuild/_config/LicenseManager.py
+@@ -13,6 +13,46 @@
+ from portage.versions import _pkg_str, cpv_getkey
+ 
+ 
++# tuple of ACCEPT_LICENSE tokens -> frozenset of the accepted licenses
++_stack_accept_license_memo = {}
++_STACK_ACCEPT_LICENSE_MEMO_MAX = 1024
++
++
++def _stack_accept_license(accept_license, licenses):
++    """
++    The loop of getMissingLicenses() that stacks the ACCEPT_LICENSE tokens
++    of a package into the set of accepted licenses. The set depends on the
++    token sequence and, only through a "*" token, on the licenses of the
++    package. Without such a token it is therefore taken from a memo keyed by
++    the tokens: the expanded ACCEPT_LICENSE has hundreds of tokens and is the
++    same for all packages without a package.license entry. The caller only
++    tests membership, so sharing one frozenset is fine.
++    """
++    key = tuple(accept_license)
++    acceptable_licenses = _stack_accept_license_memo.get(key)
++    if acceptable_licenses is not None:
++        return acceptable_licenses
++    acceptable_licenses = set()
++    uses_licenses = False
++    for x in accept_license:
++        if x == "*":
++            uses_licenses = True
++            acceptable_licenses.update(licenses)
++        elif x == "-*":
++            acceptable_licenses.clear()
++        elif x[:1] == "-":
++            acceptable_licenses.discard(x[1:])
++        else:
++            acceptable_licenses.add(x)
++    if (
++        not uses_licenses
++        and len(_stack_accept_license_memo) < _STACK_ACCEPT_LICENSE_MEMO_MAX
++    ):
++        acceptable_licenses = frozenset(acceptable_licenses)
++        _stack_accept_license_memo[key] = acceptable_licenses
++    return acceptable_licenses
++
++
+ class LicenseManager:
+     def __init__(self, locations_manager, user_config=True):
+         self._accept_license_str = None
+@@ -188,16 +228,9 @@
+         licenses = set(use_reduce(lic, matchall=1, flat=True))
+         licenses.discard("||")
+ 
+-        acceptable_licenses = set()
+-        for x in self._getPkgAcceptLicense(cpv, slot, repo):
+-            if x == "*":
+-                acceptable_licenses.update(licenses)
+-            elif x == "-*":
+-                acceptable_licenses.clear()
+-            elif x[:1] == "-":
+-                acceptable_licenses.discard(x[1:])
+-            else:
+-                acceptable_licenses.add(x)
++        acceptable_licenses = _stack_accept_license(
++            self._getPkgAcceptLicense(cpv, slot, repo), licenses
++        )
+ 
+         license_str = lic
+         if "?" in license_str:
+diff -ruN a/lib/portage/package/ebuild/_config/UseManager.py b/lib/portage/package/ebuild/_config/UseManager.py
+--- a/lib/portage/package/ebuild/_config/UseManager.py
++++ b/lib/portage/package/ebuild/_config/UseManager.py
+@@ -31,6 +31,34 @@
+ from portage.versions import _pkg_str
+ 
+ 
++# tuple of the stacked token tuples -> frozenset of the stacked result
++_stack_use_lists_memo = {}
++_STACK_USE_LISTS_MEMO_MAX = 4096
++
++
++def _stack_use_lists(lists):
++    """
++    Return frozenset(stack_lists(lists, incremental=True)) for the lists of
++    USE flag strings that getUseMask() and getUseForce() collect. With these
++    arguments stack_lists is a pure function of the token sequences (it
++    prints nothing and reads nothing else), the tokens are plain strings and
++    the result is immutable, so the result for an equal argument is reused.
++    Nearly all packages collect the same lists (those of the profiles).
++    """
++    try:
++        key = tuple([x if x.__class__ is tuple else tuple(x) for x in lists])
++        return _stack_use_lists_memo[key]
++    except KeyError:
++        pass
++    except TypeError:
++        # Unhashable token: not memoized.
++        return frozenset(stack_lists(lists, incremental=True))
++    result = frozenset(stack_lists(lists, incremental=True))
++    if len(_stack_use_lists_memo) < _STACK_USE_LISTS_MEMO_MAX:
++        _stack_use_lists_memo[key] = result
++    return result
++
++
+ class UseManager:
+     def __init__(
+         self, repositories, profiles, abs_user_config, is_stable, user_config=True
+@@ -500,7 +528,7 @@
+                     if pkg_usemask:
+                         usemask.extend(pkg_usemask)
+ 
+-        return frozenset(stack_lists(usemask, incremental=True))
++        return _stack_use_lists(usemask)
+ 
+     def getUseForce(self, pkg=None, stable=None):
+         if pkg is None:
+@@ -558,7 +586,7 @@
+                     if pkg_useforce:
+                         useforce.extend(pkg_useforce)
+ 
+-        return frozenset(stack_lists(useforce, incremental=True))
++        return _stack_use_lists(useforce)
+ 
+     def getPUSE(self, pkg):
+         cp = getattr(pkg, "cp", None)
+diff -ruN a/lib/portage/package/ebuild/config.py b/lib/portage/package/ebuild/config.py
+--- a/lib/portage/package/ebuild/config.py
++++ b/lib/portage/package/ebuild/config.py
+@@ -145,6 +145,273 @@
+             return m
+ 
+ 
++# (variable name, values, override tokens) -> the stacked flags, sorted and joined
++# Set when regenerate() prints one of its warnings about a "+" or "-" operator
++# in a value. These are printed again for every package whose settings are
++# computed, so depgraph (_probe_bounds_allowed) looks at this before it
++# passes over packages that nobody needs, in order to print as many of them
++# as it would otherwise.
++_regenerate_warned = False
++
++_regenerate_stack_incremental_memo = {}
++_REGENERATE_STACK_INCREMENTAL_MEMO_MAX = 4096
++
++
++def _regenerate_stack_incremental(mykey, incremental_list, override_tokens):
++    """
++    The loop of config.regenerate() that stacks the values of one incremental
++    variable, moved here unchanged. incremental_list holds the value of the
++    variable in each db that sets it, as an unsplit string, in stacking
++    order; override_tokens are stacked last (the FEATURES overrides).
++
++    Returns (set of flags, memoizable). The result depends on nothing but
++    the arguments; memoizable is False when a warning was printed, which a
++    memo hit would not print again.
++    """
++    global _regenerate_warned
++    myflags = set()
++    memoizable = True
++    for mysplit in chain((v.split() for v in incremental_list), (override_tokens,)):
++        for x in mysplit:
++            if x == "-*":
++                # "-*" is a special "minus" var that means "unset all settings".
++                # so USE="-* gnome" will have *just* gnome enabled.
++                myflags.clear()
++                continue
++
++            if x[0] == "+":
++                # Not legal. People assume too much. Complain.
++                memoizable = False
++                _regenerate_warned = True
++                writemsg(
++                    colorize(
++                        "BAD",
++                        _("%s values should not start with a '+': %s") % (mykey, x),
++                    )
++                    + "\n",
++                    noiselevel=-1,
++                )
++                x = x[1:]
++                if not x:
++                    continue
++
++            if x[0] == "-":
++                myflags.discard(x[1:])
++                continue
++
++            # We got here, so add it now.
++            myflags.add(x)
++
++    return myflags, memoizable
++
++
++# For config._pkg_use_fast(): variables other than USE that setcpv() and
++# regenerate() look up for the USE calculation, in addition to the
++# incrementals and to the USE_EXPAND and USE_EXPAND_UNPREFIXED variables ...
++_PKG_USE_FAST_LOOKUPS = frozenset(
++    [
++        "ACCEPT_KEYWORDS",
++        "ACCEPT_LICENSE",
++        "ACCEPT_PROPERTIES",
++        "ACCEPT_RESTRICT",
++        "ARCH",
++        "FEATURES",
++        "USE_EXPAND",
++        "USE_EXPAND_HIDDEN",
++        "USE_EXPAND_UNPREFIXED",
++        "USE_ORDER",
++    ]
++)
++# ... and the keys that setcpv() puts into the "pkg" dict in addition to
++# config._setcpv_aux_keys (without package.env).
++_PKG_USE_FAST_PKG_KEYS = frozenset(
++    [
++        "CATEGORY",
++        "IUSE_EFFECTIVE",
++        "PF",
++        "PKGUSE",
++        "PORTAGE_BUILT_USE",
++        "PORTAGE_REPO_NAME",
++    ]
++)
++# USE string -> True if no token makes _regenerate_use_stack() print a
++# warning or look at IUSE.
++_pkg_use_fast_clean_memo = {}
++# (use_stack_inputs, useforce, usemask, ARCH, IUSE_EFFECTIVE) ->
++# (USE & IUSE_EFFECTIVE, USE, True if USE has a "_*" wildcard), where USE is
++# the set of flags that regenerate() computes from these values.
++_pkg_use_fast_base_memo = {}
++_PKG_USE_FAST_MEMO_MAX = 4096
++# Test hook: None, or a function (config, pkg, result of _pkg_use_fast) that
++# compares the result with a real setcpv() call.
++_PKG_USE_FAST_SELFTEST = None
++
++# use_stack_inputs (see _regenerate_use_stack) -> frozenset of the flags.
++_regenerate_use_stack_memo = {}
++# Bounds the memory held by the memo (one set of a few hundred flags each).
++_REGENERATE_USE_STACK_MEMO_MAX = 4096
++
++
++def _regenerate_use_stack(use_stack_inputs, iuse):
++    """
++    The USE stacking loop of config.regenerate(), moved here unchanged except
++    that it works on the values that regenerate() has read from the dbs of
++    uvlist (in the same order, with the same lookups) instead of reading them
++    itself. use_stack_inputs has one item per db:
++
++        (values of the USE_EXPAND_UNPREFIXED variables (None if unset),
++         USE string,
++         names of the USE_EXPAND variables set in the db,
++         for each of these (value, "is not incremental"), or None if the
++         loop does not look at them: the defaults db, or nothing to do)
++
++    Returns (set of flags, memoizable). The result depends on nothing but the
++    arguments, and on iuse only where a flag to enable ends with "_*". So
++    when no such flag was seen and no warning was printed (a memo hit would
++    not print it again), memoizable is
++    True and regenerate() may answer a later call with equal use_stack_inputs
++    from _regenerate_use_stack_memo. setcpv() calls regenerate() for every
++    package, and most packages have the same USE inputs as an earlier one.
++    """
++    global _regenerate_warned
++    myflags = set()
++    memoizable = True
++    for unprefixed_values, use_str, cur_use_expand, expand_values in use_stack_inputs:
++        for v in unprefixed_values:
++            if v is None:
++                continue
++            for x in v.split():
++                if x[:1] == "-":
++                    myflags.discard(x[1:])
++                else:
++                    myflags.add(x)
++
++        mysplit = use_str.split()
++        if not mysplit and not cur_use_expand:
++            continue
++        for x in mysplit:
++            if x == "-*":
++                myflags.clear()
++                continue
++
++            if x[0] == "+":
++                memoizable = False
++                _regenerate_warned = True
++                writemsg(
++                    colorize(
++                        "BAD",
++                        _("USE flags should not start " "with a '+': %s\n") % x,
++                    ),
++                    noiselevel=-1,
++                )
++                x = x[1:]
++                if not x:
++                    continue
++
++            if x[0] == "-":
++                if x[-2:] == "_*":
++                    prefix = x[1:-1]
++                    prefix_len = len(prefix)
++                    myflags.difference_update(
++                        [y for y in myflags if y[:prefix_len] == prefix]
++                    )
++                myflags.discard(x[1:])
++                continue
++
++            if x[-2:] == "_*":
++                # The only place where iuse matters.
++                memoizable = False
++            if iuse is not None and x[-2:] == "_*":
++                # Expand wildcards here, so that cases like
++                # USE="linguas_* -linguas_en_US" work correctly.
++                prefix = x[:-1]
++                prefix_len = len(prefix)
++                has_iuse = False
++                for y in iuse:
++                    if y[:prefix_len] == prefix:
++                        has_iuse = True
++                        myflags.add(y)
++                if not has_iuse:
++                    # There are no matching IUSE, so allow the
++                    # wildcard to pass through. This allows
++                    # linguas_* to trigger unset LINGUAS in
++                    # cases when no linguas_ flags are in IUSE.
++                    myflags.add(x)
++            else:
++                myflags.add(x)
++
++        if expand_values is None:
++            # USE_EXPAND flags from make.defaults are handled
++            # earlier, in order to provide useful incremental
++            # behavior (for sub-profiles).
++            continue
++
++        for var, (expand_value, is_not_incremental) in zip(
++            cur_use_expand, expand_values
++        ):
++            var_lower = var.lower()
++            if is_not_incremental:
++                prefix = var_lower + "_"
++                prefix_len = len(prefix)
++                for x in list(myflags):
++                    if x[:prefix_len] == prefix:
++                        myflags.remove(x)
++            for x in expand_value.split():
++                if x[0] == "+":
++                    memoizable = False
++                    _regenerate_warned = True
++                    if is_not_incremental:
++                        writemsg(
++                            colorize(
++                                "BAD",
++                                _(
++                                    "Invalid '+' "
++                                    "operator in non-incremental variable "
++                                    "'%s': '%s'\n"
++                                )
++                                % (var, x),
++                            ),
++                            noiselevel=-1,
++                        )
++                        continue
++                    else:
++                        writemsg(
++                            colorize(
++                                "BAD",
++                                _(
++                                    "Invalid '+' "
++                                    "operator in incremental variable "
++                                    "'%s': '%s'\n"
++                                )
++                                % (var, x),
++                            ),
++                            noiselevel=-1,
++                        )
++                    x = x[1:]
++                if x[0] == "-":
++                    if is_not_incremental:
++                        memoizable = False
++                        _regenerate_warned = True
++                        writemsg(
++                            colorize(
++                                "BAD",
++                                _(
++                                    "Invalid '-' "
++                                    "operator in non-incremental variable "
++                                    "'%s': '%s'\n"
++                                )
++                                % (var, x),
++                            ),
++                            noiselevel=-1,
++                        )
++                        continue
++                    myflags.discard(var_lower + "_" + x[1:])
++                    continue
++                myflags.add(var_lower + "_" + x)
++
++    return myflags, memoizable
++
++
+ class config:
+     """
+     This class encompasses the main portage configuration.  Data is pulled from
+@@ -165,6 +432,14 @@
+         "PORTAGE_LOGDIR_CLEAN": "PORT_LOGDIR_CLEAN",
+     }
+ 
++    # See _pkg_use_fast(). None, or the constants that the last real
++    # setcpv() call left behind for it. Dropped by modifying(), that is by
++    # every method that changes this instance.
++    _pkg_use_template = None
++    # What the last regenerate() call saw: (use_stack_inputs, True if it
++    # printed no warning and its USE stacking did not depend on IUSE).
++    _regenerate_last = None
++
+     _setcpv_aux_keys = (
+         "BDEPEND",
+         "DEFINED_PHASES",
+@@ -1620,6 +1895,9 @@
+     def modifying(self):
+         if self.locked:
+             raise Exception(_("Configuration is locked."))
++        # The instance is about to change: what _pkg_use_fast() knows about
++        # it is void until the next complete setcpv() call.
++        self._pkg_use_template = None
+ 
+     def backup_changes(self, key=None):
+         self.modifying()
+@@ -1811,6 +2089,9 @@
+                 stacklevel=2,
+             )
+ 
++        # modifying() drops the template of _pkg_use_fast(); the early return
++        # below changes nothing, so it puts the template back.
++        pkg_use_template = self._pkg_use_template
+         self.modifying()
+ 
+         pkg = None
+@@ -1828,6 +2109,7 @@
+             args_hash = (mycpv, id(mydb))
+ 
+         if args_hash == self._setcpv_args_hash:
++            self._pkg_use_template = pkg_use_template
+             return
+         self._setcpv_args_hash = args_hash
+ 
+@@ -2113,22 +2395,21 @@
+                     )
+                     restrict = use_reduce(raw_restrict, uselist=built_use, flat=True)
+                 else:
++                    # Both calls used to build this same set: nothing
++                    # changes USE or IUSE between them.
++                    restrict_uselist = frozenset(
++                        x
++                        for x in self["USE"].split()
++                        if x in explicit_iuse or iuse_implicit_match(x)
++                    )
+                     properties = use_reduce(
+                         raw_properties,
+-                        uselist=frozenset(
+-                            x
+-                            for x in self["USE"].split()
+-                            if x in explicit_iuse or iuse_implicit_match(x)
+-                        ),
++                        uselist=restrict_uselist,
+                         flat=True,
+                     )
+                     restrict = use_reduce(
+                         raw_restrict,
+-                        uselist=frozenset(
+-                            x
+-                            for x in self["USE"].split()
+-                            if x in explicit_iuse or iuse_implicit_match(x)
+-                        ),
++                        uselist=restrict_uselist,
+                         flat=True,
+                     )
+             except PortageException:
+@@ -2283,6 +2564,281 @@
+         # setcpv triggers lazy instantiation of things like _use_manager.
+         _eapi_cache.clear()
+ 
++        if pkg is not None:
++            self._pkg_use_template = self._pkg_use_make_template()
++
++    def _pkg_use_make_template(self):
++        """
++        Called at the very end of a complete setcpv() call for a Package
++        (built or not: what is recorded here does not depend on the
++        package). Returns what _pkg_use_fast() needs to know about the state
++        that this call left behind, or None if _pkg_use_fast() must not be
++        used after this call.
++        """
++        last = self._regenerate_last
++        configdict = self.configdict
++        env = configdict["env"]
++        if (
++            last is None
++            # regenerate() printed a warning: every setcpv() call prints it.
++            or not last[1]
++            # package.env settings of this package are in effect, some of
++            # them in objects shared with other config instances.
++            or self._penv
++            # make.defaults of this package's repository are in effect.
++            or configdict["repo"]
++            # FEATURES=test makes USE depend on RESTRICT and PROPERTIES.
++            or "test" in self.features
++            or configdict["features"].get("USE") != ""
++            or self.configlist[-1] is not env
++            or self.lookuplist[0] is not env
++            or len(self.uvlist) != len(last[0])
++        ):
++            return None
++        use_stack_inputs = last[0]
++        use_expand = self.get("USE_EXPAND", "")
++        use_expand_hidden = self.get("USE_EXPAND_HIDDEN", "")
++        # No variable that setcpv() and regenerate() look up for the USE
++        # calculation may be a key of the "pkg" dict, which differs from
++        # package to package ("USE" itself is handled explicitly).
++        names = set(self.incrementals)
++        names.update(use_expand.split())
++        names.update(self.get("USE_EXPAND_UNPREFIXED", "").split())
++        names.update(_PKG_USE_FAST_LOOKUPS)
++        names.discard("USE")
++        if not names.isdisjoint(self._setcpv_aux_keys) or not names.isdisjoint(
++            _PKG_USE_FAST_PKG_KEYS
++        ):
++            return None
++        index = {}
++        for i, curdb in enumerate(self.uvlist):
++            for name in ("pkg", "defaults", "pkginternal"):
++                if curdb is configdict[name]:
++                    index[name] = i
++        for name in ("pkg", "pkginternal"):
++            i = index.get(name)
++            if i is not None:
++                unprefixed_values, _use_str, cur_use_expand, _ = use_stack_inputs[i]
++                if cur_use_expand or any(v is not None for v in unprefixed_values):
++                    return None
++        return (
++            use_stack_inputs,
++            index.get("pkg"),
++            index.get("defaults"),
++            index.get("pkginternal"),
++            use_expand,
++            use_expand_hidden,
++        )
++
++    def _pkg_use_fast(self, pkg):
++        """
++        For an unbuilt Package: return what the resolver reads from this
++        instance right after setcpv(pkg), namely
++
++            (self["PORTAGE_USE"], self.get("USE_EXPAND", ""),
++             self.get("USE_EXPAND_HIDDEN", ""), self.useforce, self.usemask)
++
++        without calling setcpv(pkg), or return None if the caller has to call
++        setcpv(pkg). This instance is left exactly as the last complete
++        setcpv() call left it, except that _setcpv_args_hash is cleared.
++
++        Why the values are those of setcpv(pkg):
++
++        setcpv() always calls reset() (its "previous_iuse_effective is not
++        None == ..." test is a chained comparison that is never true), so
++        what it computes for a package does not depend on the package of the
++        call before, except through package.env settings, repository
++        make.defaults and FEATURES=test. A template exists only if the last
++        complete setcpv() call had none of the three (see
++        _pkg_use_make_template), and it is dropped by modifying(), that is by
++        anything that changes this instance. With a template, the values
++        that regenerate() reads from the dbs of USE_ORDER differ from those
++        it read in that last call only in the USE strings of the "pkg",
++        "defaults" and "pkginternal" dicts. This method computes these three
++        strings, useforce, usemask and "stable" with the statements of
++        setcpv(), returns None for any package that has package.env or
++        repository settings, and stacks with the same _regenerate_use_stack()
++        (and the same memo) as regenerate(). The filtering by IUSE that
++        follows in setcpv() is repeated here for the case without "_*"
++        wildcards; None is returned in the other case.
++
++        Clearing _setcpv_args_hash keeps the next setcpv() call from
++        returning early for a package that this method was not called for
++        last (the hash contains id(pkg), which could be reused).
++        """
++        template = self._pkg_use_template
++        if template is None or self.locked or pkg.built:
++            return None
++        mydb = pkg._metadata
++        if "EAPI" not in mydb or "IUSE" not in mydb:
++            return None
++        if not _get_eapi_attrs(mydb["EAPI"]).iuse_effective:
++            return None
++        iuse = mydb["IUSE"]
++        repository = mydb["repository"] if "repository" in mydb else None
++        cp = cpv_getkey(pkg.cpv)
++        use_manager = self._use_manager
++
++        pkginternaluse_list = []
++        for x in iuse.split():
++            if x.startswith("+"):
++                pkginternaluse_list.append(x[1:])
++            elif x.startswith("-"):
++                pkginternaluse_list.append(x)
++        pkginternaluse = " ".join(pkginternaluse_list)
++
++        stable = self._isStable(pkg)
++
++        if repository and repository != Package.UNKNOWN_REPO:
++            repos = []
++            try:
++                repos.extend(
++                    repo.name for repo in self.repositories[repository].masters
++                )
++            except KeyError:
++                pass
++            repos.append(repository)
++            for repo in repos:
++                # Anything that could put an entry into setcpv()'s repo_env.
++                if (
++                    self._repo_make_defaults.get(repo)
++                    or (stable and use_manager._repo_use_stable_dict.get(repo, ()))
++                    or use_manager._repo_puse_dict.get(repo, {}).get(cp)
++                    or (
++                        stable
++                        and use_manager._repo_puse_stable_dict.get(repo, {}).get(cp)
++                    )
++                ):
++                    return None
++
++        defaults = []
++        for i, pkgprofileuse_dict in enumerate(use_manager._pkgprofileuse):
++            if self.make_defaults_use[i]:
++                defaults.append(self.make_defaults_use[i])
++
++            # package.use.stable > package.use > use.stable
++            if stable and use_manager._use_stable_list[i]:
++                defaults.append(" ".join(use_manager._use_stable_list[i]))
++
++            cpdict = pkgprofileuse_dict.get(cp)
++            if cpdict:
++                pkg_defaults = ordered_by_atom_specificity(cpdict, pkg)
++                if pkg_defaults:
++                    defaults.extend(pkg_defaults)
++
++            if stable:
++                cpdict = use_manager._puse_stable_list[i].get(cp)
++                if cpdict:
++                    pkg_defaults = ordered_by_atom_specificity(cpdict, pkg)
++                    if pkg_defaults:
++                        defaults.extend(pkg_defaults)
++
++        defaults = " ".join(defaults)
++
++        useforce = use_manager.getUseForce(pkg)
++        usemask = use_manager.getUseMask(pkg)
++        puse = use_manager.getPUSE(pkg)
++
++        cpdict = self._penvdict.get(cp)
++        if cpdict and ordered_by_atom_specificity(cpdict, pkg):
++            return None
++
++        # A token that makes _regenerate_use_stack() print a warning (which
++        # setcpv() would then print as well) or look at IUSE.
++        for use_str in (puse, defaults, pkginternaluse):
++            clean = _pkg_use_fast_clean_memo.get(use_str)
++            if clean is None:
++                clean = True
++                for x in use_str.split():
++                    if x[0] == "+" or (x[0] != "-" and x[-2:] == "_*"):
++                        clean = False
++                        break
++                if len(_pkg_use_fast_clean_memo) < _PKG_USE_FAST_MEMO_MAX:
++                    _pkg_use_fast_clean_memo[use_str] = clean
++            if not clean:
++                return None
++
++        (
++            use_stack_inputs,
++            pkg_index,
++            defaults_index,
++            pkginternal_index,
++            use_expand,
++            use_expand_hidden,
++        ) = template
++        # The items that regenerate() would read from the three dicts: the
++        # "pkg" and "pkginternal" dicts set no variable of USE_EXPAND or
++        # USE_EXPAND_UNPREFIXED (checked for the template).
++        use_stack_inputs = list(use_stack_inputs)
++        if pkg_index is not None:
++            use_stack_inputs[pkg_index] = (
++                use_stack_inputs[pkg_index][0],
++                puse,
++                (),
++                () if puse.split() else None,
++            )
++        if defaults_index is not None:
++            item = use_stack_inputs[defaults_index]
++            use_stack_inputs[defaults_index] = (item[0], defaults, item[2], None)
++        if pkginternal_index is not None:
++            use_stack_inputs[pkginternal_index] = (
++                use_stack_inputs[pkginternal_index][0],
++                pkginternaluse,
++                (),
++                () if pkginternaluse.split() else None,
++            )
++        use_stack_inputs = tuple(use_stack_inputs)
++
++        arch = self.configdict["defaults"].get("ARCH")
++        iuse_effective = self._iuse_effective
++        base_key = (use_stack_inputs, useforce, usemask, arch, iuse_effective)
++        base = _pkg_use_fast_base_memo.get(base_key)
++        if base is None:
++            myflags = _regenerate_use_stack_memo.get(use_stack_inputs)
++            if myflags is not None:
++                myflags = set(myflags)
++            else:
++                myflags, memoizable = _regenerate_use_stack(
++                    use_stack_inputs, [x.lstrip("+-") for x in iuse.split()]
++                )
++                if (
++                    memoizable
++                    and len(_regenerate_use_stack_memo)
++                    < _REGENERATE_USE_STACK_MEMO_MAX
++                ):
++                    _regenerate_use_stack_memo[use_stack_inputs] = frozenset(myflags)
++            # The end of regenerate() ...
++            myflags.update(useforce)
++            if arch:
++                myflags.add(arch)
++            myflags.difference_update(usemask)
++            # ... and what setcpv() reads back from it as self["USE"].
++            use = frozenset(" ".join(sorted(myflags)).split())
++            has_wildcard = False
++            for x in use:
++                if x[-2:] == "_*":
++                    has_wildcard = True
++                    break
++            # (flags that pass the IUSE filter whatever the package is,
++            #  USE as a whole, whether setcpv() has wildcards to expand)
++            base = (use.intersection(iuse_effective), use, has_wildcard)
++            if len(_pkg_use_fast_base_memo) < _PKG_USE_FAST_MEMO_MAX:
++                _pkg_use_fast_base_memo[base_key] = base
++        if base[2]:
++            return None
++
++        # setcpv() keeps the flags x of USE with
++        # "x in explicit_iuse or iuse_implicit_match(x)" (no "_*" here), and
++        # iuse_implicit_match is _iuse_effective_match for this EAPI.
++        portage_use = " ".join(sorted(base[0].union(base[1].intersection(pkg.iuse.all))))
++
++        result = (portage_use, use_expand, use_expand_hidden, useforce, usemask)
++        if _PKG_USE_FAST_SELFTEST is not None:
++            _PKG_USE_FAST_SELFTEST(self, pkg, result)
++        else:
++            self._setcpv_args_hash = None
++        return result
++
+     def _grab_pkg_env(self, penv, container, protected_keys=None):
+         if protected_keys is None:
+             protected_keys = ()
+@@ -2758,6 +3314,8 @@
+             # repoman will accept any property
+             self._accept_restrict = ("*",)
+ 
++        # For _pkg_use_fast(): False as soon as this call prints a warning.
++        regenerate_quiet = True
+         increment_lists = {}
+         for k in myincrementals:
+             incremental_list = []
+@@ -2765,47 +3323,38 @@
+             for curdb in mydbs:
+                 v = curdb.get(k)
+                 if v is not None:
+-                    incremental_list.append(v.split())
+-
+-        if "FEATURES" in increment_lists:
+-            increment_lists["FEATURES"].append(self._features_overrides)
++                    # Split by _regenerate_stack_incremental.
++                    incremental_list.append(v)
+ 
+-        myflags = set()
+         for mykey, incremental_list in increment_lists.items():
+-            myflags.clear()
+-            for mysplit in incremental_list:
+-                for x in mysplit:
+-                    if x == "-*":
+-                        # "-*" is a special "minus" var that means "unset all settings".
+-                        # so USE="-* gnome" will have *just* gnome enabled.
+-                        myflags.clear()
+-                        continue
+-
+-                    if x[0] == "+":
+-                        # Not legal. People assume too much. Complain.
+-                        writemsg(
+-                            colorize(
+-                                "BAD",
+-                                _("%s values should not start with a '+': %s")
+-                                % (mykey, x),
+-                            )
+-                            + "\n",
+-                            noiselevel=-1,
+-                        )
+-                        x = x[1:]
+-                        if not x:
+-                            continue
+-
+-                    if x[0] == "-":
+-                        myflags.discard(x[1:])
+-                        continue
+-
+-                    # We got here, so add it now.
+-                    myflags.add(x)
++            if mykey == "FEATURES":
++                override_tokens = tuple(self._features_overrides)
++            else:
++                override_tokens = ()
++            # The stacked value is a pure function of mykey and of the
++            # values just read (see _regenerate_stack_incremental), and it is
++            # the same for nearly every package that setcpv() loads.
++            stack_key = (mykey, tuple(incremental_list), override_tokens)
++            stacked = _regenerate_stack_incremental_memo.get(stack_key)
++            if stacked is None:
++                myflags, memoizable = _regenerate_stack_incremental(
++                    mykey, incremental_list, override_tokens
++                )
++                stacked = " ".join(sorted(myflags))
++                if not memoizable:
++                    regenerate_quiet = False
++                if (
++                    memoizable
++                    and len(_regenerate_stack_incremental_memo)
++                    < _REGENERATE_STACK_INCREMENTAL_MEMO_MAX
++                ):
++                    _regenerate_stack_incremental_memo[stack_key] = stacked
+ 
+             # store setting in last element of configlist, the original environment:
+-            if myflags or mykey in self:
+-                self.configlist[-1][mykey] = " ".join(sorted(myflags))
++            # (the flags are not empty strings, so the joined string is empty
++            # exactly when there is no flag)
++            if stacked or mykey in self:
++                self.configlist[-1][mykey] = stacked
+ 
+         # Do the USE calculation last because it depends on USE_EXPAND.
+         use_expand = self.get("USE_EXPAND", "").split()
+@@ -2871,131 +3420,41 @@
+         iuse = self.configdict["pkg"].get("IUSE")
+         if iuse is not None:
+             iuse = [x.lstrip("+-") for x in iuse.split()]
+-        myflags = set()
++        # Read what the USE stacking below depends on, db by db, with the same
++        # lookups as before. Stacking is then a pure function of these values
++        # and of iuse, see _regenerate_use_stack.
++        use_stack_inputs = []
+         for curdb in self.uvlist:
+-            for k in use_expand_unprefixed:
+-                v = curdb.get(k)
+-                if v is None:
+-                    continue
+-                for x in v.split():
+-                    if x[:1] == "-":
+-                        myflags.discard(x[1:])
+-                    else:
+-                        myflags.add(x)
+-
+-            cur_use_expand = [x for x in use_expand if x in curdb]
+-            mysplit = curdb.get("USE", "").split()
+-            if not mysplit and not cur_use_expand:
+-                continue
+-            for x in mysplit:
+-                if x == "-*":
+-                    myflags.clear()
+-                    continue
+-
+-                if x[0] == "+":
+-                    writemsg(
+-                        colorize(
+-                            "BAD",
+-                            _("USE flags should not start " "with a '+': %s\n") % x,
+-                        ),
+-                        noiselevel=-1,
+-                    )
+-                    x = x[1:]
+-                    if not x:
+-                        continue
+-
+-                if x[0] == "-":
+-                    if x[-2:] == "_*":
+-                        prefix = x[1:-1]
+-                        prefix_len = len(prefix)
+-                        myflags.difference_update(
+-                            [y for y in myflags if y[:prefix_len] == prefix]
+-                        )
+-                    myflags.discard(x[1:])
+-                    continue
+-
+-                if iuse is not None and x[-2:] == "_*":
+-                    # Expand wildcards here, so that cases like
+-                    # USE="linguas_* -linguas_en_US" work correctly.
+-                    prefix = x[:-1]
+-                    prefix_len = len(prefix)
+-                    has_iuse = False
+-                    for y in iuse:
+-                        if y[:prefix_len] == prefix:
+-                            has_iuse = True
+-                            myflags.add(y)
+-                    if not has_iuse:
+-                        # There are no matching IUSE, so allow the
+-                        # wildcard to pass through. This allows
+-                        # linguas_* to trigger unset LINGUAS in
+-                        # cases when no linguas_ flags are in IUSE.
+-                        myflags.add(x)
+-                else:
+-                    myflags.add(x)
+-
+-            if curdb is configdict_defaults:
+-                # USE_EXPAND flags from make.defaults are handled
+-                # earlier, in order to provide useful incremental
+-                # behavior (for sub-profiles).
+-                continue
+-
+-            for var in cur_use_expand:
+-                var_lower = var.lower()
+-                is_not_incremental = var not in myincrementals
+-                if is_not_incremental:
+-                    prefix = var_lower + "_"
+-                    prefix_len = len(prefix)
+-                    for x in list(myflags):
+-                        if x[:prefix_len] == prefix:
+-                            myflags.remove(x)
+-                for x in curdb[var].split():
+-                    if x[0] == "+":
+-                        if is_not_incremental:
+-                            writemsg(
+-                                colorize(
+-                                    "BAD",
+-                                    _(
+-                                        "Invalid '+' "
+-                                        "operator in non-incremental variable "
+-                                        "'%s': '%s'\n"
+-                                    )
+-                                    % (var, x),
+-                                ),
+-                                noiselevel=-1,
+-                            )
+-                            continue
+-                        else:
+-                            writemsg(
+-                                colorize(
+-                                    "BAD",
+-                                    _(
+-                                        "Invalid '+' "
+-                                        "operator in incremental variable "
+-                                        "'%s': '%s'\n"
+-                                    )
+-                                    % (var, x),
+-                                ),
+-                                noiselevel=-1,
+-                            )
+-                        x = x[1:]
+-                    if x[0] == "-":
+-                        if is_not_incremental:
+-                            writemsg(
+-                                colorize(
+-                                    "BAD",
+-                                    _(
+-                                        "Invalid '-' "
+-                                        "operator in non-incremental variable "
+-                                        "'%s': '%s'\n"
+-                                    )
+-                                    % (var, x),
+-                                ),
+-                                noiselevel=-1,
+-                            )
+-                            continue
+-                        myflags.discard(var_lower + "_" + x[1:])
+-                        continue
+-                    myflags.add(var_lower + "_" + x)
++            unprefixed_values = tuple([curdb.get(k) for k in use_expand_unprefixed])
++            cur_use_expand = tuple([x for x in use_expand if x in curdb])
++            use_str = curdb.get("USE", "")
++            if curdb is configdict_defaults or not (use_str.split() or cur_use_expand):
++                # The USE_EXPAND variables of this db are not looked at.
++                expand_values = None
++            else:
++                expand_values = tuple(
++                    [(curdb[var], var not in myincrementals) for var in cur_use_expand]
++                )
++            use_stack_inputs.append(
++                (unprefixed_values, use_str, cur_use_expand, expand_values)
++            )
++        use_stack_inputs = tuple(use_stack_inputs)
++        myflags = _regenerate_use_stack_memo.get(use_stack_inputs)
++        if myflags is not None:
++            # The memo holds frozensets, the code below needs its own set.
++            myflags = set(myflags)
++        else:
++            myflags, memoizable = _regenerate_use_stack(use_stack_inputs, iuse)
++            if not memoizable:
++                regenerate_quiet = False
++            if (
++                memoizable
++                and len(_regenerate_use_stack_memo) < _REGENERATE_USE_STACK_MEMO_MAX
++            ):
++                _regenerate_use_stack_memo[use_stack_inputs] = frozenset(myflags)
++        # (a hit in either memo means a call that printed nothing: only such
++        # calls are recorded)
++        self._regenerate_last = (use_stack_inputs, regenerate_quiet)
+ 
+         if hasattr(self, "features"):
+             self.features._features.clear()
+@@ -3110,8 +3569,6 @@
+                 return ""
+ 
+     def _getitem(self, mykey):
+-        from portage.data import portage_gid
+-
+         if mykey in self._constant_keys:
+             # These two point to temporary values when
+             # portage plans to update itself.
+@@ -3137,9 +3594,28 @@
+                 return ":".join(value)
+ 
+             if mykey == "PORTAGE_GID":
++                from portage.data import portage_gid
++
+                 return f"{portage_gid}"
+ 
+         for d in self.lookuplist:
++            # For the two classes that the list is made of, find out without
++            # raising and catching KeyError that d[mykey] would raise it:
++            # a dict raises it iff the key is not in it, and
++            # LazyItemsDict.__getitem__ looks into lazy_items and then into
++            # data, nowhere else. A lookup of a missing key walks the whole
++            # list, and regenerate() does that for every USE_EXPAND variable.
++            d_class = d.__class__
++            if d_class is dict:
++                if mykey in d:
++                    return d[mykey]
++                continue
++            if (
++                d_class is LazyItemsDict
++                and mykey not in d.data
++                and mykey not in d.lazy_items
++            ):
++                continue
+             try:
+                 return d[mykey]
+             except KeyError:
+diff -ruN a/lib/portage/_sets/base.py b/lib/portage/_sets/base.py
+--- a/lib/portage/_sets/base.py
++++ b/lib/portage/_sets/base.py
+@@ -123,6 +123,59 @@
+             pkg = pkg.copy()
+             pkg._metadata["USE"] = " ".join(modified_use)
+ 
++        # Shortcut for a set that has no atom for the cp of pkg, which is the
++        # usual state of the sets that the resolver consults for every
++        # package it looks at (--exclude and friends are empty unless the
++        # option is given). iterAtomsForPackage() below would do these same
++        # three steps and yield nothing when ExtendedAtomDict.get() returns
++        # nothing for the cp; without extended (wildcard) atoms that is the
++        # case exactly when there is no non-empty entry for the cp in
++        # _normal. best_match_to_list() of no atoms is None.
++        # cpv_getkey(pkg.cpv) and self._load(), without the two calls where
++        # they would do nothing else: cpv_getkey() returns the cp attribute
++        # of a cpv that has one, and _load() (not overridden in an
++        # InternalPackageSet) does nothing once the set is loaded or while
++        # it is loading. This method is called for every candidate package.
++        cpv = pkg.cpv
++        try:
++            cp = cpv.cp
++        except AttributeError:
++            cp = cpv_getkey(cpv)
++        if not (
++            self.__class__ is InternalPackageSet and (self._loaded or self._loading)
++        ):
++            self._load()
++        atommap = self._atommap
++        if (
++            atommap.__class__ is ExtendedAtomDict
++            and not atommap._extended
++            and not atommap._normal.get(cp)
++        ):
++            return None
++
++        # Shortcut for exactly one atom with the cp of pkg and no extended
++        # atoms, which is what a set made from a single atom looks like to a
++        # package of that cp (the resolver makes such sets all the time).
++        # iterAtomsForPackage() below would yield this atom if
++        # match_from_list() matches it, and nothing otherwise. With nothing,
++        # the result is None. With the atom (its cp equals that of pkg, so
++        # it is not transformed), best_match_to_list() matches it a second
++        # time, with the same result, and returns it whatever its operator
++        # is, since it is the only candidate; an Atom is always true.
++        if atommap.__class__ is ExtendedAtomDict and not atommap._extended:
++            atoms = atommap._normal[cp]
++            if len(atoms) == 1:
++                for atom in atoms:
++                    break
++                if (
++                    atom.__class__ is Atom
++                    and atom.cp == pkg.cp
++                    and not atom.extended_syntax
++                ):
++                    if match_from_list(atom, [pkg]):
++                        return atom
++                    return None
++
+         # Atoms matched via PROVIDE must be temporarily transformed since
+         # match_from_list() only works correctly when atom.cp == pkg.cp.
+         rev_transform = {}
+@@ -131,6 +184,16 @@
+                 rev_transform[atom] = atom
+             else:
+                 rev_transform[atom.with_cp(pkg.cp)] = atom
++        if len(rev_transform) == 1:
++            # Upstream commit 969bcd5b7 (after 3.0.83): iterAtomsForPackage()
++            # yielded this atom because match_from_list(atom, [pkg]) found
++            # pkg, and best_match_to_list() of a single atom does nothing but
++            # repeat that match and return the atom. Only for an atom that
++            # was not transformed above: a transformed one is a different
++            # atom that has not been matched yet.
++            for atom, orig_atom in rev_transform.items():
++                if atom is orig_atom:
++                    return atom
+         best_match = best_match_to_list(pkg, iter(rev_transform))
+         if best_match:
+             return rev_transform[best_match]
+@@ -146,6 +209,19 @@
+         cp = cpv_getkey(pkg.cpv)
+         self._load()  # make sure the atoms are loaded
+ 
++        atommap = self._atommap
++        if (
++            atommap.__class__ is ExtendedAtomDict
++            and not atommap._extended
++            and atommap._normal.get(cp) is None
++        ):
++            # ExtendedAtomDict.get() below would return None: without
++            # extended (wildcard) atoms it finds nothing but the _normal
++            # entry of the cp, and there is none. This is the answer for
++            # most packages, and get() reaches it by raising and catching
++            # KeyError.
++            return
++
+         atoms = self._atommap.get(cp)
+         if atoms:
+             for atom in atoms:
+diff -ruN a/lib/portage/util/digraph.py b/lib/portage/util/digraph.py
+--- a/lib/portage/util/digraph.py
++++ b/lib/portage/util/digraph.py
+@@ -27,22 +27,28 @@
+         If the dep is a soft-dep and the node already has a hard
+         relationship to the parent, the relationship is left as hard."""
+ 
+-        if node not in self.nodes:
+-            self.nodes[node] = ({}, {}, node)
++        # The same steps as before, with each node looked up (hashed) once
++        # instead of up to three times: an entry of self.nodes is never
++        # None, so get() tells whether the node is there.
++        nodes = self.nodes
++        node_data = nodes.get(node)
++        if node_data is None:
++            node_data = nodes[node] = ({}, {}, node)
+             self.order.append(node)
+ 
+         if not parent:
+             return
+ 
+-        if parent not in self.nodes:
+-            self.nodes[parent] = ({}, {}, parent)
++        parent_data = nodes.get(parent)
++        if parent_data is None:
++            parent_data = nodes[parent] = ({}, {}, parent)
+             self.order.append(parent)
+ 
+-        priorities = self.nodes[node][1].get(parent)
++        priorities = node_data[1].get(parent)
+         if priorities is None:
+             priorities = []
+-            self.nodes[node][1][parent] = priorities
+-            self.nodes[parent][0][node] = priorities
++            node_data[1][parent] = priorities
++            parent_data[0][node] = priorities
+ 
+         if not priorities or priorities[-1] is not priority:
+             bisect.insort(priorities, priority)
+diff -ruN a/lib/portage/util/SlotObject.py b/lib/portage/util/SlotObject.py
+--- a/lib/portage/util/SlotObject.py
++++ b/lib/portage/util/SlotObject.py
+@@ -2,10 +2,81 @@
+ # Distributed under the terms of the GNU General Public License v2
+ 
+ 
++from types import MemberDescriptorType
++
++# class -> tuple of its slot names in the order in which __init__ visits
++# them, or False if the class needs the general code of __init__.
++_plain_slots = {}
++
++
++def _find_plain_slots(cls):
++    """
++    Return the slot names that SlotObject.__init__ visits for an instance of
++    cls, in its order, if every one of them is an ordinary slot: named once
++    in the __slots__ of cls and its bases, and found on cls as the slot
++    descriptor itself (no property or class attribute in front of it).
++    Return False otherwise.
++    """
++    names = []
++    classes = [cls]
++    while classes:
++        c = classes.pop()
++        if c is SlotObject:
++            continue
++        classes.extend(c.__bases__)
++        slots = getattr(c, "__slots__", None)
++        if not slots:
++            continue
++        if type(slots) not in (tuple, list):
++            return False
++        names.extend(slots)
++    if len(set(names)) != len(names):
++        return False
++    for myattr in names:
++        if type(myattr) is not str:
++            return False
++        for c in cls.__mro__:
++            if myattr in c.__dict__:
++                if type(c.__dict__[myattr]) is not MemberDescriptorType:
++                    return False
++                break
++        else:
++            return False
++    return tuple(names)
++
++
+ class SlotObject:
+     __slots__ = ("__weakref__",)
+ 
+     def __init__(self, **kwargs):
++        # Fast path for classes with ordinary slots only (see
++        # _find_plain_slots). For such a slot of a new instance, the test
++        # "getattr(self, myattr, None) is not None" below is false (the slot
++        # is empty) and setattr() cannot fail, so all that the loop below
++        # does is setattr(self, myattr, kwargs.pop(myattr, None)) in the
++        # same order. The only difference: a slot that was given a value
++        # other than None before this constructor ran, and that is not in
++        # kwargs, is set to None here where the loop below raises
++        # AssertionError.
++        cls = self.__class__
++        plain_slots = _plain_slots.get(cls)
++        if plain_slots is None:
++            plain_slots = _plain_slots[cls] = _find_plain_slots(cls)
++        if plain_slots is not False:
++            if kwargs:
++                pop = kwargs.pop
++                for myattr in plain_slots:
++                    setattr(self, myattr, pop(myattr, None))
++                if kwargs:
++                    raise TypeError(
++                        "'%s' is an invalid keyword argument for this constructor"
++                        % (next(iter(kwargs)),)
++                    )
++            else:
++                for myattr in plain_slots:
++                    setattr(self, myattr, None)
++            return
++
+         classes = [self.__class__]
+         while classes:
+             c = classes.pop()
+diff -ruN a/lib/portage/versions.py b/lib/portage/versions.py
+--- a/lib/portage/versions.py
++++ b/lib/portage/versions.py
+@@ -110,7 +110,11 @@
+     return False
+ 
+ 
+-@lru_cache(1024)
++# Unbounded (it was 1024 entries): the resolver compares many more distinct
++# pairs of versions than that, again and again, and the function is a pure
++# function of its arguments (no caller passes silent=0, the only thing
++# that makes it print), so a larger cache returns the same values.
++@lru_cache(None)
+ def vercmp(ver1: str, ver2: str, silent: int = 1) -> Optional[int]:
+     """
+     Compare two versions
+@@ -312,7 +316,9 @@
+ _missing_cat = "null"
+ 
+ 
+-@lru_cache(10240)
++# Unbounded (it was 10240 entries, fewer than the cpvs that one resolver run
++# splits): a pure function of its arguments, silent is not used.
++@lru_cache(None)
+ def catpkgsplit(
+     mydata: Union[str, "_pkg_str"],
+     silent: int = 1,

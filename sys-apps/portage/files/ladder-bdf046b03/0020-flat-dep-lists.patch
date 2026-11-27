@@ -1,0 +1,104 @@
+depgraph: build the dep_check() result directly for lists without a choice
+
+Sub-series: G (flat dependency lists) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+For a dependency list that is a non-empty list of plain Atoms only (no
+"||" group, no virtual/, nothing from package.provided, local_config, no
+virt_parent), dep_check() has nothing to choose: it returns every atom in
+order. _select_atoms_flat() builds that result directly, including the
+OrderedDict keyed by the parent that _select_atoms_highest_available()
+returns, and dep_check() is not called.
+
+On top of patches 0001-0019, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 26.9 -> 25.7, holds 13.6 -> 12.9, masks 28.7 -> 27.2,
+  py313 17.0 -> 15.8, bdeps 19.7 -> 18.5, policykit 13.9 -> 13.2
+  sum of six 119.8 -> 113.3 (-6.5 s, -1.5 % of the stock sum 447.5)
+Patches 0001-0020 together: 447.5 -> 113.3 s (-75 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Weak spots and what was not checked:
+* Same dependence on dep_check() internals as the previous point, here for
+  the whole result including its order.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -6785,6 +6785,9 @@
+         if trees is None:
+             trees = self._dynamic_config._filtered_trees
+         mytrees = trees[root]
++        selected_atoms = self._select_atoms_flat(depstring, pkgsettings, mytrees, parent)
++        if selected_atoms is not None:
++            return selected_atoms
+         atom_graph = digraph()
+         if True:
+             # Temporarily disable autounmask so that || preferences
+@@ -6909,6 +6912,56 @@
+ 
+         return selected_atoms
+ 
++    def _select_atoms_flat(self, depstring, pkgsettings, mytrees, parent):
++        """
++        The result of _select_atoms_highest_available() for a dependency
++        list in which dep_check() has nothing to choose, or None if the list
++        is not of that kind: a non-empty list of Atom instances only (no
++        "||" group, hence no nested list either), none of them for a
++        virtual/ package or for a package that package.provided names, with
++        local_config set and no virt_parent in mytrees.
++
++        For such a list dep_check() does the following, step by step, and
++        calls nothing that looks at the graph, the databases or the state
++        that _select_atoms_highest_available() sets up around the call:
++        _expand_new_virtuals() copies the list, and adds (atom, id(atom)) as
++        a child of parent to atom_graph for every atom, if there is a
++        parent; _overlap_dnf() returns it unchanged, since it contains no
++        disjunction; dep_wordreduce(), without a dbapi and with none of
++        the packages in package.provided, marks every atom as not satisfied; and
++        dep_zapdeps() then returns every atom, in order, in a new list.
++        Without a parent that list is the result. With a parent the result
++        is an OrderedDict with the one key parent, whose value lists the
++        atom of every child node of parent in atom_graph: every atom once
++        per object (the node of an atom object that occurs twice is the same
++        node), in the order of the first occurrences.
++        """
++        if (
++            not depstring
++            or not pkgsettings.local_config
++            or mytrees.get("virt_parent") is not None
++        ):
++            return None
++        pprovideddict = pkgsettings.pprovideddict
++        for atom in depstring:
++            if atom.__class__ is not Atom:
++                return None
++            cp = atom.cp
++            if cp.startswith("virtual/") or cp in pprovideddict:
++                return None
++        if parent is None:
++            return depstring[:]
++        child_atoms = []
++        seen = set()
++        for atom in depstring:
++            atom_id = id(atom)
++            if atom_id not in seen:
++                seen.add(atom_id)
++                child_atoms.append(atom)
++        selected_atoms = OrderedDict()
++        selected_atoms[parent] = child_atoms
++        return selected_atoms
++
+     def _expand_virt_from_graph(self, root, atom):
+         if not isinstance(atom, Atom):
+             atom = Atom(atom)

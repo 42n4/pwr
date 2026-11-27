@@ -1,0 +1,303 @@
+dep: atom memo in the C parser glue, C parser for use_reduce() calls with is_valid_flag
+
+Sub-series: C (use_reduce parser) - patch 2 of 3; applies to 3.0.83 with only the earlier patches of this sub-series.
+
+_c_atom_from_c() built an Atom from a C parser token and then interned it;
+about nine of ten tokens had been seen before (the implementers' count).
+The interned, unevaluated Atom is now remembered per (token string, EAPI),
+and USE conditionals are evaluated from the remembered instance.
+
+use_reduce() left every call with an is_valid_flag callable to the Python
+parser. The Python parser consults is_valid_flag only for the flags of
+"flag?" groups and of USE conditionals inside atoms, so when the C parser
+accepts the string and all those flags are valid, the C parser's result for
+the same mode is the Python parser's result. _use_reduce_c_validated()
+serves these calls behind the existing LRU cache (which therefore sees the
+same keys in the same order), remembers per (string, EAPI) the tokens and
+the flags to check, and returns None so that the Python parser runs and
+decides whenever anything is unusual.
+
+On top of patches 0001-0017, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 30.0 -> 28.0, holds 15.1 -> 13.9, masks 32.0 -> 30.7,
+  py313 18.4 -> 16.9, bdeps 21.9 -> 20.1, policykit 15.3 -> 14.3
+  sum of six 132.7 -> 123.9 (-8.8 s, -2.0 % of the stock sum 447.5)
+Patches 0001-0018 together: 447.5 -> 123.9 s (-72 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Two pieces of the C parser glue grouped: the atom memo and the validated
+use_reduce path; they were not measured apart in the chain.
+
+Weak spots and what was not checked:
+* The atom memo keeps every interned Atom alive for the life of the process.
+* Equivalence with the Python parser is an argument plus the implementers'
+  fuzzing (not repeated for this series).
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+--- a/lib/portage/dep/__init__.py
++++ b/lib/portage/dep/__init__.py
+@@ -100,10 +100,39 @@
+     )
+ 
+ 
++# (token string, eapi) -> the interned Atom that _c_atom_from_c() built for
++# that token with its USE conditionals left unevaluated.
++_c_atom_memo = {}
++
++
+ def _c_atom_from_c(catom, eapi, eapi_attrs, uselist, matchall):
+-    """Construct a portage.dep.Atom from a _parser.Atom, bypassing __init__ regex."""
++    """Construct a portage.dep.Atom from a _parser.Atom, bypassing __init__ regex.
++
++    The same atom tokens come by again and again (about nine of ten calls
++    in a resolver run), so the unevaluated result is remembered per (token
++    string, eapi). Every field that is set below is a function of these
++    two: the C parser derives all attributes of catom from the token text
++    alone (build_atom_obj in src/dep_parser.c), and eapi_attrs is
++    _get_eapi_attrs(eapi). Hence a later call would build an instance with
++    the same _atom_intern_key, and _intern_atom() would hand back the
++    remembered instance, which is still in the weak intern cache because
++    the memo keeps it alive. Evaluating the USE conditionals of the
++    remembered instance instead of an equal fresh one gives an equal Atom
++    (same string, same _use, an unevaluated_atom with the same string and
++    eapi, which is all that _atom_ctor_key and _atom_intern_key look at).
++    Tokens for which the construction raises are never remembered.
++    """
++    key = (str(catom), eapi)
++    a = _c_atom_memo.get(key)
++    if a is not None:
++        if matchall:
++            return a
++        use = a._use
++        if use is None or not use.conditional:
++            return a
++        return _intern_atom(a.evaluate_conditionals(uselist))
+     a = Atom.__new__(Atom)
+-    a._string = str(catom)
++    a._string = key[0]
+     _c_fill_atom_fields(a, catom, eapi)
+     a._unevaluated_atom = a
+     use_tokens = catom.use
+@@ -123,11 +152,12 @@
+                 required=req,
+             )
+         )
+-        if not matchall and a._use.conditional:
+-            a = a.evaluate_conditionals(uselist)
+     else:
+         a._use = None
+-    return _intern_atom(a)
++    a = _c_atom_memo[key] = _intern_atom(a)
++    if not matchall and a._use is not None and a._use.conditional:
++        a = _intern_atom(a.evaluate_conditionals(uselist))
++    return a
+ 
+ 
+ def _c_convert_result(items, eapi, eapi_attrs, uselist, matchall):
+@@ -625,19 +655,196 @@
+     The LRU cache in front of this function is unchanged, so that the calls
+     for which use_reduce returns a result that shares its nested lists with
+     an earlier result are the same ones as before. The only difference is on
+-    an LRU miss for arguments that were parsed before: instead of parsing the
+-    string again, the lists of the earlier result are copied. Exceptions are
+-    not recorded, they are raised by parsing again like before.
++    an LRU miss for arguments that were parsed before (which happens all the
++    time, since the resolver walks many more than 1024 dep strings on every
++    backtracking run): instead of parsing the string again, the lists of the
++    earlier result are copied. _use_reduce_parse is a pure function of its
++    arguments (the LRU cache already relies on that), and the tokens are
++    immutable and already shared between results (the cache hits, the Atom
++    intern cache), so the copy equals what parsing would return. Exceptions
++    are not recorded, they are raised by parsing again like before.
+     """
+     try:
+         parsed = _use_reduce_parsed[args]
+     except KeyError:
+-        result = _use_reduce_parse(*args)
++        result = _use_reduce_c_validated(*args)
++        if result is None:
++            result = _use_reduce_parse(*args)
+         _use_reduce_parsed[args] = _copy_dep_lists(result)
+         return result
+     return _copy_dep_lists(parsed)
+ 
+ 
++# (depstr, eapi, is_valid_flag) -> whether _use_reduce_c_matchall() accepted it.
++_use_reduce_c_valid = {}
++
++
++def _c_opconvert(seq):
++    """
++    Convert the non-flat form of a use_reduce() result (an any-of group is
++    the string "||" followed by the list of its alternatives) to the
++    opconvert form (the group is one list that starts with "||").
++    """
++    out = []
++    i = 0
++    n = len(seq)
++    while i < n:
++        item = seq[i]
++        if item.__class__ is str:
++            i += 1
++            group = [item]
++            for alt in seq[i]:
++                group.append(_c_opconvert(alt) if alt.__class__ is list else alt)
++            out.append(group)
++        elif item.__class__ is list:
++            out.append(_c_opconvert(item))
++        else:
++            out.append(item)
++        i += 1
++    return out
++
++
++def _use_reduce_c_validated(
++    depstr,
++    uselist,
++    masklist,
++    matchall,
++    excludeall,
++    is_src_uri,
++    eapi,
++    opconvert,
++    flat,
++    is_valid_flag,
++    token_class,
++    matchnone,
++    subset,
++):
++    """
++    use_reduce() leaves every call that has an is_valid_flag callable to the
++    Python parser, since the C parser knows nothing about IUSE. This covers
++    the calls of that kind which the resolver makes for the dependency
++    strings of every ebuild, with Atom tokens and an EAPI that the C
++    grammar covers: the one of Package._validate_deps() (all conditionals
++    active, flat), and the ones that evaluate the conditionals with the USE
++    of the package (flat, nested, or nested with opconvert).
++
++    The Python parser consults is_valid_flag in two places only: for the
++    flag of every "flag?" conditional (when the group is closed, whether or
++    not it is active), and (Atom._validate_conditional_flags) for the flags
++    of the USE conditionals inside every atom (every token is made an Atom,
++    whether or not its group is active). Everything else that can make it
++    raise depends on the string and the EAPI alone. So if the C parser
++    accepts the string and all of these flags are valid
++    (_use_reduce_c_matchall), the Python parser accepts it in every one of
++    these modes, and the result is what the C parser gives for the same
++    mode, like in the calls without is_valid_flag that use_reduce() hands to
++    the C parser itself; the opconvert form is derived from the nested one
++    (_c_opconvert). The tokens are the same interned Atom instances. In
++    every other case None is returned and the Python parser runs like
++    before, so it alone decides about errors and their messages. This runs
++    behind the LRU cache of _use_reduce_cached, hence the cache sees the
++    same keys in the same order as before.
++    """
++    if (
++        _c_dep_parser is None
++        or token_class is not Atom
++        or is_valid_flag is None
++        or is_src_uri
++        or subset is not None
++        or matchnone
++        or masklist
++        or excludeall
++        or eapi is None
++        or not _get_eapi_attrs(eapi).slot_operator
++    ):
++        return None
++    if matchall:
++        if opconvert or not flat:
++            return None
++        result = _use_reduce_c_matchall(depstr, eapi, is_valid_flag)
++        _use_reduce_c_valid[(depstr, eapi, is_valid_flag)] = result is not None
++        return result
++    if flat and opconvert:
++        return None
++    valid_key = (depstr, eapi, is_valid_flag)
++    valid = _use_reduce_c_valid.get(valid_key)
++    if valid is None:
++        valid = _use_reduce_c_valid[valid_key] = (
++            _use_reduce_c_matchall(depstr, eapi, is_valid_flag) is not None
++        )
++    if not valid:
++        return None
++    try:
++        result = _c_fast_use_reduce(depstr, uselist, False, eapi, flat)
++    except Exception:
++        return None
++    if opconvert:
++        result = _c_opconvert(result)
++    return result
++
++
++# (depstr, eapi) -> None if _use_reduce_c_matchall() cannot serve the string
++# whatever the IUSE, else (tokens, flags): the tuple of all tokens and the
++# tuple of the distinct flags that is_valid_flag has to accept.
++_use_reduce_c_matchall_memo = {}
++
++
++def _use_reduce_c_matchall(depstr, eapi, is_valid_flag):
++    """
++    The flat list of all tokens of depstr (all conditionals active) from the
++    C parser, if it accepts the string and is_valid_flag accepts the flag of
++    every "flag?" conditional and of every USE conditional inside an atom.
++    None otherwise.
++
++    The parse does not depend on is_valid_flag, so the tokens and the flags
++    to check are remembered per (depstr, eapi): different versions of a
++    package mostly share their dependency strings. is_valid_flag is the
++    side-effect-free IUSE test of a package, so asking it once per distinct
++    flag, in any order, gives the same verdict as asking for every
++    occurrence. The tokens are immutable interned Atoms (or "||"); each
++    call returns a new list of them.
++    """
++    key = (depstr, eapi)
++    try:
++        memo = _use_reduce_c_matchall_memo[key]
++    except KeyError:
++        memo = _use_reduce_c_matchall_memo[key] = _use_reduce_c_matchall_parse(
++            depstr, eapi
++        )
++    if memo is None:
++        return None
++    for flag in memo[1]:
++        if not is_valid_flag(flag):
++            return None
++    return list(memo[0])
++
++
++def _use_reduce_c_matchall_parse(depstr, eapi):
++    try:
++        result = _c_fast_use_reduce(depstr, frozenset(), True, eapi, True)
++    except Exception:
++        return None
++    flags = {}
++    for token in depstr.split():
++        if token[-1] == "?":
++            if token[:1] == "!":
++                flags[token[1:-1]] = None
++            else:
++                flags[token[:-1]] = None
++    for token in result:
++        if token.__class__ is Atom:
++            use = token._use
++            if use is not None and use.conditional:
++                for cond_flags in use.conditional.values():
++                    for flag in cond_flags:
++                        flags[flag] = None
++        elif token != "||":
++            # Not a token that the comparison with the Python parser
++            # was made for.
++            return None
++    return (tuple(result), tuple(flags))
++
++
+ def _use_reduce_parse(
+     depstr: str,
+     uselist,

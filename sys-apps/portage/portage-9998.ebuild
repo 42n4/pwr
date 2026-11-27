@@ -1,0 +1,274 @@
+# Copyright 1999-2026 Gentoo Authors
+# Distributed under the terms of the GNU General Public License v2
+
+EAPI=8
+
+PYTHON_COMPAT=( python3_{12..15} )
+SPHINX_PYTHON_COMPAT=( python3_{13..15} )
+PYTHON_REQ_USE='bzip2(+),threads(+)'
+TMPFILES_OPTIONAL=1
+
+inherit meson linux-info python-r1 tmpfiles
+
+DESCRIPTION="The package management and distribution system for Gentoo"
+HOMEPAGE="https://wiki.gentoo.org/wiki/Project:Portage"
+
+# REFERENCE ONLY: this is the former portage-9999-r4, kept under 9998 so that
+# it sorts below the patch-series ebuilds. Its two large patches give the same
+# patched sources, byte for byte, as portage-9999-r9 (ladder patches 0001-0030
+# plus the native fast paths). History of the former revisions follows.
+# NOT a git checkout: this is the 3.0.83 release (same tarball and patch as
+# ::gentoo's 3.0.83-r1) plus the resolver speed patch produced by the
+# emerge-fast agent job (stage 3, round 3 winner). The 9999 version keeps it
+# above every ::gentoo release, so it stays until it is removed by hand.
+# Same plan, same merge order, same number of backtracking attempts as the
+# unpatched resolver on every tested state; six states 365 s -> 73 s.
+# -r1: C base types for the hash and equality of Task (Package, Blocker) and
+# Atom (portage.util._hashbase, built with USE=native-extensions; the Python
+# methods stay as the fallback). Same plans; emptytree resolve about 3 % faster.
+# -r2: portage.util._cfast: slot dict lookups (package metadata) and the
+# conversion of the C parser's result to Atoms; about 1.6 % more. Both modules
+# are optional: without their .so files the Python code runs as before.
+# -r3: comparisons that C code calls for every element: the ordering of
+# Package, the comparisons of the dependency priorities and cmp_sort_key;
+# about 1.6 % more. (Atom matching was ported too and measured SLOWER than
+# the Python it replaced, so it is not here.)
+# -r4: three string functions: the _pkg_str constructor, vercmp and
+# catpkgsplit (plain ASCII input; the Python functions for the rest). By
+# instruction count 1.4 % less on an emptytree resolve, 3.1 % on a world update.
+MY_P="${PN}-3.0.83"
+SRC_URI="https://gitweb.gentoo.org/proj/portage.git/snapshot/${MY_P}.tar.bz2"
+S="${WORKDIR}/${MY_P}"
+
+LICENSE="GPL-2"
+SLOT="0"
+IUSE="apidoc build doc gentoo-dev +ipc +native-extensions +rsync-verify selinux test xattr"
+REQUIRED_USE="
+	${PYTHON_REQUIRED_USE}
+	apidoc? ( || ( $(python_gen_useflags "${SPHINX_PYTHON_COMPAT[@]}") ) )
+"
+RESTRICT="!test? ( test )"
+
+BDEPEND="
+	${PYTHON_DEPS}
+	>=app-arch/tar-1.27
+	>=dev-build/meson-1.3.0-r1
+	>=sys-apps/sed-4.0.5
+	sys-devel/patch
+	!build? ( $(python_gen_impl_dep 'ssl(+)') )
+	apidoc? (
+		$(python_gen_cond_dep '
+			dev-python/sphinx[${PYTHON_USEDEP}]
+			dev-python/sphinx-epytext[${PYTHON_USEDEP}]
+		' "${SPHINX_PYTHON_COMPAT[@]}")
+	)
+	doc? (
+		~app-text/docbook-xml-dtd-4.4
+		app-text/xmlto
+	)
+	test? (
+		dev-python/pytest-xdist[${PYTHON_USEDEP}]
+		dev-vcs/git
+	)
+"
+# Require sandbox-2.2 for bug #288863.
+# For whirlpool hash, require python[ssl] (bug #425046).
+RDEPEND="
+	${PYTHON_DEPS}
+	>=acct-user/portage-0-r4
+	>=app-arch/tar-1.27
+	app-arch/zstd
+	>=app-misc/pax-utils-0.1.17
+	dev-lang/python-exec:2
+	>=sys-apps/baselayout-2.9
+	>=sys-apps/findutils-4.9
+	!build? (
+		>=app-admin/eselect-1.2
+		app-portage/getuto
+		>=app-shells/bash-5.3:0
+		dev-util/debugedit
+		>=sec-keys/openpgp-keys-gentoo-release-20240703
+		>=sys-apps/sed-4.0.5
+		rsync-verify? (
+			app-alternatives/gpg[ssl(-)]
+			>=app-portage/gemato-14.5[${PYTHON_USEDEP}]
+		)
+	)
+	kernel_linux? (
+		sys-apps/util-linux
+		elibc_glibc? ( >=sys-apps/sandbox-2.2 )
+		elibc_musl? ( >=sys-apps/sandbox-2.2 )
+	)
+	selinux? ( >=sys-libs/libselinux-2.0.94[python,${PYTHON_USEDEP}] )
+	xattr? ( kernel_linux? (
+		>=sys-apps/install-xattr-0.3
+	) )
+"
+# coreutils-6.4 rdep is for date format in emerge-webrsync #164532
+# NOTE: FEATURES=installsources requires debugedit and rsync
+PDEPEND="
+	!build? (
+		>=net-misc/rsync-2.6.4
+		>=sys-apps/coreutils-6.4
+		>=sys-apps/file-5.44-r3
+	)
+"
+
+PATCHES=(
+	"${FILESDIR}"/0001-bintree-provide-an-empty-default-for-USER_PATCHES.patch
+	"${FILESDIR}"/portage-3.0.83-emerge-fast-resolver.patch
+	"${FILESDIR}"/portage-3.0.83-native-fastpaths.patch
+)
+
+pkg_pretend() {
+	local CONFIG_CHECK="~IPC_NS ~PID_NS ~NET_NS ~UTS_NS"
+
+	check_extra_config
+}
+
+my_python_check_deps() {
+	use apidoc || return 0
+	python_has_version -b "dev-python/sphinx[${PYTHON_USEDEP}]" &&
+		python_has_version -b "dev-python/sphinx-epytext[${PYTHON_USEDEP}]"
+}
+
+src_prepare() {
+	default
+
+	if use prefix-guest; then
+		sed -e "s|^\(main-repo = \).*|\\1gentoo_prefix|" \
+			-e "s|^\\[gentoo\\]|[gentoo_prefix]|" \
+			-e "s|^\(sync-uri = \).*|\\1rsync://rsync.prefix.bitzolder.nl/gentoo-portage-prefix|" \
+			-i cnf/repos.conf || die "sed failed"
+	fi
+}
+
+src_configure() {
+	local code_only=false
+	python_foreach_impl my_src_configure
+	[[ ${code_only} == false ]] && die "Documentation and additional configuration aren't getting built as expected"
+}
+
+my_src_configure() {
+	local emesonargs=(
+		-Deprefix="${EPREFIX}"
+		-Dportage-bindir="${EPREFIX}/usr/lib/portage/${EPYTHON}"
+		-Ddocdir="${EPREFIX}/usr/share/doc/${PF}"
+		$(meson_use doc)
+		$(meson_use apidoc)
+		$(meson_use gentoo-dev)
+		$(meson_use ipc)
+		$(meson_use xattr)
+	)
+
+	if use native-extensions && [[ "${EPYTHON}" != pypy3* ]] ; then
+		emesonargs+=( -Dnative-extensions=true )
+	else
+		emesonargs+=( -Dnative-extensions=false )
+	fi
+
+	if use build; then
+		emesonargs+=( -Drsync-verify=false )
+	else
+		emesonargs+=( $(meson_use rsync-verify) )
+	fi
+
+	if [[ "${code_only}" == "false" ]] && my_python_check_deps; then
+		emesonargs+=( -Dcode-only=false )
+		code_only=true
+	else
+		emesonargs+=( -Dcode-only=true )
+	fi
+
+	meson_src_configure
+}
+
+src_compile() {
+	python_foreach_impl meson_src_compile
+}
+
+src_test() {
+	local EPYTEST_XDIST=1
+	local -x PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+	python_foreach_impl epytest
+}
+
+src_install() {
+	python_foreach_impl my_src_install
+	dotmpfiles "${FILESDIR}"/portage-{ccache,tmpdir}.conf
+
+	local scripts
+	mapfile -t scripts < <(awk '/^#!.*python/ {print FILENAME} {nextfile}' "${ED}"/usr/{bin,sbin}/* || die)
+	python_replicate_script "${scripts[@]}"
+}
+
+my_src_install() {
+	local pydirs=(
+		"${D}$(python_get_sitedir)"
+		"${ED}/usr/lib/portage/${EPYTHON}"
+	)
+
+	meson_src_install
+	python_fix_shebang "${pydirs[@]}"
+	python_optimize "${pydirs[@]}"
+}
+
+pkg_preinst() {
+	if ! use build && [[ -z ${ROOT} ]]; then
+		python_setup
+		local sitedir=$(python_get_sitedir)
+		[[ -d ${D}${sitedir} ]] || die "${D}${sitedir}: No such directory"
+		env -u DISTDIR \
+			-u PORTAGE_OVERRIDE_EPREFIX \
+			-u PORTAGE_REPOSITORIES \
+			-u PORTDIR \
+			-u PORTDIR_OVERLAY \
+			PYTHONPATH="${D}${sitedir}${PYTHONPATH:+:${PYTHONPATH}}" \
+			ED="${ED}" \
+			"${PYTHON}" -m portage._compat_upgrade.default_locations || die
+
+		env -u BINPKG_COMPRESS -u PORTAGE_REPOSITORIES \
+			PYTHONPATH="${D}${sitedir}${PYTHONPATH:+:${PYTHONPATH}}" \
+			ED="${ED}" \
+			"${PYTHON}" -m portage._compat_upgrade.binpkg_compression || die
+
+		env -u FEATURES -u PORTAGE_REPOSITORIES \
+			PYTHONPATH="${D}${sitedir}${PYTHONPATH:+:${PYTHONPATH}}" \
+			ED="${ED}" \
+			"${PYTHON}" -m portage._compat_upgrade.binpkg_multi_instance || die
+
+		env -u BINPKG_FORMAT \
+			PYTHONPATH="${D}${sitedir}${PYTHONPATH:+:${PYTHONPATH}}" \
+			ED="${ED}" \
+			"${PYTHON}" -m portage._compat_upgrade.binpkg_format || die
+	fi
+
+	# elog dir must exist to avoid logrotate error for bug #415911.
+	# This code runs in preinst in order to bypass the mapping of
+	# portage:portage to root:root which happens after src_install.
+	keepdir /var/log/portage/elog
+	# This is allowed to fail if the user/group are invalid for prefix users.
+	if chown portage:portage "${ED}"/var/log/portage{,/elog} 2>/dev/null ; then
+		chmod g+s,ug+rwx "${ED}"/var/log/portage{,/elog}
+	fi
+
+	if has_version "<${CATEGORY}/${PN}-2.3.77"; then
+		elog "The emerge --autounmask option is now disabled by default, except for"
+		elog "portions of behavior which are controlled by the --autounmask-use and"
+		elog "--autounmask-license options. For backward compatibility, previous"
+		elog "behavior of --autounmask=y and --autounmask=n is entirely preserved."
+		elog "Users can get the old behavior simply by adding --autounmask to the"
+		elog "make.conf EMERGE_DEFAULT_OPTS variable. For the rationale for this"
+		elog "change, see https://bugs.gentoo.org/658648."
+	fi
+}
+
+pkg_postinst() {
+	# Warn about obsolete "enotice" script, bug #867010
+	local bashrc=${EROOT}/etc/portage/profile/profile.bashrc
+	if [[ -e ${bashrc} ]] && grep -q enotice "${bashrc}"; then
+		eerror "Obsolete 'enotice' script detected!"
+		eerror "Please remove this from ${bashrc} to avoid problems."
+		eerror "See bug 867010 for more details."
+	fi
+}

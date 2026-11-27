@@ -1,0 +1,11 @@
+--- a/src/scanner/discovery.ts
++++ b/src/scanner/discovery.ts
+@@ -575,6 +575,8 @@
+ ): void {
+   const relativePath = toPosixPath(relative(scanRoot, fullPath));
+   if (seenFiles.has(relativePath)) return;
++  // A directory named like a config file (e.g. a plugin's ".clinerules/" folder) is not one: reading it threw EISDIR.
++  if (statSync(fullPath).isDirectory()) return;
+ 
+   const content = readFileSync(fullPath, "utf-8");
+   files.push({ path: relativePath, type, content });

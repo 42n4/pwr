@@ -1,0 +1,11 @@
+DEFINED_PHASES=install prepare
+DESCRIPTION=Linter for AI agent context files: README overlap, inferable content
+EAPI=8
+HOMEPAGE=https://github.com/ctxlint/Ctxlint
+KEYWORDS=~amd64 ~arm64
+LICENSE=MIT
+RDEPEND=>=net-libs/nodejs-18 sys-apps/bubblewrap
+RESTRICT=test
+SLOT=0
+SRC_URI=https://github.com/ctxlint/Ctxlint/archive/0a6e86a4e4256816ce417b952063382e0dc45c60.tar.gz -> ctxlint-1.1.2_p20260413.tar.gz
+_md5_=2a2a113302931598084739469427e6f6

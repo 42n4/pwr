@@ -1,0 +1,238 @@
+dep, versions: one-atom match path, slot reads for Atom attributes, unbounded version caches
+
+Sub-series: H (atom matching caches) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+match_from_list() with one plain Atom and a one-element list is the
+resolver's most frequent match. A short path (_match_single) performs the
+same tests in the same order for the common atom kinds (no operator, or
+> >= < <=, with or without slot) and leaves blockers, wildcards, repo
+atoms, = =* ~ and USE dependencies to the original code. The kind of an
+atom is computed once and kept in a new slot (_match_kind).
+
+vercmp() and catpkgsplit() get unbounded lru caches (they had 1,024 and
+10,240 entries, fewer than the distinct arguments of one run). Both are
+pure functions of their arguments.
+
+Fifteen Atom properties that only return one slot (cp, cpv, slot,
+operator, use, unevaluated_atom, ...) are replaced on the class by the slot
+descriptors themselves, so reading them needs no Python call.
+
+This is patch 0021 of the 25-patch ladder without its fourth piece, the
+string-keyed atom caches in _emerge, which changes a line of patch 0002
+and is now patch 0028 (sub-series A). The figures that follow are those of
+the four pieces together, on top of patches 0001-0020, resolve seconds
+before -> after (median of the runs, at least 2 per figure):
+  start 25.7 -> 24.0, holds 12.9 -> 12.2, masks 27.2 -> 25.4,
+  py313 15.8 -> 15.1, bdeps 18.5 -> 17.5, policykit 13.2 -> 12.4
+  sum of six 113.3 -> 106.6 (-6.6 s, -1.5 % of the stock sum 447.5)
+Alone on 0001-0009 none of the pieces was distinguishable from noise on
+the start state. The three pieces kept here alone on stock 3.0.83: see
+README (sub-series H).
+
+Weak spots and what was not checked:
+* A second implementation of part of match_from_list() that has to be kept
+  in step with it.
+* The two caches now grow without bound for the life of the process (a
+  concern for long-running API users, not for emerge).
+* The attributes become assignable: a property without a setter raised
+  AttributeError on assignment, a slot descriptor does not. Whether any code
+  assigns them was not searched.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21; cut out of its
+former patch on 2026-11-21 without changing a line of code. Not a
+human-written change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on
+six states of one system image, one resolve at a time; every run gave the
+same merge list in the same order, the same number of backtracking attempts
+and the same package count as unpatched 3.0.83.
+---
+--- a/lib/portage/dep/__init__.py
++++ b/lib/portage/dep/__init__.py
+@@ -1892,6 +1892,7 @@
+         "_eapi",
+         "_extended_syntax",
+         "_intern_key",
++        "_match_kind",
+         "_operator",
+         "_orig_atom",
+         "_repo",
+@@ -2645,6 +2646,32 @@
+         return bool(match_from_list(self, (pkg,)))
+ 
+ 
++# The properties of Atom that only return the value of one slot are replaced
++# by the descriptor of that slot, which the interpreter reads without calling
++# a Python function (these attributes are read millions of times per
++# resolver run). Reading gives the same value, and raises AttributeError in
++# the same case (slot not set). The property definitions in the class body
++# remain as the documentation of the attributes.
++for _atom_property, _atom_slot in (
++    ("cp", "_cp"),
++    ("cpv", "_cpv"),
++    ("version", "_version"),
++    ("repo", "_repo"),
++    ("slot", "_slot"),
++    ("sub_slot", "_sub_slot"),
++    ("slot_operator", "_slot_operator"),
++    ("operator", "_operator"),
++    ("blocker", "_blocker_obj"),
++    ("eapi", "_eapi"),
++    ("extended_syntax", "_extended_syntax"),
++    ("build_id", "_build_id"),
++    ("use", "_use"),
++    ("unevaluated_atom", "_unevaluated_atom"),
++    ("orig_atom", "_orig_atom"),
++):
++    setattr(Atom, _atom_property, Atom.__dict__[_atom_slot])
++del _atom_property, _atom_slot
++
+ _extended_cp_re_cache = {}
+ 
+ 
+@@ -3193,6 +3220,93 @@
+     return bestm
+ 
+ 
++_match_kinds = {">": 2, ">=": 3, "<": 4, "<=": 5}
++
++
++def _match_kind_init(mydep):
++    """
++    Classify an Atom for _match_single() and remember the class in the
++    atom: 1 if match_from_list() takes its "operator is None" branch for
++    it, 2 to 5 for the operators > >= < <=, and 0 if _match_single() is
++    not to be used (blockers, wildcard atoms, atoms with a repository, the
++    operators = =* ~, and the atoms for which match_from_list() raises or
++    prints a message). These are the statements of match_from_list() up to
++    its branch on the operator; they depend on nothing but the atom, which
++    is immutable.
++    """
++    kind = 0
++    if not mydep.blocker and not mydep.extended_syntax and not mydep.repo:
++        mycpv = mydep.cpv
++        mycpv_cps = catpkgsplit(mycpv)
++        if not mycpv_cps:
++            kind = 1
++        elif mydep != mycpv:
++            if mycpv_cps[2] and mycpv_cps[3]:
++                kind = _match_kinds.get(mydep.operator, 0)
++            else:
++                kind = 1
++    mydep._match_kind = kind
++    return kind
++
++
++def _match_single(mydep, x, kind):
++    """
++    Whether match_from_list(mydep, [x]) returns [x] (True) or [] (False),
++    for an Atom of a kind that _match_kind_init() accepts and a candidate
++    that has a cp attribute (a _pkg_str, a Package, an Atom); None if that
++    has to be found out by match_from_list() itself. The resolver matches
++    one atom against one package several hundred thousand times per run.
++
++    This performs, for the one candidate, the tests of match_from_list() in
++    their order: the cp ("operator is None" branch) or the cp and the
++    version comparison (> >= < <=), then the slot, then USE, and nothing
++    else, since the atom has no repository. Only attributes are read that
++    match_from_list() reads at the same point for a candidate that got as
++    far (in particular the "use" attribute, which a Package computes
++    lazily). The USE dependencies themselves are left to
++    match_from_list(), as is everything unusual.
++    """
++    try:
++        cp = x.cp
++    except AttributeError:
++        return None
++    if cp != mydep._cp:
++        return False
++    if kind != 1:
++        try:
++            result = vercmp(x.version, mydep._version)
++        except ValueError:
++            return None
++        if result is None:
++            return False
++        if kind == 2:
++            if not result > 0:
++                return False
++        elif kind == 3:
++            if not result >= 0:
++                return False
++        elif kind == 4:
++            if not result < 0:
++                return False
++        elif not result <= 0:
++            return False
++    if mydep._slot is not None:
++        try:
++            x.cpv
++        except AttributeError:
++            return None
++        try:
++            x.slot
++        except AttributeError:
++            pass
++        else:
++            if not _match_slot(mydep, x):
++                return False
++    if mydep._unevaluated_atom._use and hasattr(x, "use"):
++        return None
++    return True
++
++
+ def match_from_list(mydep: Union[str, Atom], candidate_list):
+     """
+     Searches list for entries that matches the package.
+@@ -3207,6 +3321,25 @@
+     if not candidate_list:
+         return []
+ 
++    # match-single begin
++    if (
++        mydep.__class__ is Atom
++        and candidate_list.__class__ is list
++        and len(candidate_list) == 1
++    ):
++        # See _match_single().
++        try:
++            kind = mydep._match_kind
++        except AttributeError:
++            kind = _match_kind_init(mydep)
++        if kind:
++            verdict = _match_single(mydep, candidate_list[0], kind)
++            if verdict is not None:
++                if verdict:
++                    return [candidate_list[0]]
++                return []
++    # match-single end
++
+     if isinstance(mydep, Atom):
+         if mydep.blocker:
+             mydep = Atom(str(mydep).lstrip("!"), allow_wildcard=True, allow_repo=True)
+--- a/lib/portage/versions.py
++++ b/lib/portage/versions.py
+@@ -110,7 +110,11 @@
+     return False
+ 
+ 
+-@lru_cache(1024)
++# Unbounded (it was 1024 entries): the resolver compares many more distinct
++# pairs of versions than that, again and again, and the function is a pure
++# function of its arguments (no caller passes silent=0, the only thing
++# that makes it print), so a larger cache returns the same values.
++@lru_cache(None)
+ def vercmp(ver1: str, ver2: str, silent: int = 1) -> Optional[int]:
+     """
+     Compare two versions
+@@ -312,7 +316,9 @@
+ _missing_cat = "null"
+ 
+ 
+-@lru_cache(10240)
++# Unbounded (it was 10240 entries, fewer than the cpvs that one resolver run
++# splits): a pure function of its arguments, silent is not used.
++@lru_cache(None)
+ def catpkgsplit(
+     mydata: Union[str, "_pkg_str"],
+     silent: int = 1,

@@ -1,0 +1,97 @@
+depgraph: remember that the runtime cycle search found nothing for a graph state
+
+Sub-series: B (cycle search and frontier) - patch 2 of 6; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs none: it also applies to 3.0.83 by itself.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+A mutation counter in the frontier identifies the graph state; a search
+that came back empty for a state would come back empty again.
+Alone on 3.0.83: start 119.6 -> 112.2; no effect on short merge lists.
+Applies to upstream head unchanged.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -10291,6 +10291,10 @@
+             frontier = _SerializeFrontier(mygraph)
+             mygraph.frontier = frontier
+ 
++        # local_priority_range -> the search state for which the runtime
++        # cycle search of that range last came back empty.
++        no_cycle_memo = {}
++
+         while mygraph:
+             selected_nodes = None
+             ignore_priority = None
+@@ -10471,6 +10475,23 @@
+                     priority_ranges.append(DepPrioritySatisfiedRange)
+ 
+                 for local_priority_range in priority_ranges:
++                    search_state = None
++                    if frontier is not None:
++                        # Everything the search below reads besides constants:
++                        # the graph, scheduled_uninstalls (only grows) and the
++                        # asap/priority_range selection state. When the search
++                        # for this range found nothing in this very state, it
++                        # would find nothing again (this happens each time the
++                        # loop comes back with drop_satisfied set).
++                        search_state = (
++                            frontier.mutations,
++                            len(scheduled_uninstalls),
++                            priority_range,
++                            tuple(asap_nodes) if prefer_asap and asap_nodes else None,
++                        )
++                        if no_cycle_memo.get(local_priority_range) == search_state:
++                            selected_nodes, ignore_priority = None, None
++                            continue
+                     if frontier is not None:
+                         # ignore_medium is ignore_priority[MEDIUM] for both
+                         # ranges, and frontier_leaves() returns the nodes of
+@@ -10495,6 +10516,8 @@
+                         )
+                         if selected_nodes:
+                             break
++                        if search_state is not None:
++                            no_cycle_memo[local_priority_range] = search_state
+ 
+                 if not selected_nodes:
+                     if prefer_asap and asap_nodes:
+diff -ruN a/lib/_emerge/_serialize_frontier.py b/lib/_emerge/_serialize_frontier.py
+--- a/lib/_emerge/_serialize_frontier.py
++++ b/lib/_emerge/_serialize_frontier.py
+@@ -71,6 +71,9 @@
+         self._by_index = {}
+         # per-level min-heap of order-indices for nodes currently leaf under it
+         self._ready = [[] for _ in range(nlevels)]
++        # Mutation journal: every change of the graph goes through
++        # remove() or add_edge(), so this number identifies its state.
++        self.mutations = 0
+ 
+         for i, node in enumerate(graph.order):
+             self._index[node] = i
+@@ -160,6 +163,7 @@
+         node_data = self._graph.nodes.get(node)
+         if node_data is None:
+             return
++        self.mutations += 1
+         children, parents, _ = node_data
+         edge_mask = self._edge_mask
+         surv = self._surv
+@@ -213,6 +217,7 @@
+         counts only increase. A parent may leave a level's ready set; that is
+         handled lazily on pop.
+         """
++        self.mutations += 1
+         self._assign_index(node)
+         if not parent:
+             return

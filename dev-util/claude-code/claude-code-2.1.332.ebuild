@@ -1,0 +1,78 @@
+# Copyright 1999-2026 Gentoo Authors
+# Distributed under the terms of the GNU General Public License v2
+
+EAPI=8
+
+# Copied from ::gentoo dev-util/claude-code-2.1.325, bumped to 2.1.329.
+# Difference: the managed settings file no longer forces
+# CLAUDE_CODE_CERT_STORE=system. A managed "env" value replaces the user's,
+# so with it set nobody could choose the certificate store in
+# ~/.claude/settings.json. The two remaining keys stay: without them a
+# root-owned /opt/bin/claude tries to update itself into the home directory.
+# -r1: sys-apps/ripgrep is optional (USE=system-ripgrep). The binary carries
+# its own ripgrep ("exec -a rg /opt/bin/claude --version" prints it) and uses
+# it unless USE_BUILTIN_RIPGREP=0, so the hard dependency only blocked hosts
+# where Rust packages cannot be built (cross-compiled ARM images).
+
+DESCRIPTION="Claude Code - an agentic coding tool by Anthropic"
+HOMEPAGE="https://claude.com/product/claude-code"
+
+# NOTE(JayF): Claude code's official install method is now curl|bash
+#             the script is simple: it fetches the latest version,
+#             downloads a manifest of files for that version, and
+#             downloads a single binary claude executable matching.
+GCS_BUCKET="https://downloads.claude.ai/claude-code-releases"
+SRC_URI="
+	amd64? (
+		elibc_glibc? ( ${GCS_BUCKET}/${PV}/linux-x64/claude -> claude-amd64-glibc-${PV} )
+		elibc_musl?  ( ${GCS_BUCKET}/${PV}/linux-x64-musl/claude -> claude-amd64-musl-${PV} )
+	)
+	arm64? (
+		elibc_glibc? ( ${GCS_BUCKET}/${PV}/linux-arm64/claude -> claude-arm64-glibc-${PV} )
+		elibc_musl?  ( ${GCS_BUCKET}/${PV}/linux-arm64-musl/claude -> claude-arm64-musl-${PV} )
+	)"
+S="${WORKDIR}"
+
+# NOTE(JayF): claude-code is only usable via paid subscription and has a
+#             clickthrough EULA-type license. Please see $HOMEPAGE for
+#             full details.
+LICENSE="all-rights-reserved"
+SLOT="0"
+KEYWORDS="-* ~amd64 ~arm64"
+QA_PREBUILT="opt/bin/claude"
+
+IUSE="cpu_flags_x86_avx cpu_flags_x86_avx2 system-ripgrep"
+
+RDEPEND="system-ripgrep? ( sys-apps/ripgrep )"
+REQUIRED_USE="amd64? ( cpu_flags_x86_avx cpu_flags_x86_avx2 )"
+
+RESTRICT="bindist mirror strip"
+
+src_compile() {
+	# Skip, nothing to compile here.
+	:
+}
+
+src_install() {
+	# NOTE(JayF) Literally the file we download is all there is to
+	#            install. It's just a binary. No docs. Nothing else.
+	exeinto /opt/bin
+	newexe "${DISTDIR}/${A[0]}" claude
+
+	insinto /etc/${PN}
+	newins "${FILESDIR}/managed-settings-native-r1.json" managed-settings.json
+	if use system-ripgrep; then
+		sed -i -e 's|^  "env": {$|&\n    "USE_BUILTIN_RIPGREP": "0",|' \
+			"${ED}/etc/${PN}/managed-settings.json" || die
+		grep -q USE_BUILTIN_RIPGREP "${ED}/etc/${PN}/managed-settings.json" \
+			|| die "system-ripgrep: managed settings were not updated"
+	fi
+}
+
+pkg_postinst() {
+	if ! grep -q DISABLE_INSTALLATION_CHECKS /etc/claude-code/managed-settings.json; then
+		ewarn "Ensure you run etc-update or dispatch-conf before executing claude."
+		ewarn "Failure to properly integrate changes to /etc/claude-code/managed-settings.json"
+		ewarn "may lead to claude installing itself to your homedir without asking."
+	fi
+}

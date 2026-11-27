@@ -1,0 +1,109 @@
+portdbapi: aux_get() answers from a valid cache entry without the event loop
+
+Sub-series: O (stage 4, round 2) - patch 2 of 3; applies without the other patches of O.
+Base: upstream 73646c35d.
+
+aux_get() runs async_aux_get() through run_until_complete(), which costs a task
+and two passes of the loop per call, although the coroutine awaits nothing when
+the answer is in _aux_cache or the ebuild has a valid metadata cache entry. A
+resolve makes several thousand such calls. _aux_get_no_wait() holds the
+statements of async_aux_get() up to its first await, in the same order; in every
+other case (unknown repository, malformed cpv, ebuild not found, no valid cache
+entry) it returns None and aux_get() runs async_aux_get() as before, which
+reports the problem or runs the metadata phase.
+Maintenance: the two bodies must be kept in step when async_aux_get() changes.
+
+Judge, medians: 0033 and 0034 together on 0001-0031: 88.6 s -> 85.3 s (four
+passes); 0033 alone 85.8 against 87.2 s (three passes, inside the noise).
+Lock-step counters of the author: 59,743 no-wait answers, 895 fallbacks,
+0 mismatches. See 0032 for origin and for why there is no author report.
+Origin: written by AI agents (Claude) in stage 4 of the emerge-fast job, 2026-11-21, on
+upstream commit 73646c35d with patches 0001-0030 and the C modules applied. Not a
+human-written change. Judge: `emerge -p -uND @world` on six states of one system image, six
+resolves in parallel, wall seconds summed; every run gave the same merge list in the same
+order and the same number of backtracking attempts as unpatched 73646c35d. Black-box
+testers (invented states, reference against candidate): 0 differences.
+
+--- a/lib/portage/dbapi/porttree.py
++++ b/lib/portage/dbapi/porttree.py
+@@ -633,6 +633,10 @@
+         "stub code for returning auxiliary db information, such as SLOT, DEPEND, etc."
+         'input: "sys-apps/foo-1.0",["SLOT","DEPEND","HOMEPAGE"]'
+         'return: ["0",">=sys-libs/bar-1.0","http://www.foo.com"] or raise PortageKeyError if error'
++        # stage4: see _aux_get_no_wait().
++        ret = self._aux_get_no_wait(mycpv, mylist, mytree, myrepo)
++        if ret is not None:
++            return ret
+         # For external API consumers, self._event_loop returns a new event
+         # loop on each access, so a local reference is needed in order
+         # to avoid instantiating more than one.
+@@ -641,6 +645,69 @@
+             self.async_aux_get(mycpv, mylist, mytree=mytree, myrepo=myrepo, loop=loop)
+         )
+ 
++    def _aux_get_no_wait(self, mycpv, mylist, mytree, myrepo):
++        """
++        stage4: what async_aux_get() returns when it has nothing to wait
++        for, i.e. when the answer is in self._aux_cache or the ebuild has a
++        valid metadata cache entry; None in every other case (unknown
++        repository, malformed cpv, ebuild not found, no valid cache entry),
++        and then aux_get() runs async_aux_get() as before, which reports
++        the problem or runs the metadata phase. These are the statements
++        of async_aux_get() up to its first await, in the same order, so the
++        same values are returned, the same entry is stored in
++        self._aux_cache and the same exception leaves _pull_valid_cache()
++        for an ebuild file that has vanished. A coroutine that ends without
++        awaiting gains nothing from an event loop, but run_until_complete()
++        costs a task and two passes of the loop per call, and a resolve
++        makes several thousand of these calls, one per ebuild it looks at.
++        After a None, async_aux_get() repeats findname2() and
++        _pull_valid_cache(); they answer the same again.
++        """
++        cache_me = False
++        if myrepo is not None:
++            mytree = self.treemap.get(myrepo)
++            if mytree is None:
++                return None
++
++        if (
++            mytree is not None
++            and len(self.porttrees) == 1
++            and mytree == self.porttrees[0]
++        ):
++            mytree = None
++            myrepo = None
++
++        if mytree is None:
++            cache_me = True
++        if mytree is None and not self._known_keys.intersection(mylist).difference(
++            self._aux_cache_keys
++        ):
++            aux_cache = self._aux_cache.get(mycpv)
++            if aux_cache is not None:
++                return [aux_cache.get(x, "") for x in mylist]
++            cache_me = True
++
++        if "/" not in mycpv:
++            return None
++
++        myebuild, mylocation = self.findname2(mycpv, mytree)
++        if not myebuild:
++            return None
++
++        mydata, ebuild_hash = self._pull_valid_cache(mycpv, myebuild, mylocation)
++        if mydata is None:
++            return None
++
++        return self._aux_get_return(
++            mycpv,
++            mylist,
++            myebuild,
++            ebuild_hash,
++            mydata,
++            mylocation,
++            cache_me,
++        )
++
+     async def async_aux_get(self, mycpv, mylist, mytree=None, myrepo=None, loop=None):
+         """
+         Asynchronous form form of aux_get.

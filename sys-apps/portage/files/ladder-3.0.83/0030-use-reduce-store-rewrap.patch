@@ -1,0 +1,36 @@
+dep: re-wrap one line of _copy_dep_lists (no code change)
+
+Sub-series: C (use_reduce parser) - patch 3 of 3; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs 0008 only.
+
+One line of _copy_dep_lists(), the helper that patch 0008 adds, is
+re-wrapped so that the series ends byte-identical to the tested tree. No
+code change, nothing to measure. With this patch the tree is the tested
+Python tree (the s10 arm of the ladder run).
+
+This hunk was part of patch 0025 of the 25-patch ladder
+(config-trims-and-leftovers). It is a patch of its own because it is the
+only line of 0025 that needs another patch (0008), which would have tied
+the leftovers to sub-series C.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21; cut out of its
+former patch on 2026-11-21 without changing a line of code. Not a
+human-written change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on
+six states of one system image, one resolve at a time; every run gave the
+same merge list in the same order, the same number of backtracking attempts
+and the same package count as unpatched 3.0.83.
+---
+--- a/lib/portage/dep/__init__.py
++++ b/lib/portage/dep/__init__.py
+@@ -641,7 +641,9 @@
+     Return a copy of a use_reduce result in which every (nested) list is a
+     new list, holding the very same tokens.
+     """
+-    return [_copy_dep_lists(x) if x.__class__ is list else x for x in dep_struct]
++    return [
++        _copy_dep_lists(x) if x.__class__ is list else x for x in dep_struct
++    ]
+ 
+ 
+ # Results of _use_reduce_parse by argument tuple. The values are private

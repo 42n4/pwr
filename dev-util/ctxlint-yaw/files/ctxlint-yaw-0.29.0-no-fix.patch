@@ -1,0 +1,132 @@
+diff --git a/src/cli.ts b/src/cli.ts
+index 732e79f..ba5dac6 100644
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -70,10 +70,6 @@ export async function runCli() {
+     )
+     .option('--tokens', 'Show token breakdown per file', false)
+     .option('--verbose', 'Show passing checks too', false)
+-    .option('--fix', 'Auto-fix broken paths using git history and fuzzy matching', false)
+-    .option('--fix-dry-run', 'Preview --fix changes without writing', false)
+-    .option('--yes', 'Skip interactive confirmation prompts (required for --fix in TTY)', false)
+-    .option('--follow-symlinks', 'Allow --fix to write through symlinks (default: skip)', false)
+     .option('--ignore <checks>', 'Comma-separated list of checks to ignore', '')
+     .option('--quiet', 'Suppress all output except errors (exit code only)', false)
+     .option('--config <path>', 'Path to config file (default: .ctxlintrc in project root)')
+diff --git a/src/core/fixer.ts b/src/core/fixer.ts
+index 71d10ef..4e37a38 100644
+--- a/src/core/fixer.ts
++++ b/src/core/fixer.ts
+@@ -94,7 +94,9 @@ function jsonValidity(text: string): JsonValidity {
+ 
+ export function applyFixes(result: LintResult, options: FixOptions = {}): FixSummary {
+   const log = options.quiet ? () => {} : console.log.bind(console);
+-  const dryRun = options.dryRun ?? false;
++  // LOCAL (appz-config/no-fix.patch): this build never writes. The fuzzy matcher rewrote curated context files
++  // with wrong paths, so applyFixes only ever previews, whatever the caller asks for.
++  const dryRun = true;
+   const skipSymlinks = options.skipSymlinks ?? true;
+ 
+   // Collect all fixable issues grouped by target file, skipping symlinks.
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index 081c45b..4d85a3c 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -369,96 +369,7 @@ server.tool(
+   },
+ );
+ 
+-server.tool(
+-  'ctxlint_fix',
+-  'Run the selected context-file checks and apply every auto-fix they emit, writing the context files in place. Today only the paths check emits fixes: a broken file path is rewritten to its git-rename target or a close fuzzy match. Returns a summary of what was fixed. Pass dryRun: true to preview what would be fixed without writing any files.',
+-  {
+-    projectPath: z
+-      .string()
+-      .optional()
+-      .describe('Path to the project root. Defaults to current working directory.'),
+-    checks: z
+-      .array(contextCheckEnum)
+-      .optional()
+-      .describe('Which context-file checks to run before fixing. Defaults to all.'),
+-    dryRun: z
+-      .boolean()
+-      .optional()
+-      .describe(
+-        'If true, simulate fixes and report what would change without writing any files. Returns accurate counts.',
+-      ),
+-  },
+-  {
+-    // ctxlint_fix writes to disk via applyFixes() → fs.writeFileSync, so it
+-    // must advertise destructiveHint: true. Hosts (Claude Code, Cursor, etc.)
+-    // use this to decide whether to require user confirmation before the call.
+-    readOnlyHint: false,
+-    destructiveHint: true,
+-    idempotentHint: true,
+-    openWorldHint: false,
+-  },
+-  async ({ projectPath, checks, dryRun }) => {
+-    try {
+-      const root = validateProjectPath(projectPath);
+-      const activeChecks = checks?.length ? (checks as CheckName[]) : ALL_CHECKS;
+-      const config = safeLoadConfig(root);
+-      const result = await runAudit(root, activeChecks, {
+-        exclude: config?.exclude,
+-        ignoreRules: config?.ignoreRules,
+-      });
+-      const fixSummary = applyFixes(result, { quiet: true, dryRun: dryRun ?? false });
+-
+-      // applyFixes wrote to disk, so the pre-fix summary no longer describes
+-      // the project. Re-audit before reporting `remainingIssues` -- returning
+-      // the pre-fix counts (which include every issue just fixed) tells the
+-      // host agent the fixes did nothing. Skip the second audit when nothing
+-      // was written: the pre-fix summary is still accurate then.
+-      // Also skip the re-audit in dry-run mode: no files were written, so
+-      // remainingIssues reflects the pre-fix (unfixed) state intentionally.
+-      let remaining = result.summary;
+-      if (!dryRun && fixSummary.totalFixes > 0) {
+-        resetGit();
+-        resetPathsCache();
+-        resetPackageJsonCache();
+-        const postFix = await runAudit(root, activeChecks, {
+-          exclude: config?.exclude,
+-          ignoreRules: config?.ignoreRules,
+-        });
+-        remaining = postFix.summary;
+-      }
+-
+-      return {
+-        content: [
+-          {
+-            type: 'text' as const,
+-            text: JSON.stringify(
+-              {
+-                totalFixes: fixSummary.totalFixes,
+-                filesModified: fixSummary.filesModified,
+-                remainingIssues: remaining,
+-                ...(dryRun ? { dryRun: true } : {}),
+-              },
+-              null,
+-              2,
+-            ),
+-          },
+-        ],
+-      };
+-    } catch (err) {
+-      const msg = err instanceof Error ? err.message : String(err);
+-      return {
+-        content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
+-        isError: true,
+-      };
+-    } finally {
+-      freeEncoder();
+-      resetGit();
+-      resetPathsCache();
+-      resetPackageJsonCache();
+-    }
+-  },
+-);
+-
++// LOCAL (appz-config/no-fix.patch): the ctxlint_fix tool is removed; it gave the calling agent a write to disk.
+ server.tool(
+   'ctxlint_mcp_audit',
+   'Lint MCP server configuration files in a project. Checks for schema errors, hardcoded secrets, deprecated transports, wrong env var syntax, URL issues, and cross-client inconsistencies.',

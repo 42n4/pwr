@@ -1,0 +1,14 @@
+BDEPEND=>=net-libs/nodejs-20[npm]
+DEFINED_PHASES=compile install postinst prepare
+DESCRIPTION=Linter for AI agent context files, MCP configs and Claude Code skills (YawLabs)
+EAPI=8
+HOMEPAGE=https://github.com/YawLabs/ctxlint
+INHERIT=edo
+KEYWORDS=~amd64 ~arm64
+LICENSE=MIT ISC BSD BSD-2 Apache-2.0
+RDEPEND=>=net-libs/nodejs-20 dev-vcs/git sys-apps/bubblewrap
+RESTRICT=network-sandbox test
+SLOT=0
+SRC_URI=https://github.com/YawLabs/ctxlint/archive/refs/tags/v0.29.0.tar.gz -> ctxlint-yaw-0.29.0.tar.gz
+_eclasses_=edo	e472083829a6e7ff43a197cf536728a2	edob	357e125b8c5cad0deccb625e537ea831
+_md5_=9672493528a71e5de3d2d640ad4e42bb

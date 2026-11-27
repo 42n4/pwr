@@ -7,8 +7,14 @@
 #    ResourceManager.cpp to DetectionManager.cpp) and is obsolete anyway on
 #    merged-usr profiles: the code now probes /usr/lib/udev/rules.d, exactly
 #    where udev_dorules lands via the /lib -> usr/lib merge.
-#  - Adds the Gainward RTX 5070 Ti Phoenix I2C detector (sub-device 0xF323),
-#    not yet upstream — this host's GPU.
+#  - The Gainward RTX 5070 Ti Phoenix detector (sub-device 0xF323, this
+#    host's GPU) was a local patch until 2026-11-12; upstream now carries it.
+#  - Adds the ASUS ROG Swift PG34WCDN (0b05:1d38) to AsusMonitorController —
+#    this host's monitor; same HID profile as the PG32UCDM generation.
+# 2026-10-16: openrgb-9999-exit-and-concurrency-crashes.patch — two SIGSEGVs
+# in short CLI runs (Aura USB "delete this" in a constructor; Logitech HID++
+# receiver watchers joined after their statics were destroyed). Drop once
+# upstream fixes both.
 # 2026-09-03: dropped OpenRGB-0.7-r1-udev.patch — upstream 7854c491
 # (2026-08-24) removed udev rules from the repo AND the build entirely; the
 # executable generates them now (--print-udev-rules), and the .pro installs a
@@ -48,7 +54,8 @@ BDEPEND="
 "
 
 PATCHES=(
-	"${FILESDIR}"/openrgb-9999-gainward-rtx5070ti-phoenix.patch
+	"${FILESDIR}"/openrgb-9999-asus-pg34wcdn-monitor.patch
+	"${FILESDIR}"/openrgb-9999-exit-and-concurrency-crashes.patch
 )
 
 CHECKREQS_DISK_BUILD="2G"

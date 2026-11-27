@@ -1,0 +1,168 @@
+DepPriority: copy priorities slot by slot, build them from templates
+
+Sub-series: J (priority copy) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
+Unchanged, but the patch before it is now required-use-memo (probe-certain-atoms, the old 0022, is 0029); the step figures below are those of the old order.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+A priority object is created or copied for every dependency.
+AbstractDepPriority.copy() does what copy.copy() does for a slots-only
+class without the __reduce_ex__ detour, DepPriority.copy() assigns its ten
+slots directly, and depgraph._priority() keeps one template per
+combination of flag arguments (True/False/None only) and returns copies.
+
+On top of patches 0001-0022, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 23.0 -> 22.1, holds 11.8 -> 11.5, masks 24.1 -> 23.4,
+  py313 14.4 -> 14.0, bdeps 16.9 -> 16.2, policykit 12.0 -> 11.7
+  sum of six 102.2 -> 98.8 (-3.4 s, -0.8 % of the stock sum 447.5)
+Patches 0001-0023 together: 447.5 -> 98.8 s (-78 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Kept as its own small patch: it is a different mechanism from 0017 (copying,
+not constructing), and in the second order that was measured (chain-
+prelim2), where it followed 0017 directly, its step was about 5 s.
+
+Weak spots and what was not checked:
+* Uses copyreg._slotnames(), a private helper of the standard library.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/AbstractDepPriority.py b/lib/_emerge/AbstractDepPriority.py
+--- a/lib/_emerge/AbstractDepPriority.py
++++ b/lib/_emerge/AbstractDepPriority.py
+@@ -2,6 +2,7 @@
+ # Distributed under the terms of the GNU General Public License v2
+ 
+ import copy
++import copyreg
+ 
+ from portage.util.SlotObject import SlotObject
+ 
+@@ -35,4 +36,45 @@
+         return self.__int__() >= other
+ 
+     def copy(self):
+-        return copy.copy(self)
++        # What copy.copy() does for an instance of a class that has only
++        # slots and no hooks of its own for copying or pickling: a new
++        # object from cls.__new__(cls), then setattr() for every slot that
++        # is set, the slot names coming from copyreg._slotnames(). Doing it
++        # here skips the detour through __reduce_ex__(), which is slow, and
++        # priorities are copied for every dependency. Any other class goes
++        # through copy.copy() as before.
++        cls = self.__class__
++        slot_names = _copy_slot_names.get(cls)
++        if slot_names is None:
++            slot_names = _copy_slot_names[cls] = _get_copy_slot_names(cls)
++        if slot_names is False:
++            return copy.copy(self)
++        result = cls.__new__(cls)
++        for name in slot_names:
++            try:
++                value = getattr(self, name)
++            except AttributeError:
++                continue
++            setattr(result, name, value)
++        return result
++
++
++# class -> tuple of slot names for AbstractDepPriority.copy(), or False if
++# the class has to be copied by copy.copy().
++_copy_slot_names = {}
++
++
++def _get_copy_slot_names(cls):
++    if (
++        cls.__dictoffset__ != 0
++        or getattr(cls, "__copy__", None) is not None
++        or cls in copyreg.dispatch_table
++        or cls.__reduce_ex__ is not object.__reduce_ex__
++        or cls.__reduce__ is not object.__reduce__
++        or cls.__getstate__ is not object.__getstate__
++        or hasattr(cls, "__setstate__")
++        or hasattr(cls, "__getnewargs__")
++        or hasattr(cls, "__getnewargs_ex__")
++    ):
++        return False
++    return tuple(copyreg._slotnames(cls))
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -313,6 +313,10 @@
+         self.mergelist = mergelist
+ 
+ 
++# (priority class, keyword arguments) -> instance, see depgraph._priority.
++_priority_templates = {}
++
++
+ class _ProbeMemo:
+     """
+     Memo tables for the probe helpers that _slot_operator_trigger_reinstalls
+@@ -5642,7 +5646,22 @@
+             priority_constructor = UnmergeDepPriority
+         else:
+             priority_constructor = DepPriority
+-        return priority_constructor(**kwargs)
++        # The constructor is a pure function of its keyword arguments, and
++        # the same few combinations of flags are asked for with every
++        # dependency. So each combination is constructed once, and after
++        # that a copy of that instance is returned, which has the same class
++        # and the same attribute values as a newly constructed one (the
++        # instance kept here is never handed out, so nobody modifies it).
++        # Only for arguments that are True, False or None: these are
++        # singletons, so an equal key means identical arguments.
++        for value in kwargs.values():
++            if value is not True and value is not False and value is not None:
++                return priority_constructor(**kwargs)
++        key = (priority_constructor, tuple(kwargs.items()))
++        template = _priority_templates.get(key)
++        if template is None:
++            template = _priority_templates[key] = priority_constructor(**kwargs)
++        return template.copy()
+ 
+     def _cross(self, eroot):
+         """
+diff -ruN a/lib/_emerge/DepPriority.py b/lib/_emerge/DepPriority.py
+--- a/lib/_emerge/DepPriority.py
++++ b/lib/_emerge/DepPriority.py
+@@ -7,6 +7,31 @@
+ class DepPriority(AbstractDepPriority):
+     __slots__ = ("cross", "ignored", "optional", "satisfied")
+ 
++    def copy(self):
++        # What AbstractDepPriority.copy() does for an instance of exactly
++        # this class with all ten slots set (they are, after __init__ or
++        # copy): a new instance with the same slot values. If a slot is not
++        # set, the attribute error sends it to the generic code, which
++        # copies the slots that are set. The resolver copies a priority for
++        # every dependency it adds.
++        if self.__class__ is not DepPriority:
++            return AbstractDepPriority.copy(self)
++        result = DepPriority.__new__(DepPriority)
++        try:
++            result.buildtime = self.buildtime
++            result.buildtime_slot_op = self.buildtime_slot_op
++            result.installtime = self.installtime
++            result.runtime = self.runtime
++            result.runtime_post = self.runtime_post
++            result.runtime_slot_op = self.runtime_slot_op
++            result.cross = self.cross
++            result.ignored = self.ignored
++            result.optional = self.optional
++            result.satisfied = self.satisfied
++        except AttributeError:
++            return AbstractDepPriority.copy(self)
++        return result
++
+     def __int__(self):
+         """
+         Note: These priorities are only used for measuring hardness

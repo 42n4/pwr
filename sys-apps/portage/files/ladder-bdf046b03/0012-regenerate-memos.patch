@@ -1,0 +1,540 @@
+config: remember the stacked incrementals and USE of regenerate() per input
+
+Sub-series: A (probe, match and config memos) - patch 5 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs none: it also applies to 3.0.83 by itself.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+config.setcpv() calls regenerate() for every package, and regenerate()
+stacks every incremental variable and then USE from the same values again
+and again. The two stacking loops are moved, unchanged, into module
+functions (_regenerate_stack_incremental, _regenerate_use_stack) that work
+on the values regenerate() has read from its dbs, with the same lookups in
+the same order. As functions of those values they can be answered from a
+memo (4096 entries at most). A result is not remembered when the loop
+printed a warning (a hit would not print it again) or, for USE, when a
+"_*" wildcard made it depend on IUSE. regenerate() also records whether a
+warning was ever printed (_regenerate_warned) and what its last call saw
+(_regenerate_last); the two following patches read these.
+
+On top of patches 0001-0011, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 43.5 -> 41.8, holds 26.0 -> 24.1, masks 47.1 -> 45.2,
+  py313 29.4 -> 27.2, bdeps 34.5 -> 31.9, policykit 25.9 -> 24.2
+  sum of six 206.6 -> 194.4 (-12.2 s, -2.7 % of the stock sum 447.5)
+Patches 0001-0012 together: 447.5 -> 194.4 s (-57 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Weak spots and what was not checked:
+* A memo hit skips nothing but the loops, but the functions must stay free
+  of side effects other than the warnings. Memos live for the process
+  (bounded by entry count, not bytes).
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/portage/package/ebuild/config.py b/lib/portage/package/ebuild/config.py
+--- a/lib/portage/package/ebuild/config.py
++++ b/lib/portage/package/ebuild/config.py
+@@ -146,6 +146,233 @@
+             return m
+ 
+ 
++# (variable name, values, override tokens) -> the stacked flags, sorted and joined
++# Set when regenerate() prints one of its warnings about a "+" or "-" operator
++# in a value. These are printed again for every package whose settings are
++# computed, so depgraph (_probe_bounds_allowed) looks at this before it
++# passes over packages that nobody needs, in order to print as many of them
++# as it would otherwise.
++_regenerate_warned = False
++
++_regenerate_stack_incremental_memo = {}
++_REGENERATE_STACK_INCREMENTAL_MEMO_MAX = 4096
++
++
++def _regenerate_stack_incremental(mykey, incremental_list, override_tokens):
++    """
++    The loop of config.regenerate() that stacks the values of one incremental
++    variable, moved here unchanged. incremental_list holds the value of the
++    variable in each db that sets it, as an unsplit string, in stacking
++    order; override_tokens are stacked last (the FEATURES overrides).
++
++    Returns (set of flags, memoizable). The result depends on nothing but
++    the arguments; memoizable is False when a warning was printed, which a
++    memo hit would not print again.
++    """
++    global _regenerate_warned
++    myflags = set()
++    memoizable = True
++    for mysplit in chain((v.split() for v in incremental_list), (override_tokens,)):
++        for x in mysplit:
++            if x == "-*":
++                # "-*" is a special "minus" var that means "unset all settings".
++                # so USE="-* gnome" will have *just* gnome enabled.
++                myflags.clear()
++                continue
++
++            if x[0] == "+":
++                # Not legal. People assume too much. Complain.
++                memoizable = False
++                _regenerate_warned = True
++                writemsg(
++                    colorize(
++                        "BAD",
++                        _("%s values should not start with a '+': %s") % (mykey, x),
++                    )
++                    + "\n",
++                    noiselevel=-1,
++                )
++                x = x[1:]
++                if not x:
++                    continue
++
++            if x[0] == "-":
++                myflags.discard(x[1:])
++                continue
++
++            # We got here, so add it now.
++            myflags.add(x)
++
++    return myflags, memoizable
++
++
++
++# use_stack_inputs (see _regenerate_use_stack) -> frozenset of the flags.
++_regenerate_use_stack_memo = {}
++# Bounds the memory held by the memo (one set of a few hundred flags each).
++_REGENERATE_USE_STACK_MEMO_MAX = 4096
++
++
++def _regenerate_use_stack(use_stack_inputs, iuse):
++    """
++    The USE stacking loop of config.regenerate(), moved here unchanged except
++    that it works on the values that regenerate() has read from the dbs of
++    uvlist (in the same order, with the same lookups) instead of reading them
++    itself. use_stack_inputs has one item per db:
++
++        (values of the USE_EXPAND_UNPREFIXED variables (None if unset),
++         USE string,
++         names of the USE_EXPAND variables set in the db,
++         for each of these (value, "is not incremental"), or None if the
++         loop does not look at them: the defaults db, or nothing to do)
++
++    Returns (set of flags, memoizable). The result depends on nothing but the
++    arguments, and on iuse only where a flag to enable ends with "_*". So
++    when no such flag was seen and no warning was printed (a memo hit would
++    not print it again), memoizable is
++    True and regenerate() may answer a later call with equal use_stack_inputs
++    from _regenerate_use_stack_memo. setcpv() calls regenerate() for every
++    package, and most packages have the same USE inputs as an earlier one.
++    """
++    global _regenerate_warned
++    myflags = set()
++    memoizable = True
++    for unprefixed_values, use_str, cur_use_expand, expand_values in use_stack_inputs:
++        for v in unprefixed_values:
++            if v is None:
++                continue
++            for x in v.split():
++                if x[:1] == "-":
++                    myflags.discard(x[1:])
++                else:
++                    myflags.add(x)
++
++        mysplit = use_str.split()
++        if not mysplit and not cur_use_expand:
++            continue
++        for x in mysplit:
++            if x == "-*":
++                myflags.clear()
++                continue
++
++            if x[0] == "+":
++                memoizable = False
++                _regenerate_warned = True
++                writemsg(
++                    colorize(
++                        "BAD",
++                        _("USE flags should not start " "with a '+': %s\n") % x,
++                    ),
++                    noiselevel=-1,
++                )
++                x = x[1:]
++                if not x:
++                    continue
++
++            if x[0] == "-":
++                if x[-2:] == "_*":
++                    prefix = x[1:-1]
++                    prefix_len = len(prefix)
++                    myflags.difference_update(
++                        [y for y in myflags if y[:prefix_len] == prefix]
++                    )
++                myflags.discard(x[1:])
++                continue
++
++            if x[-2:] == "_*":
++                # The only place where iuse matters.
++                memoizable = False
++            if iuse is not None and x[-2:] == "_*":
++                # Expand wildcards here, so that cases like
++                # USE="linguas_* -linguas_en_US" work correctly.
++                prefix = x[:-1]
++                prefix_len = len(prefix)
++                has_iuse = False
++                for y in iuse:
++                    if y[:prefix_len] == prefix:
++                        has_iuse = True
++                        myflags.add(y)
++                if not has_iuse:
++                    # There are no matching IUSE, so allow the
++                    # wildcard to pass through. This allows
++                    # linguas_* to trigger unset LINGUAS in
++                    # cases when no linguas_ flags are in IUSE.
++                    myflags.add(x)
++            else:
++                myflags.add(x)
++
++        if expand_values is None:
++            # USE_EXPAND flags from make.defaults are handled
++            # earlier, in order to provide useful incremental
++            # behavior (for sub-profiles).
++            continue
++
++        for var, (expand_value, is_not_incremental) in zip(
++            cur_use_expand, expand_values
++        ):
++            var_lower = var.lower()
++            if is_not_incremental:
++                prefix = var_lower + "_"
++                prefix_len = len(prefix)
++                for x in list(myflags):
++                    if x[:prefix_len] == prefix:
++                        myflags.remove(x)
++            for x in expand_value.split():
++                if x[0] == "+":
++                    memoizable = False
++                    _regenerate_warned = True
++                    if is_not_incremental:
++                        writemsg(
++                            colorize(
++                                "BAD",
++                                _(
++                                    "Invalid '+' "
++                                    "operator in non-incremental variable "
++                                    "'%s': '%s'\n"
++                                )
++                                % (var, x),
++                            ),
++                            noiselevel=-1,
++                        )
++                        continue
++                    else:
++                        writemsg(
++                            colorize(
++                                "BAD",
++                                _(
++                                    "Invalid '+' "
++                                    "operator in incremental variable "
++                                    "'%s': '%s'\n"
++                                )
++                                % (var, x),
++                            ),
++                            noiselevel=-1,
++                        )
++                    x = x[1:]
++                if x[0] == "-":
++                    if is_not_incremental:
++                        memoizable = False
++                        _regenerate_warned = True
++                        writemsg(
++                            colorize(
++                                "BAD",
++                                _(
++                                    "Invalid '-' "
++                                    "operator in non-incremental variable "
++                                    "'%s': '%s'\n"
++                                )
++                                % (var, x),
++                            ),
++                            noiselevel=-1,
++                        )
++                        continue
++                    myflags.discard(var_lower + "_" + x[1:])
++                    continue
++                myflags.add(var_lower + "_" + x)
++
++    return myflags, memoizable
++
++
+ class config:
+     """
+     This class encompasses the main portage configuration.  Data is pulled from
+@@ -166,6 +393,10 @@
+         "PORTAGE_LOGDIR_CLEAN": "PORT_LOGDIR_CLEAN",
+     }
+ 
++    # What the last regenerate() call saw: (use_stack_inputs, True if it
++    # printed no warning and its USE stacking did not depend on IUSE).
++    _regenerate_last = None
++
+     _setcpv_aux_keys = (
+         "BDEPEND",
+         "DEFINED_PHASES",
+@@ -2807,6 +3038,8 @@
+             # repoman will accept any property
+             self._accept_restrict = ("*",)
+ 
++        # For _pkg_use_fast(): False as soon as this call prints a warning.
++        regenerate_quiet = True
+         increment_lists = {}
+         for k in myincrementals:
+             incremental_list = []
+@@ -2814,47 +3047,38 @@
+             for curdb in mydbs:
+                 v = curdb.get(k)
+                 if v is not None:
+-                    incremental_list.append(v.split())
++                    # Split by _regenerate_stack_incremental.
++                    incremental_list.append(v)
+ 
+-        if "FEATURES" in increment_lists:
+-            increment_lists["FEATURES"].append(self._features_overrides)
+-
+-        myflags = set()
+         for mykey, incremental_list in increment_lists.items():
+-            myflags.clear()
+-            for mysplit in incremental_list:
+-                for x in mysplit:
+-                    if x == "-*":
+-                        # "-*" is a special "minus" var that means "unset all settings".
+-                        # so USE="-* gnome" will have *just* gnome enabled.
+-                        myflags.clear()
+-                        continue
+-
+-                    if x[0] == "+":
+-                        # Not legal. People assume too much. Complain.
+-                        writemsg(
+-                            colorize(
+-                                "BAD",
+-                                _("%s values should not start with a '+': %s")
+-                                % (mykey, x),
+-                            )
+-                            + "\n",
+-                            noiselevel=-1,
+-                        )
+-                        x = x[1:]
+-                        if not x:
+-                            continue
+-
+-                    if x[0] == "-":
+-                        myflags.discard(x[1:])
+-                        continue
+-
+-                    # We got here, so add it now.
+-                    myflags.add(x)
++            if mykey == "FEATURES":
++                override_tokens = tuple(self._features_overrides)
++            else:
++                override_tokens = ()
++            # The stacked value is a pure function of mykey and of the
++            # values just read (see _regenerate_stack_incremental), and it is
++            # the same for nearly every package that setcpv() loads.
++            stack_key = (mykey, tuple(incremental_list), override_tokens)
++            stacked = _regenerate_stack_incremental_memo.get(stack_key)
++            if stacked is None:
++                myflags, memoizable = _regenerate_stack_incremental(
++                    mykey, incremental_list, override_tokens
++                )
++                stacked = " ".join(sorted(myflags))
++                if not memoizable:
++                    regenerate_quiet = False
++                if (
++                    memoizable
++                    and len(_regenerate_stack_incremental_memo)
++                    < _REGENERATE_STACK_INCREMENTAL_MEMO_MAX
++                ):
++                    _regenerate_stack_incremental_memo[stack_key] = stacked
+ 
+             # store setting in last element of configlist, the original environment:
+-            if myflags or mykey in self:
+-                self.configlist[-1][mykey] = " ".join(sorted(myflags))
++            # (the flags are not empty strings, so the joined string is empty
++            # exactly when there is no flag)
++            if stacked or mykey in self:
++                self.configlist[-1][mykey] = stacked
+ 
+         # Do the USE calculation last because it depends on USE_EXPAND.
+         use_expand = self.get("USE_EXPAND", "").split()
+@@ -2920,131 +3144,41 @@
+         iuse = self.configdict["pkg"].get("IUSE")
+         if iuse is not None:
+             iuse = [x.lstrip("+-") for x in iuse.split()]
+-        myflags = set()
++        # Read what the USE stacking below depends on, db by db, with the same
++        # lookups as before. Stacking is then a pure function of these values
++        # and of iuse, see _regenerate_use_stack.
++        use_stack_inputs = []
+         for curdb in self.uvlist:
+-            for k in use_expand_unprefixed:
+-                v = curdb.get(k)
+-                if v is None:
+-                    continue
+-                for x in v.split():
+-                    if x[:1] == "-":
+-                        myflags.discard(x[1:])
+-                    else:
+-                        myflags.add(x)
+-
+-            cur_use_expand = [x for x in use_expand if x in curdb]
+-            mysplit = curdb.get("USE", "").split()
+-            if not mysplit and not cur_use_expand:
+-                continue
+-            for x in mysplit:
+-                if x == "-*":
+-                    myflags.clear()
+-                    continue
+-
+-                if x[0] == "+":
+-                    writemsg(
+-                        colorize(
+-                            "BAD",
+-                            _("USE flags should not start " "with a '+': %s\n") % x,
+-                        ),
+-                        noiselevel=-1,
+-                    )
+-                    x = x[1:]
+-                    if not x:
+-                        continue
+-
+-                if x[0] == "-":
+-                    if x[-2:] == "_*":
+-                        prefix = x[1:-1]
+-                        prefix_len = len(prefix)
+-                        myflags.difference_update(
+-                            [y for y in myflags if y[:prefix_len] == prefix]
+-                        )
+-                    myflags.discard(x[1:])
+-                    continue
+-
+-                if iuse is not None and x[-2:] == "_*":
+-                    # Expand wildcards here, so that cases like
+-                    # USE="linguas_* -linguas_en_US" work correctly.
+-                    prefix = x[:-1]
+-                    prefix_len = len(prefix)
+-                    has_iuse = False
+-                    for y in iuse:
+-                        if y[:prefix_len] == prefix:
+-                            has_iuse = True
+-                            myflags.add(y)
+-                    if not has_iuse:
+-                        # There are no matching IUSE, so allow the
+-                        # wildcard to pass through. This allows
+-                        # linguas_* to trigger unset LINGUAS in
+-                        # cases when no linguas_ flags are in IUSE.
+-                        myflags.add(x)
+-                else:
+-                    myflags.add(x)
+-
+-            if curdb is configdict_defaults:
+-                # USE_EXPAND flags from make.defaults are handled
+-                # earlier, in order to provide useful incremental
+-                # behavior (for sub-profiles).
+-                continue
+-
+-            for var in cur_use_expand:
+-                var_lower = var.lower()
+-                is_not_incremental = var not in myincrementals
+-                if is_not_incremental:
+-                    prefix = var_lower + "_"
+-                    prefix_len = len(prefix)
+-                    for x in list(myflags):
+-                        if x[:prefix_len] == prefix:
+-                            myflags.remove(x)
+-                for x in curdb[var].split():
+-                    if x[0] == "+":
+-                        if is_not_incremental:
+-                            writemsg(
+-                                colorize(
+-                                    "BAD",
+-                                    _(
+-                                        "Invalid '+' "
+-                                        "operator in non-incremental variable "
+-                                        "'%s': '%s'\n"
+-                                    )
+-                                    % (var, x),
+-                                ),
+-                                noiselevel=-1,
+-                            )
+-                            continue
+-                        else:
+-                            writemsg(
+-                                colorize(
+-                                    "BAD",
+-                                    _(
+-                                        "Invalid '+' "
+-                                        "operator in incremental variable "
+-                                        "'%s': '%s'\n"
+-                                    )
+-                                    % (var, x),
+-                                ),
+-                                noiselevel=-1,
+-                            )
+-                        x = x[1:]
+-                    if x[0] == "-":
+-                        if is_not_incremental:
+-                            writemsg(
+-                                colorize(
+-                                    "BAD",
+-                                    _(
+-                                        "Invalid '-' "
+-                                        "operator in non-incremental variable "
+-                                        "'%s': '%s'\n"
+-                                    )
+-                                    % (var, x),
+-                                ),
+-                                noiselevel=-1,
+-                            )
+-                            continue
+-                        myflags.discard(var_lower + "_" + x[1:])
+-                        continue
+-                    myflags.add(var_lower + "_" + x)
++            unprefixed_values = tuple([curdb.get(k) for k in use_expand_unprefixed])
++            cur_use_expand = tuple([x for x in use_expand if x in curdb])
++            use_str = curdb.get("USE", "")
++            if curdb is configdict_defaults or not (use_str.split() or cur_use_expand):
++                # The USE_EXPAND variables of this db are not looked at.
++                expand_values = None
++            else:
++                expand_values = tuple(
++                    [(curdb[var], var not in myincrementals) for var in cur_use_expand]
++                )
++            use_stack_inputs.append(
++                (unprefixed_values, use_str, cur_use_expand, expand_values)
++            )
++        use_stack_inputs = tuple(use_stack_inputs)
++        myflags = _regenerate_use_stack_memo.get(use_stack_inputs)
++        if myflags is not None:
++            # The memo holds frozensets, the code below needs its own set.
++            myflags = set(myflags)
++        else:
++            myflags, memoizable = _regenerate_use_stack(use_stack_inputs, iuse)
++            if not memoizable:
++                regenerate_quiet = False
++            if (
++                memoizable
++                and len(_regenerate_use_stack_memo) < _REGENERATE_USE_STACK_MEMO_MAX
++            ):
++                _regenerate_use_stack_memo[use_stack_inputs] = frozenset(myflags)
++        # (a hit in either memo means a call that printed nothing: only such
++        # calls are recorded)
++        self._regenerate_last = (use_stack_inputs, regenerate_quiet)
+ 
+         if hasattr(self, "features"):
+             self.features._features.clear()

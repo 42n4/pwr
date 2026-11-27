@@ -1,0 +1,173 @@
+diff --git a/src/core/checks/paths.ts b/src/core/checks/paths.ts
+index 99e2d40..f011fc7 100644
+--- a/src/core/checks/paths.ts
++++ b/src/core/checks/paths.ts
+@@ -136,6 +136,30 @@ function getBasenameIndex(projectRoot: string, files: string[]): Map<string, str
+   return index;
+ }
+ 
++/**
++ * LOCAL F3: a reference with no anchor (`./`, `../`, `/`) that is missing where the linter resolves it, but exists
++ * deeper in the project under the same relative spelling, was written relative to another directory (a doc section
++ * that says "cd there first", a sub-tree described from its own root). That is worth a note, not an error.
++ * Single-segment directory names qualify only when distinctive (a digit, `_` or `-`): `build/` exists everywhere.
++ */
++function foundElsewhere(refValue: string, projectFiles: string[]): string | null {
++  if (/^\.{0,2}\//.test(refValue) || refValue.startsWith('~') || refValue.startsWith('@')) return null;
++  const isDir = refValue.endsWith('/');
++  const ref = refValue.replace(/\/+$/, '');
++  if (ref.length < 4) return null;
++  if (!ref.includes('/') && !(isDir && /[\d_-]/.test(ref))) return null;
++  let best: string | null = null;
++  for (const raw of projectFiles) {
++    const f = raw.replace(/\\/g, '/');
++    let hit: string | null = null;
++    const at = `/${f}`.indexOf(`/${ref}/`);
++    if (at >= 0) hit = `/${f}`.slice(1, at + 1 + ref.length);
++    else if (!isDir && f.endsWith(`/${ref}`)) hit = f;
++    if (hit !== null && hit !== ref && (best === null || hit.length < best.length)) best = hit;
++  }
++  return best;
++}
++
+ export function resetPathsCache(): void {
+   cachedProjectFiles = null;
+   cachedBasenameIndex = null;
+@@ -296,6 +320,17 @@ export async function checkPaths(
+     const isDir = normalizedRef.endsWith('/');
+     if (isDir) {
+       if (!resolvedCandidates.some((p) => isDirectory(p) && caseExact(p))) {
++        const elsewhereDir = foundElsewhere(ref.value, projectFiles);
++        if (elsewhereDir) {
++          issues.push({
++            severity: 'info',
++            check: 'paths',
++            ruleId: 'paths/not-found',
++            line: ref.line,
++            message: `${ref.value} is not at this location; it exists as ${elsewhereDir}/ (written relative to another directory)`,
++          });
++          continue;
++        }
+         issues.push({
+           severity: 'error',
+           check: 'paths',
+@@ -370,6 +405,17 @@ export async function checkPaths(
+         continue;
+       }
+       const rename = batchResult.get(relTarget) ?? null;
++      const elsewhere = rename ? null : foundElsewhere(ref.value, projectFiles);
++      if (elsewhere) {
++        issues.push({
++          severity: 'info',
++          check: 'paths',
++          ruleId: 'paths/not-found',
++          line: ref.line,
++          message: `${ref.value} is not at this location; it exists as ${elsewhere} (written relative to another directory)`,
++        });
++        continue;
++      }
+ 
+       let suggestion: string | undefined;
+       let detail: string | undefined;
+diff --git a/src/core/checks/skills.ts b/src/core/checks/skills.ts
+index efdf185..4f0aa23 100644
+--- a/src/core/checks/skills.ts
++++ b/src/core/checks/skills.ts
+@@ -320,6 +320,13 @@ function inlineCodeRef(line: string, start: number, content: string): string | n
+   return value;
+ }
+ 
++// LOCAL: bare skill-layout references. Upstream checks only `./` and `../` refs; a router SKILL.md names its files as
++// `references/x.md`, `scripts/y.sh`, `assets/z.png`, and a deleted or renamed one passed unnoticed. Only a path with a
++// file extension counts, and for every directory but `references` only when that directory exists in the skill (a
++// `scripts/foo.sh` in a skill with no scripts/ is some other tree's path).
++const SKILL_LAYOUT_REF =
++  /(?:^|[\s`"'(\[<])((references|scripts|assets|templates|examples)\/[\w@./-]*[\w@-]\.[A-Za-z0-9]+)(?=[\s`"')\]>,;:.]|$)/g;
++
+ function checkBrokenRefs(file: SkillFile, fmEndLine: number): LintIssue[] {
+   const issues: LintIssue[] = [];
+   const skillDir = path.dirname(file.filePath);
+@@ -394,6 +401,15 @@ function checkBrokenRefs(file: SkillFile, fmEndLine: number): LintIssue[] {
+     BODY_PATH.lastIndex = 0;
+     let m: RegExpExecArray | null;
+     while ((m = BODY_PATH.exec(prose)) !== null) report(lineNo, m[1]);
++
++    if (file.kind === 'skill') {
++      SKILL_LAYOUT_REF.lastIndex = 0;
++      while ((m = SKILL_LAYOUT_REF.exec(raw)) !== null) {
++        if (m[1].includes('*') || /(^|\/)\.\.?\//.test(m[1])) continue;
++        if (m[2] !== 'references' && !isDirectory(path.join(skillDir, m[2]))) continue;
++        report(lineNo, m[1]);
++      }
++    }
+   }
+   return issues;
+ }
+diff --git a/src/core/parser.ts b/src/core/parser.ts
+index b2d99f7..3b7a8eb 100644
+--- a/src/core/parser.ts
++++ b/src/core/parser.ts
+@@ -230,7 +230,13 @@ function extractPathReferences(
+     PATH_PATTERN.lastIndex = 0;
+     let match;
+     while ((match = PATH_PATTERN.exec(line)) !== null) {
+-      const value = match[1];
++      // LOCAL F1: sentence punctuation is stripped first. Upstream stripped it after the guards below, so "64/36." at
++      // the end of a sentence missed the numeric-fraction guard and "Jest/Vitest." the capitalized-pair one.
++      let value = match[1];
++      while (/[.,;:]$/.test(value) && value.includes('/')) {
++        value = value.slice(0, -1);
++      }
++      if (!value.includes('/')) continue;
+ 
+       // Skip URLs and false positives
+       if (PATH_EXCLUDE.test(value)) continue;
+@@ -304,7 +310,8 @@ function extractPathReferences(
+       // rescued too. The segment char class excludes `.` (so an extension or
+       // version like `foo.bar/baz` is not suppressed) and the leading
+       // `[A-Za-z]` still excludes `./`, `../`, and `/` prefixes.
+-      const twoSegmentProse = /^([A-Za-z][\w-]*)\/[A-Za-z][\w-]*$/.exec(cleanValue);
++      // LOCAL F2d: a segment may start with a digit too (`01C/01D`, `5-hour/7-day`, `02H/02I`).
++      const twoSegmentProse = /^([A-Za-z0-9][\w-]*)\/[A-Za-z0-9][\w-]*$/.exec(cleanValue);
+       if (twoSegmentProse && !PATH_FIRST_SEGMENTS.has(twoSegmentProse[1].toLowerCase())) {
+         continue;
+       }
+@@ -322,7 +329,37 @@ function extractPathReferences(
+       // and the `$` anchor (no trailing `/`) -- so a real, resolvable ref is not
+       // lost. A broken extension-less 3+ segment ref is the accepted tradeoff
+       // (rare, low-value) mirroring the 2-segment guard's own tradeoff.
+-      if (/^[a-z][\w-]*(?:\/[a-z][\w-]*){2,}$/.test(cleanValue)) continue;
++      // LOCAL F2c: any case and digit-leading segments, not lowercase only (`THP/MGLRU/zswap`, `INT/TERM/HUP`,
++      // `Oops/BUG/Xid`, `01C/01D/04D`). Same accepted tradeoff as upstream states above.
++      if (/^[A-Za-z0-9][\w-]*(?:\/[A-Za-z0-9][\w-]*){2,}$/.test(cleanValue)) continue;
++
++      // LOCAL F2: more slash-joined prose lists. Only for tokens with no path anchor (`./`, `../`, `/`), no trailing
++      // slash and no glob, so an explicitly relative or directory reference is always still validated.
++      if (!/^\.{0,2}\//.test(cleanValue) && !cleanValue.endsWith('/') && !cleanValue.includes('*')) {
++        const segs = cleanValue.split('/');
++        const numeric = (x: string): boolean => /^(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?)$/.test(x);
++        // F2a: an option list (`--ram/--cpus/--nested`, `-T/-p/-s`, `gothic-quality/-balanced/-dlaa`)
++        if (segs.slice(1).some((x) => x.startsWith('-'))) continue;
++        // F2b: a number at either end is a ratio, rate, date range or numbered variant
++        // (`PCT/100`, `1/2.2`, `60/h`, `set6/42`, `2026-10-28/29`, `0x14/0x15/0x16`, `KRA002/006/007/011`)
++        if (numeric(segs[0]) || numeric(segs[segs.length - 1])) continue;
++        // F2e: alternative extensions (`.snp/.ind/.anno`, `report.md/.json`): every later segment is a bare
++        // extension and the first is one too or already carries one. `repo/.gitignore` does not match.
++        if (
++          segs.slice(1).every((x) => /^\.[A-Za-z0-9]+$/.test(x)) &&
++          (/^\.[A-Za-z0-9]+$/.test(segs[0]) || /\.[A-Za-z0-9]+$/.test(segs[0]))
++        ) {
++          continue;
++        }
++        // F2f: a URL written without its scheme (`api.example.com/v2/graphql`, `aka.ms/vs/17/release`)
++        if (
++          /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|org|net|io|ms|sh|dev|ai|app|cloud|co|me|eu|pl|de|uk|gov|edu)$/.test(
++            segs[0],
++          )
++        ) {
++          continue;
++        }
++      }
+ 
+       // Fix C -- repeated-uppercase placeholder segment (`meta/NNNN_snapshot.json`
+       // is doc shorthand for a migration NUMBER, not a literal filename: `NNNN`

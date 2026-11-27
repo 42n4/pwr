@@ -1,0 +1,57 @@
+--- a/src/scanner/paths.ts
++++ b/src/scanner/paths.ts
+@@ -29,8 +29,17 @@
+   return `${currentScanRoot}/${p}`;
+ }
+ 
++/**
++ * LOCAL BUILD: AGENTSHIELD_USER_SCOPE=1 says the scan root IS the user's own Claude Code directory even though it is
++ * not ~/.claude of the scanning account (a Windows profile mounted into WSL or a container: /mnt/c/Users/x/.claude).
++ */
++export function scanRootIsUserScope(): boolean {
++  return process.env.AGENTSHIELD_USER_SCOPE === "1" && currentScanRoot !== "";
++}
++
+ /** True for a file below the user's own Claude Code directory (never travels with a repository). */
+ export function isUserScopeFile(filePath: string, home: string): boolean {
++  if (scanRootIsUserScope()) return true;
+   const abs = toAbsoluteScanPath(filePath);
+   const h = toPosixPath(home).replace(/\/+$/, "");
+   return h !== "" && abs.startsWith(`${h}/.claude/`);
+--- a/src/rules/claude-code.ts
++++ b/src/rules/claude-code.ts
+@@ -2,7 +2,7 @@
+ import { homedir } from "node:os";
+ import type { ConfigFile, Finding, FindingCategory, Rule, Severity } from "../types.js";
+ import { parseFrontmatter, parseJsonLenient } from "../scanner/parsers.js";
+-import { toAbsoluteScanPath } from "../scanner/paths.js";
++import { scanRootIsUserScope, toAbsoluteScanPath } from "../scanner/paths.js";
+ 
+ /**
+  * Rules for the September 2026 Claude Code configuration surface:
+@@ -72,6 +72,7 @@
+ }
+ 
+ function isUserScopeSettingsPath(filePath: string): boolean {
++  if (scanRootIsUserScope()) return true;
+   const normalized = normalizePath(toAbsoluteScanPath(filePath));
+   const home = normalizePath(homedir());
+   if (home && normalized.startsWith(`${home}/.claude/`)) return true;
+--- a/src/rules/mcp-remote.ts
++++ b/src/rules/mcp-remote.ts
+@@ -6,6 +6,7 @@
+   RuntimeConfidence,
+   Severity,
+ } from "../types.js";
++import { scanRootIsUserScope } from "../scanner/paths.js";
+ import { parseJsonLenient } from "../scanner/parsers.js";
+ import { isPluginCachePath, isStrongDocumentationExamplePath } from "../source-context.js";
+ 
+@@ -154,6 +155,7 @@
+ }
+ 
+ function isUserScopeFile(file: ConfigFile): boolean {
++  if (scanRootIsUserScope()) return true;
+   const normalized = file.path.replace(/\\/g, "/");
+   return /(^|\/)\.claude\.json$/.test(normalized) || /^(?:\/Users\/[^/]+|\/home\/[^/]+|~)\//.test(normalized);
+ }

@@ -1,0 +1,403 @@
+depgraph: mergeable set from the frontier's leaf set, one-node graph removal
+
+Sub-series: B (cycle search and frontier) - patch 6 of 6; applies to 3.0.83 with only the earlier patches of this sub-series.
+Unchanged, but patch 0022 before it is now required-use-memo (probe-certain-atoms, the old 0022, is 0029); the step figures below are those of the old order.
+
+The set of mergeable nodes was built as set(frontier_leaves(level)): sort
+the leaves, filter them, hash every node again; once per priority range in
+every pass. frontier_mergeable() copies the frontier's leaf set and removes
+the nodes the filter rejects. Only a node that is not a Package, or is an
+uninstall, can be rejected, and the frontier now remembers those few nodes
+(`special`), so only they are tested. The copy has the same members but not
+the same iteration order as the original set, and that order decides
+between candidates for which Package.__lt__ gives no order and is the input
+order of sorted() and _gather_deps_closures(). So find_smallest_cycle
+searches the least leaf over the unordered intersection only as long as
+every comparison is strict (then the result is the minimum in any order);
+on the first tie, and before sorted() or the closure pass, it switches to
+the originally ordered set, which is built on demand (use_ordered).
+This replaces the reduced forms of patches 0003 and 0007 in
+find_smallest_cycle.
+
+_serialize_tasks removes one node at a time, and
+digraph.difference_update() walks the whole order list and tests every node
+of the graph for membership each time. For a set of one node,
+_FrontierDigraph now finds the node's position in the order list by
+bisection on the frontier's order-indices (they increase along the list),
+checks that the entry found is that node, and then unlinks it the way the
+generic code does, with a new order list as before. When the position
+cannot be confirmed the generic code runs. induced_subgraph() of one node
+builds the one-node graph (and its self-edge, if any) directly.
+
+On top of patches 0001-0023, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 22.1 -> 20.4, holds 11.5 -> 11.5, masks 23.4 -> 23.3,
+  py313 14.0 -> 13.0, bdeps 16.2 -> 16.1, policykit 11.7 -> 11.7
+  sum of six 98.8 -> 95.9 (-2.9 s, -0.6 % of the stock sum 447.5)
+Patches 0001-0024 together: 447.5 -> 95.9 s (-79 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Two pieces merged, each too small to stand alone here: directly after 0011
+(first order, chain-prelim, single runs) the mergeable set measured 4.1 s
+and the one-node removal 3.3 s; at this position they give 2.9 s together.
+Kept apart from the leftovers because the ordering fallback is the most
+intricate logic of the series after the tracker, and because it carries the
+replacement of the reduced forms of 0003 and 0007.
+
+Weak spots and what was not checked:
+* Relies on Package.__lt__ being transitive where it gives an order. The
+  fallback to the ordered set was not counted, so how often ties occur is
+  unknown.
+* bisect_left(key=) needs Python 3.10. The shortcut relies on order-indices
+  increasing along mygraph.order; the identity check at the found position
+  guards it.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+--- a/lib/_emerge/_serialize_frontier.py
++++ b/lib/_emerge/_serialize_frontier.py
+@@ -24,6 +24,7 @@
+ digraph.leaf_nodes() path (frontier not built).
+ """
+ 
++from bisect import bisect_left
+ from collections import deque
+ 
+ from portage.util.digraph import digraph
+@@ -55,10 +56,16 @@
+ 
+     A node is a leaf under level L iff surv[node][L] == 0. Counts and leaf sets
+     are maintained incrementally as the graph is mutated (see remove/add_edge).
++
++    `special` is a predicate; the nodes for which it is true are remembered
++    in special_nodes (see depgraph._serialize_tasks, frontier_mergeable).
+     """
+ 
+-    def __init__(self, graph):
++    def __init__(self, graph, special=None):
+         self._graph = graph
++        self._special = special
++        # Every node, ever seen in the graph, for which special() is true.
++        self.special_nodes = set()
+         self._filters, self._level_of = _build_levels()
+         self._nlevels = nlevels = len(self._filters)
+         # node -> list[int]: surviving-child count per level
+@@ -79,6 +86,8 @@
+ 
+         for i, node in enumerate(graph.order):
+             self._index[node] = i
++            if special is not None and special(node):
++                self.special_nodes.add(node)
+         self._next_index = len(graph.order)
+ 
+         for node in graph.order:
+@@ -150,6 +159,21 @@
+         The caller must not modify it."""
+         return self._leaf[level]
+ 
++    def order_position(self, node, order):
++        """Return the position of `node` in `order` (the graph's order list) if
++        it can be found by bisection on the order-indices, else None. The
++        order-indices of the nodes in mygraph.order are strictly increasing:
++        nodes keep their relative order when others are removed, and a node
++        introduced later is appended with an index above all earlier ones."""
++        index = self._index
++        idx = index.get(node)
++        if idx is None:
++            return None
++        pos = bisect_left(order, idx, key=index.__getitem__)
++        if pos < len(order) and order[pos] is node:
++            return pos
++        return None
++
+     def remove(self, node):
+         """Account for `node` leaving the graph. Must be called while the graph
+         still contains `node` and its edges, i.e. before the digraph mutation.
+@@ -206,6 +230,8 @@
+             for L in range(self._nlevels):
+                 self._leaf[L].add(node)
+                 self.leaf_version[L] += 1
++            if self._special is not None and self._special(node):
++                self.special_nodes.add(node)
+ 
+     def add_edge(self, node, parent, priority):
+         """Account for digraph.add(node, parent, priority), an edge from graph
+@@ -395,12 +421,62 @@
+         super().remove(node)
+ 
+     def difference_update(self, t):
+-        if self.frontier is not None:
++        frontier = self.frontier
++        if frontier is not None:
+             if isinstance(t, (list, tuple)) or not hasattr(t, "__contains__"):
+                 t = frozenset(t)
+-            self.frontier.difference_update(t)
++            if len(t) == 1:
++                # One node, the usual case in _serialize_tasks: do what
++                # digraph.difference_update() does for it without walking
++                # self.order and testing every graph node for membership.
++                # The position of the node in self.order is found by
++                # bisection and verified (order_position); if it cannot be
++                # found that way, the generic code below runs.
++                for node in t:
++                    break
++                node_data = self.nodes.get(node)
++                if node_data is not None:
++                    # The graph's own instance, which is what self.order
++                    # holds.
++                    node = node_data[2]
++                    pos = frontier.order_position(node, self.order)
++                    if pos is not None:
++                        frontier.remove(node)
++                        nodes = self.nodes
++                        for parent in node_data[1]:
++                            del nodes[parent][0][node]
++                        for child in node_data[0]:
++                            del nodes[child][1][node]
++                        del nodes[node]
++                        # A new list, like digraph.difference_update().
++                        order = self.order[:]
++                        del order[pos]
++                        self.order = order
++                        return
++            frontier.difference_update(t)
+         super().difference_update(t)
+ 
++    def induced_subgraph(self, nodes):
++        if self.frontier is not None and len(nodes) == 1:
++            # One node: the subgraph that digraph.induced_subgraph() builds
++            # has this node (the graph's own instance) and, if the node has
++            # an edge to itself, that edge with a copy of its priorities.
++            for node in nodes:
++                break
++            node_data = self.nodes.get(node)
++            if node_data is not None:
++                node = node_data[2]
++                sub = digraph()
++                sub_data = sub.nodes[node] = ({}, {}, node)
++                priorities = node_data[0].get(node)
++                if priorities is not None:
++                    priorities = priorities[:]
++                    sub_data[0][node] = priorities
++                    sub_data[1][node] = priorities
++                sub.order = [node]
++                return sub
++        return super().induced_subgraph(nodes)
++
+     def add(self, node, parent, priority=0):
+         super().add(node, parent, priority=priority)
+         if self.frontier is not None:
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -10208,6 +10208,38 @@
+             )
+             return result[:]
+ 
++        def frontier_ordered_mergeable(ignore_priority):
++            """
++            The set that the original code builds from
++            get_nodes(ignore_priority=...), with the same iteration order.
++            """
++            return set(frontier_leaves(ignore_priority))
++
++        def frontier_mergeable(ignore_priority):
++            """
++            The nodes of frontier_leaves(ignore_priority) as a new set, built
++            from the frontier's leaf set of that level without hashing every
++            node again: a copy of it, minus the nodes that the filter of
++            frontier_leaves() rejects. Only a node for which the frontier's
++            `special` predicate is true (not a Package, or an uninstall) can
++            be rejected, so only those are put to the test. The iteration
++            order of this set is not that of set(frontier_leaves(...)).
++            """
++            leaves = frontier.leaf_set(frontier.level_of(ignore_priority))
++            result = leaves.copy()
++            special_nodes = frontier.special_nodes
++            if not special_nodes.isdisjoint(leaves):
++                for node in special_nodes & leaves:
++                    if not (
++                        isinstance(node, Package)
++                        and (
++                            node.operation != "uninstall"
++                            or node in scheduled_uninstalls
++                        )
++                    ):
++                        result.discard(node)
++            return result
++
+         # sys-apps/portage needs special treatment if ROOT="/"
+         running_root = self._frozen_config._running_root.root
+         runtime_deps = InternalPackageSet(initial_atoms=[PORTAGE_PACKAGE_ATOM])
+@@ -10350,7 +10382,11 @@
+         # unresolved blockers or circular dependencies.
+ 
+         if use_frontier:
+-            frontier = _SerializeFrontier(mygraph)
++            frontier = _SerializeFrontier(
++                mygraph,
++                special=lambda node: not isinstance(node, Package)
++                or node.operation == "uninstall",
++            )
+             mygraph.frontier = frontier
+ 
+         # (local_priority_range, level index) -> _GatherOkTracker, see
+@@ -10462,7 +10498,17 @@
+ 
+             if not selected_nodes:
+ 
+-                def find_smallest_cycle(mergeable_nodes, local_priority_range):
++                def find_smallest_cycle(
++                    mergeable_nodes, local_priority_range, ordered_mergeable=None
++                ):
++                    # With ordered_mergeable, mergeable_nodes is the set from
++                    # frontier_mergeable(), whose iteration order is not the
++                    # original one, and ordered_mergeable() returns the same
++                    # nodes as the set that the original code builds. The
++                    # iteration order of that set decides between candidates
++                    # for which Package.__lt__ gives no order, and it is the
++                    # input order of sorted() and _gather_deps_closures(), so
++                    # these steps get the original set, see use_ordered().
+                     if prefer_asap and asap_nodes:
+                         nodes = asap_nodes
+                     else:
+@@ -10511,6 +10557,19 @@
+                             valid_nodes = mergeable_nodes - blocked_nodes
+                         graph_nodes = mygraph.nodes
+ 
++                    def use_ordered():
++                        # Switch to the originally ordered set of mergeable
++                        # nodes (same members, see above).
++                        nonlocal mergeable_nodes, nodes, valid_nodes
++                        nonlocal ordered_mergeable
++                        ordered = ordered_mergeable()
++                        ordered_mergeable = None
++                        if nodes is mergeable_nodes:
++                            nodes = ordered
++                        if valid_nodes is mergeable_nodes:
++                            valid_nodes = ordered
++                        mergeable_nodes = ordered
++
+                     for i in range(
+                         local_priority_range.MEDIUM_POST,
+                         local_priority_range.MEDIUM_SOFT + 1,
+@@ -10529,20 +10588,52 @@
+                             # iterating nodes in its own order is what the
+                             # stable sort followed by that loop returns.
+                             smallest_leaf = None
+-                            graph_nodes = mygraph.nodes
+-                            for node in frontier.leaves_among(nodes, level):
+-                                if (
+-                                    graph_nodes[node][1]
+-                                    and node in mergeable_nodes
+-                                    and (
+-                                        blocked_nodes is None
+-                                        or node not in blocked_nodes
+-                                    )
+-                                    and (
+-                                        smallest_leaf is None or node < smallest_leaf
+-                                    )
+-                                ):
+-                                    smallest_leaf = node
++                            if (
++                                ordered_mergeable is not None
++                                and nodes is mergeable_nodes
++                            ):
++                                # The same candidates, found by intersecting
++                                # the frontier's leaf set of this level with
++                                # valid_nodes (a subset of nodes), in no
++                                # particular order. If every comparison made
++                                # here gives a strict order, the result is
++                                # less than every other candidate
++                                # (Package.__lt__ is transitive), so it is
++                                # the first minimum in any iteration order.
++                                # Otherwise the original order decides, and
++                                # the search is redone below on the
++                                # originally ordered set.
++                                unordered = False
++                                for node in frontier.leaf_set(level) & valid_nodes:
++                                    if not graph_nodes[node][1]:
++                                        continue
++                                    if smallest_leaf is None:
++                                        smallest_leaf = node
++                                    elif node < smallest_leaf:
++                                        smallest_leaf = node
++                                    elif not smallest_leaf < node:
++                                        unordered = True
++                                        break
++                                if unordered:
++                                    smallest_leaf = None
++                                    use_ordered()
++                            if (
++                                ordered_mergeable is None
++                                or nodes is not mergeable_nodes
++                            ):
++                                for node in frontier.leaves_among(nodes, level):
++                                    if (
++                                        graph_nodes[node][1]
++                                        and (
++                                            nodes is valid_nodes
++                                            or node in valid_nodes
++                                        )
++                                        and (
++                                            smallest_leaf is None
++                                            or node < smallest_leaf
++                                        )
++                                    ):
++                                        smallest_leaf = node
+                             if smallest_leaf is not None:
+                                 smallest_cycle = frozenset((smallest_leaf,))
+                                 smallest_size = 1
+@@ -10569,6 +10660,9 @@
+                                 for node in nodes
+                             ):
+                                 continue
++
++                        if ordered_mergeable is not None:
++                            use_ordered()
+                         if sorted_nodes is None:
+                             sorted_nodes = sorted(nodes)
+                         # Compute gather_deps success and closure size for every
+@@ -10622,15 +10716,17 @@
+                             selected_nodes, ignore_priority = None, None
+                             continue
+                         # ignore_medium is ignore_priority[MEDIUM] for both
+-                        # ranges, and frontier_leaves() returns the nodes of
+-                        # get_nodes() in the same order, without the scan of
+-                        # the whole graph.
+-                        mergeable_nodes = set(
+-                            frontier_leaves(
+-                                local_priority_range.ignore_priority[
+-                                    local_priority_range.MEDIUM
+-                                ]
+-                            )
++                        # ranges, so set(frontier_leaves(ignore_medium)) is
++                        # set(get_nodes(ignore_medium)), with the nodes in
++                        # the same order. find_smallest_cycle gets the same
++                        # nodes as a set that is cheaper to build, and
++                        # builds this one when the order matters.
++                        ignore_medium = local_priority_range.ignore_priority[
++                            local_priority_range.MEDIUM
++                        ]
++                        mergeable_nodes = frontier_mergeable(ignore_medium)
++                        ordered_mergeable = functools.partial(
++                            frontier_ordered_mergeable, ignore_medium
+                         )
+                     else:
+                         mergeable_nodes = set(
+@@ -10638,9 +10734,10 @@
+                                 ignore_priority=local_priority_range.ignore_medium
+                             )
+                         )
++                        ordered_mergeable = None
+                     if mergeable_nodes:
+                         selected_nodes, ignore_priority = find_smallest_cycle(
+-                            mergeable_nodes, local_priority_range
++                            mergeable_nodes, local_priority_range, ordered_mergeable
+                         )
+                         if selected_nodes:
+                             break

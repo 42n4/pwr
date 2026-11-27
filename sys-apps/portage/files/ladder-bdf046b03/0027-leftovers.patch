@@ -1,0 +1,195 @@
+Package, depgraph, dep_check, dep_expand, digraph: local rewrites of hot statements
+
+Sub-series: M (leftovers) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+Leftovers, each a local rewrite of a hot statement, none depending on
+another: Package gets a __bool__ that needs no Python frame (truth was
+taken from __len__, always 4); the metadata wrapper constructor copies the
+slots in a direct loop; digraph.add() looks each node up once;
+dep_expand() tests the category without splitting the cp;
+_pkg_use_enabled() returns at once when no USE change is recorded;
+dep_check() and dep_zapdeps() test the noise level before formatting debug
+messages.
+
+These are the local trims of patch 0025 of the 25-patch ladder
+(config-trims-and-leftovers), which is now patches 0022, 0025, 0026, 0027
+and 0030. With the two memos (now 0022 and 0026) they were 2.8 s as a step
+of the second order that was measured (chain-prelim2); none of the pieces
+is clearly above the noise alone. Together, on top of patches 0001-0024:
+sum of six states 95.9 -> 90.5 s (-5.5 s, -1.2 % of the stock sum 447.5).
+Alone on stock 3.0.83: see README (sub-series M).
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21; cut out of its
+former patch on 2026-11-21 without changing a line of code. Not a
+human-written change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on
+six states of one system image, one resolve at a time; every run gave the
+same merge list in the same order, the same number of backtracking attempts
+and the same package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -8678,9 +8678,12 @@
+         """
+         if pkg.built:
+             return pkg.use.enabled
+-        needed_use_config_change = self._dynamic_config._needed_use_config_changes.get(
+-            pkg
+-        )
++        needed_use_config_changes = self._dynamic_config._needed_use_config_changes
++        if not needed_use_config_changes and target_use is None:
++            # Nothing recorded (the usual state): get(pkg) below would
++            # return None, and then this is the result.
++            return pkg.use.enabled
++        needed_use_config_change = needed_use_config_changes.get(pkg)
+ 
+         if target_use is None:
+             if needed_use_config_change is None:
+diff -ruN a/lib/_emerge/Package.py b/lib/_emerge/Package.py
+--- a/lib/_emerge/Package.py
++++ b/lib/_emerge/Package.py
+@@ -864,6 +864,13 @@
+     def __len__(self):
+         return 4
+ 
++    # The truth value of a Package is asked all the time ("if pkg:"). Without
++    # __bool__ it is taken from __len__ above, a call of a Python function
++    # that always returns 4, so it is always True. (1).__bool__ is a builtin
++    # that returns True; the interpreter calls a __bool__ that is not a
++    # function without arguments, and no Python frame is needed.
++    __bool__ = (1).__bool__
++
+     def __iter__(self):
+         """
+         This is used to generate mtimedb resume mergelist entries, so we
+@@ -932,6 +939,13 @@
+ 
+ _PackageMetadataWrapperBase = slot_dict_class(_all_metadata_keys)
+ 
++# (slot name, key) for every key of the class above, in the order in which
++# its iteritems() looks at them. See _PackageMetadataWrapper.__init__.
++_metadata_slots = tuple(
++    (_PackageMetadataWrapperBase._prefix + k, k)
++    for k in _PackageMetadataWrapperBase.allowed_keys
++)
++
+ 
+ class _PackageMetadataWrapper(_PackageMetadataWrapperBase):
+     """
+@@ -955,7 +969,24 @@
+             # USE is lazy, but we want it to show up in self.keys().
+             _PackageMetadataWrapperBase.__setitem__(self, "USE", "")
+ 
+-        self.update(metadata)
++        if metadata.__class__ is _PackageMetadataWrapperBase:
++            # What self.update(metadata) does for this class, without a
++            # generator and two method calls per key: iteritems() yields
++            # the keys of allowed_keys that are set, in the iteration
++            # order of that frozenset (_metadata_slots was made from the
++            # same object), and __setitem__ stores each value in its slot
++            # and then calls the _set_* hook of a wrapped key.
++            wrapped_keys = self._wrapped_keys
++            for attr, k in _metadata_slots:
++                try:
++                    v = getattr(metadata, attr)
++                except AttributeError:
++                    continue
++                setattr(self, attr, v)
++                if k in wrapped_keys:
++                    getattr(self, "_set_" + k.lower())(k, v)
++        else:
++            self.update(metadata)
+ 
+     def __getitem__(self, k):
+         v = _PackageMetadataWrapperBase.__getitem__(self, k)
+diff -ruN a/lib/portage/dbapi/dep_expand.py b/lib/portage/dbapi/dep_expand.py
+--- a/lib/portage/dbapi/dep_expand.py
++++ b/lib/portage/dbapi/dep_expand.py
+@@ -47,7 +47,9 @@
+ 
+     if has_cat:
+         # Optimize most common cases to avoid calling cpv_expand.
+-        if mydep.category != "virtual":
++        # mydep.category != "virtual", without splitting the cp for it.
++        cp = mydep.cp
++        if not (cp.startswith("virtual/") or cp == "virtual"):
+             return mydep
+         if not hasattr(mydb, "cp_list") or mydb.cp_list(mydep.cp):
+             return mydep
+diff -ruN a/lib/portage/dep/dep_check.py b/lib/portage/dep/dep_check.py
+--- a/lib/portage/dep/dep_check.py
++++ b/lib/portage/dep/dep_check.py
+@@ -385,7 +385,10 @@
+     """
+     if trees is None:
+         trees = portage.db
+-    writemsg(f"ZapDeps -- {use_binaries}\n", 2)
++    # writemsg() drops a message whose noiselevel is above noiselimit; make
++    # that test before formatting it (this runs for every dependency).
++    if portage.util.noiselimit >= 2:
++        writemsg(f"ZapDeps -- {use_binaries}\n", 2)
+     if not reduced or unreduced == ["||"] or dep_eval(reduced):
+         return []
+ 
+@@ -961,9 +964,14 @@
+     if mysplit2 is None:
+         return [0, _("Invalid token")]
+ 
+-    writemsg("\n\n\n", 1)
+-    writemsg(f"mysplit:  {mysplit}\n", 1)
+-    writemsg(f"mysplit2: {mysplit2}\n", 1)
++    # writemsg() drops a message whose noiselevel is above noiselimit, but
++    # only after the f-strings below have formatted both dependency lists
++    # (the repr of every atom in them). The same test is made here first;
++    # formatting the lists has no side effects.
++    if portage.util.noiselimit >= 1:
++        writemsg("\n\n\n", 1)
++        writemsg(f"mysplit:  {mysplit}\n", 1)
++        writemsg(f"mysplit2: {mysplit2}\n", 1)
+ 
+     selected_atoms = dep_zapdeps(
+         mysplit,
+diff -ruN a/lib/portage/util/digraph.py b/lib/portage/util/digraph.py
+--- a/lib/portage/util/digraph.py
++++ b/lib/portage/util/digraph.py
+@@ -27,22 +27,28 @@
+         If the dep is a soft-dep and the node already has a hard
+         relationship to the parent, the relationship is left as hard."""
+ 
+-        if node not in self.nodes:
+-            self.nodes[node] = ({}, {}, node)
++        # The same steps as before, with each node looked up (hashed) once
++        # instead of up to three times: an entry of self.nodes is never
++        # None, so get() tells whether the node is there.
++        nodes = self.nodes
++        node_data = nodes.get(node)
++        if node_data is None:
++            node_data = nodes[node] = ({}, {}, node)
+             self.order.append(node)
+ 
+         if not parent:
+             return
+ 
+-        if parent not in self.nodes:
+-            self.nodes[parent] = ({}, {}, parent)
++        parent_data = nodes.get(parent)
++        if parent_data is None:
++            parent_data = nodes[parent] = ({}, {}, parent)
+             self.order.append(parent)
+ 
+-        priorities = self.nodes[node][1].get(parent)
++        priorities = node_data[1].get(parent)
+         if priorities is None:
+             priorities = []
+-            self.nodes[node][1][parent] = priorities
+-            self.nodes[parent][0][node] = priorities
++            node_data[1][parent] = priorities
++            parent_data[0][node] = priorities
+ 
+         if not priorities or priorities[-1] is not priority:
+             bisect.insort(priorities, priority)

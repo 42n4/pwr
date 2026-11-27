@@ -1,0 +1,203 @@
+depgraph: skip _select_atoms_probe for atoms that dep_check() cannot drop
+
+Sub-series: A (probe, match and config memos) - patch 10 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs 0001, 0002, 0004, 0005, 0012, 0013, 0014 only.
+In the 25-patch ladder this was patch 0022; the step figures below were measured there, on top of 0001-0021 of that order.
+
+_slot_operator_update_probe runs _select_atoms_probe(), i.e. dep_check()
+over all dependency strings of a replacement parent, only to ask whether
+one atom is among the selected atoms. An atom that stands at the top level
+of a dependency list (outside every "||" group), is a plain Atom, is not
+for a virtual/ package and is not in package.provided cannot be dropped by
+dep_check(). _select_atoms_probe_certain() returns the set of those atoms
+from use_reduce() alone (kept per root, package and USE for all
+backtracking runs), and the probe is run only when the atom is not in that
+set. The set is empty wherever the argument does not hold: before the
+graph is complete, with --ignore-built-slot-operator-deps, without
+local_config, during virtual expansion, for an invalid dependency string,
+and after a config warning was printed (_probe_bounds_allowed of patch
+0014).
+
+On top of patches 0001-0021, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 24.0 -> 23.0, holds 12.2 -> 11.8, masks 25.4 -> 24.1,
+  py313 15.1 -> 14.4, bdeps 17.5 -> 16.9, policykit 12.4 -> 12.0
+  sum of six 106.6 -> 102.2 (-4.4 s, -1.0 % of the stock sum 447.5)
+Patches 0001-0022 together: 447.5 -> 102.2 s (-77 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Kept as its own patch although the step is just under 5 s: a distinct
+mechanism with its own correctness argument, and its step was between 4.4
+and 5.9 s in all three orders that were measured.
+
+Weak spots and what was not checked:
+* Depends on dep_check() internals (what _expand_new_virtuals,
+  dep_wordreduce and dep_zapdeps do with a top-level atom); a change there
+  must revisit it. The probe may now run later than before or not at all,
+  which is safe only inside one _slot_operator_trigger_reinstalls loop (the
+  premise of patch 0001).
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -454,1 +454,4 @@
+-        self._highest_license_masked = {}
++        # (root, pkg, USE flags) -> frozenset of atoms, see
++        # depgraph._select_atoms_probe_certain.
++        self._probe_certain_cache = {}
++        self._highest_license_masked = {}
+@@ -2892,11 +2895,22 @@
+                         # to see if this atom is really desirable, since
+                         # otherwise we may trigger an undesirable rebuild
+                         # as in bug #460304.
+-                        if selected_atoms is None:
+-                            selected_atoms = self._select_atoms_probe(
++                        if (
++                            selected_atoms is None
++                            and unevaluated_atom
++                            in self._select_atoms_probe_certain(
+                                 dep.child.root, replacement_parent
+                             )
+-                        atom_not_selected = unevaluated_atom not in selected_atoms
++                        ):
++                            # It is in the result of _select_atoms_probe()
++                            # for sure, see _select_atoms_probe_certain.
++                            atom_not_selected = False
++                        else:
++                            if selected_atoms is None:
++                                selected_atoms = self._select_atoms_probe(
++                                    dep.child.root, replacement_parent
++                                )
++                            atom_not_selected = unevaluated_atom not in selected_atoms
+                         if atom_not_selected:
+                             break
+ 
+@@ -2913,11 +2927,20 @@
+                 # an soname atom which is unconditionally selected, and
+                 # _select_atoms_probe is not applicable.
+                 if atom_not_selected is None and unevaluated_atom is not None:
+-                    if selected_atoms is None:
+-                        selected_atoms = self._select_atoms_probe(
++                    if (
++                        selected_atoms is None
++                        and unevaluated_atom
++                        in self._select_atoms_probe_certain(
+                             dep.child.root, replacement_parent
+                         )
+-                    atom_not_selected = unevaluated_atom not in selected_atoms
++                    ):
++                        atom_not_selected = False
++                    else:
++                        if selected_atoms is None:
++                            selected_atoms = self._select_atoms_probe(
++                                dep.child.root, replacement_parent
++                            )
++                        atom_not_selected = unevaluated_atom not in selected_atoms
+ 
+                 if atom_not_selected:
+                     continue
+@@ -3254,6 +3277,98 @@
+             memo.select_atoms_probe[(root, pkg)] = result
+         return result
+ 
++    def _select_atoms_probe_certain(self, root, pkg):
++        """
++        A frozenset of atoms that are certain to be in the result of
++        _select_atoms_probe(root, pkg), found without dep_check(): the
++        unevaluated form of every atom that stands at the top level of one
++        of the dependency lists that _select_atoms_probe_imp() hands to
++        dep_check() (use_reduce() of a dependency string with the USE of
++        pkg), i.e. outside every "||" group, and that is an instance of
++        exactly Atom, not for a virtual/ package and not for a package that
++        package.provided names.
++
++        dep_check() cannot drop such an atom: _expand_new_virtuals() copies
++        it and adds it to atom_graph as a child of the parent,
++        _overlap_dnf() passes on what is not a "||" group, dep_wordreduce()
++        (no dbapi, not in package.provided) marks it as not satisfied, and
++        dep_zapdeps() returns every top level atom that is not satisfied;
++        _select_atoms_highest_available() then lists it under the parent,
++        as a child of the parent in atom_graph that dep_check() returned.
++        Most slot operator dependencies are of this kind, so the probe,
++        which runs dep_check() on every dependency string of the package,
++        is rarely needed for them.
++
++        The set is empty where this reasoning does not hold: with
++        --ignore-built-slot-operator-deps (the atoms of a built package are
++        rewritten before dep_check), without local_config, while a virtual
++        is being expanded (virt_parent), when a dependency string is
++        invalid, and once config.regenerate() has printed a warning (see
++        _probe_bounds_allowed; dep_check can create packages). It is also
++        empty as long as _select_atoms() is not _select_atoms_from_graph():
++        before the graph is complete, dep_check() selects packages with
++        _select_pkg_highest_available(), which records what it selected
++        (_highest_pkg_cache, _visible_pkgs), so the probe is not skipped
++        then. With the graph's own trees it only reads the graph.
++
++        Within one _slot_operator_trigger_reinstalls loop the result of
++        _select_atoms_probe() for a package does not change (_probe_memo
++        relies on that), so it does not matter that the probe may now be
++        computed at a later request than before, or not at all.
++        """
++        pkgsettings = self._frozen_config.pkgsettings[root]
++        if (
++            getattr(self._select_atoms, "__func__", None)
++            is not depgraph._select_atoms_from_graph
++            or not pkgsettings.local_config
++            or (
++                pkg.built
++                and self._dynamic_config.myparams.get(
++                    "ignore_built_slot_operator_deps", "n"
++                )
++                == "y"
++            )
++            or self._dynamic_config._graph_trees[root].get("virt_parent") is not None
++            or not self._probe_bounds_allowed()
++        ):
++            return frozenset()
++        use = self._pkg_use_enabled(pkg)
++        cache_key = (root, pkg, use)
++        certain = self._frozen_config._probe_certain_cache.get(cache_key)
++        if certain is not None:
++            return certain
++        # The same use_reduce() call that _select_atoms_highest_available()
++        # makes for a dependency string of the parent pkg.
++        eapi = pkg.eapi
++        is_valid_flag = None
++        if not pkg.installed:
++            is_valid_flag = pkg.iuse.is_valid_flag
++        pprovideddict = pkgsettings.pprovideddict
++        certain = set()
++        try:
++            for k in pkg._dep_keys:
++                v = pkg._metadata.get(k)
++                if not v:
++                    continue
++                for atom in portage.dep.use_reduce(
++                    v,
++                    uselist=use,
++                    opconvert=True,
++                    token_class=Atom,
++                    is_valid_flag=is_valid_flag,
++                    eapi=eapi,
++                ):
++                    if atom.__class__ is Atom:
++                        cp = atom.cp
++                        if not cp.startswith("virtual/") and cp not in pprovideddict:
++                            certain.add(atom.unevaluated_atom)
++        except InvalidDependString:
++            certain = set()
++        certain = self._frozen_config._probe_certain_cache[cache_key] = frozenset(
++            certain
++        )
++        return certain
++
+     def _select_atoms_probe_imp(self, root, pkg):
+         selected_atoms = []
+         use = self._pkg_use_enabled(pkg)

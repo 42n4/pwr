@@ -1,0 +1,473 @@
+config: compute the USE of an ebuild Package without setcpv()
+
+Sub-series: A (probe, match and config memos) - patch 8 of 10; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs 0012 only.
+
+Creating a Package for an ebuild called setcpv() only to read five values
+back: PORTAGE_USE, USE_EXPAND, USE_EXPAND_HIDDEN, useforce and usemask.
+config._pkg_use_fast(pkg) computes the same five values without setcpv():
+setcpv() always calls reset(), so its result for a package depends on the
+previous package only through package.env, repository make.defaults and
+FEATURES=test. At the end of a complete setcpv() a template of the constant
+stacking inputs is recorded (not in any of those three cases) and
+modifying() drops it. With a template, only the USE strings of the "pkg",
+"defaults" and "pkginternal" dicts differ per package; they are computed
+with the statements of setcpv() and stacked with the same
+_regenerate_use_stack and memo as regenerate(). The method returns None,
+and the caller runs setcpv() as before, for built packages, packages with
+package.env or repository settings, "+flag" tokens and "_*" wildcards.
+
+On top of patches 0001-0015, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 34.2 -> 32.3, holds 18.0 -> 16.0, masks 36.9 -> 34.7,
+  py313 21.5 -> 19.4, bdeps 25.4 -> 23.2, policykit 18.4 -> 16.5
+  sum of six 154.4 -> 142.1 (-12.3 s, -2.7 % of the stock sum 447.5)
+Patches 0001-0016 together: 447.5 -> 142.1 s (-68 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Weak spots and what was not checked:
+* Not a proof for every configuration: it rests on the analysis that
+  setcpv() results depend on the previous package only via package.env, repo
+  make.defaults and FEATURES=test. The template is dropped by
+  config.modifying(); code that edits the dicts of doebuild_settings
+  directly would not invalidate it. After resolution doebuild_settings holds
+  the state of the last real setcpv(). The built-in self-test hook
+  (_PKG_USE_FAST_SELFTEST) was not run for this series.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+--- a/lib/_emerge/Package.py
++++ b/lib/_emerge/Package.py
+@@ -674,14 +674,18 @@
+ 
+         def _init_force_mask(self):
+             pkgsettings = self._pkg._get_pkgsettings()
+-            self._expand = _intern_frozenset(
+-                pkgsettings.get("USE_EXPAND", "").lower().split()
++            self._set_force_mask(
++                pkgsettings.get("USE_EXPAND", ""),
++                pkgsettings.get("USE_EXPAND_HIDDEN", ""),
++                pkgsettings.useforce,
++                pkgsettings.usemask,
+             )
+-            self._expand_hidden = _intern_frozenset(
+-                pkgsettings.get("USE_EXPAND_HIDDEN", "").lower().split()
+-            )
+-            self._force = _intern_frozenset(pkgsettings.useforce)
+-            self._mask = _intern_frozenset(pkgsettings.usemask)
++
++        def _set_force_mask(self, use_expand, use_expand_hidden, useforce, usemask):
++            self._expand = _intern_frozenset(use_expand.lower().split())
++            self._expand_hidden = _intern_frozenset(use_expand_hidden.lower().split())
++            self._force = _intern_frozenset(useforce)
++            self._mask = _intern_frozenset(usemask)
+ 
+         @property
+         def expand(self):
+@@ -748,15 +752,29 @@
+             except KeyError:
+                 use_str = None
+             calculated_use = False
++            fast_use = None
+             if not use_str:
+-                use_str = self._get_pkgsettings()["PORTAGE_USE"]
++                # config._pkg_use_fast() returns the five values that are
++                # read below and in _init_force_mask() after setcpv(self),
++                # without the setcpv() call, or None if it cannot.
++                fast_use = (
++                    self.root_config.trees["porttree"]
++                    .dbapi.doebuild_settings._pkg_use_fast(self)
++                )
++                if fast_use is None:
++                    use_str = self._get_pkgsettings()["PORTAGE_USE"]
++                else:
++                    use_str = fast_use[0]
+                 calculated_use = True
+             self._use = self._use_class(self, split_interned(use_str))
+             # Initialize these now, since USE access has just triggered
+             # setcpv, and we want to cache the result of the force/mask
+             # calculations that were done.
+             if calculated_use:
+-                self._use._init_force_mask()
++                if fast_use is None:
++                    self._use._init_force_mask()
++                else:
++                    self._use._set_force_mask(*fast_use[1:])
+ 
+         _PackageMetadataWrapperBase.__setitem__(self._metadata, "USE", use_str)
+ 
+--- a/lib/portage/package/ebuild/config.py
++++ b/lib/portage/package/ebuild/config.py
+@@ -205,6 +205,46 @@
+     return myflags, memoizable
+ 
+ 
++# For config._pkg_use_fast(): variables other than USE that setcpv() and
++# regenerate() look up for the USE calculation, in addition to the
++# incrementals and to the USE_EXPAND and USE_EXPAND_UNPREFIXED variables ...
++_PKG_USE_FAST_LOOKUPS = frozenset(
++    [
++        "ACCEPT_KEYWORDS",
++        "ACCEPT_LICENSE",
++        "ACCEPT_PROPERTIES",
++        "ACCEPT_RESTRICT",
++        "ARCH",
++        "FEATURES",
++        "USE_EXPAND",
++        "USE_EXPAND_HIDDEN",
++        "USE_EXPAND_UNPREFIXED",
++        "USE_ORDER",
++    ]
++)
++# ... and the keys that setcpv() puts into the "pkg" dict in addition to
++# config._setcpv_aux_keys (without package.env).
++_PKG_USE_FAST_PKG_KEYS = frozenset(
++    [
++        "CATEGORY",
++        "IUSE_EFFECTIVE",
++        "PF",
++        "PKGUSE",
++        "PORTAGE_BUILT_USE",
++        "PORTAGE_REPO_NAME",
++    ]
++)
++# USE string -> True if no token makes _regenerate_use_stack() print a
++# warning or look at IUSE.
++_pkg_use_fast_clean_memo = {}
++# (use_stack_inputs, useforce, usemask, ARCH, IUSE_EFFECTIVE) ->
++# (USE & IUSE_EFFECTIVE, USE, True if USE has a "_*" wildcard), where USE is
++# the set of flags that regenerate() computes from these values.
++_pkg_use_fast_base_memo = {}
++_PKG_USE_FAST_MEMO_MAX = 4096
++# Test hook: None, or a function (config, pkg, result of _pkg_use_fast) that
++# compares the result with a real setcpv() call.
++_PKG_USE_FAST_SELFTEST = None
+ 
+ # use_stack_inputs (see _regenerate_use_stack) -> frozenset of the flags.
+ _regenerate_use_stack_memo = {}
+@@ -392,6 +432,10 @@
+         "PORTAGE_LOGDIR_CLEAN": "PORT_LOGDIR_CLEAN",
+     }
+ 
++    # See _pkg_use_fast(). None, or the constants that the last real
++    # setcpv() call left behind for it. Dropped by modifying(), that is by
++    # every method that changes this instance.
++    _pkg_use_template = None
+     # What the last regenerate() call saw: (use_stack_inputs, True if it
+     # printed no warning and its USE stacking did not depend on IUSE).
+     _regenerate_last = None
+@@ -1851,6 +1895,9 @@
+     def modifying(self):
+         if self.locked:
+             raise Exception(_("Configuration is locked."))
++        # The instance is about to change: what _pkg_use_fast() knows about
++        # it is void until the next complete setcpv() call.
++        self._pkg_use_template = None
+ 
+     def backup_changes(self, key=None):
+         self.modifying()
+@@ -2042,6 +2089,9 @@
+                 stacklevel=2,
+             )
+ 
++        # modifying() drops the template of _pkg_use_fast(); the early return
++        # below changes nothing, so it puts the template back.
++        pkg_use_template = self._pkg_use_template
+         self.modifying()
+ 
+         pkg = None
+@@ -2059,6 +2109,7 @@
+             args_hash = (mycpv, id(mydb))
+ 
+         if args_hash == self._setcpv_args_hash:
++            self._pkg_use_template = pkg_use_template
+             return
+         self._setcpv_args_hash = args_hash
+ 
+@@ -2514,6 +2565,281 @@
+         # setcpv triggers lazy instantiation of things like _use_manager.
+         _eapi_cache.clear()
+ 
++        if pkg is not None:
++            self._pkg_use_template = self._pkg_use_make_template()
++
++    def _pkg_use_make_template(self):
++        """
++        Called at the very end of a complete setcpv() call for a Package
++        (built or not: what is recorded here does not depend on the
++        package). Returns what _pkg_use_fast() needs to know about the state
++        that this call left behind, or None if _pkg_use_fast() must not be
++        used after this call.
++        """
++        last = self._regenerate_last
++        configdict = self.configdict
++        env = configdict["env"]
++        if (
++            last is None
++            # regenerate() printed a warning: every setcpv() call prints it.
++            or not last[1]
++            # package.env settings of this package are in effect, some of
++            # them in objects shared with other config instances.
++            or self._penv
++            # make.defaults of this package's repository are in effect.
++            or configdict["repo"]
++            # FEATURES=test makes USE depend on RESTRICT and PROPERTIES.
++            or "test" in self.features
++            or configdict["features"].get("USE") != ""
++            or self.configlist[-1] is not env
++            or self.lookuplist[0] is not env
++            or len(self.uvlist) != len(last[0])
++        ):
++            return None
++        use_stack_inputs = last[0]
++        use_expand = self.get("USE_EXPAND", "")
++        use_expand_hidden = self.get("USE_EXPAND_HIDDEN", "")
++        # No variable that setcpv() and regenerate() look up for the USE
++        # calculation may be a key of the "pkg" dict, which differs from
++        # package to package ("USE" itself is handled explicitly).
++        names = set(self.incrementals)
++        names.update(use_expand.split())
++        names.update(self.get("USE_EXPAND_UNPREFIXED", "").split())
++        names.update(_PKG_USE_FAST_LOOKUPS)
++        names.discard("USE")
++        if not names.isdisjoint(self._setcpv_aux_keys) or not names.isdisjoint(
++            _PKG_USE_FAST_PKG_KEYS
++        ):
++            return None
++        index = {}
++        for i, curdb in enumerate(self.uvlist):
++            for name in ("pkg", "defaults", "pkginternal"):
++                if curdb is configdict[name]:
++                    index[name] = i
++        for name in ("pkg", "pkginternal"):
++            i = index.get(name)
++            if i is not None:
++                unprefixed_values, _use_str, cur_use_expand, _ = use_stack_inputs[i]
++                if cur_use_expand or any(v is not None for v in unprefixed_values):
++                    return None
++        return (
++            use_stack_inputs,
++            index.get("pkg"),
++            index.get("defaults"),
++            index.get("pkginternal"),
++            use_expand,
++            use_expand_hidden,
++        )
++
++    def _pkg_use_fast(self, pkg):
++        """
++        For an unbuilt Package: return what the resolver reads from this
++        instance right after setcpv(pkg), namely
++
++            (self["PORTAGE_USE"], self.get("USE_EXPAND", ""),
++             self.get("USE_EXPAND_HIDDEN", ""), self.useforce, self.usemask)
++
++        without calling setcpv(pkg), or return None if the caller has to call
++        setcpv(pkg). This instance is left exactly as the last complete
++        setcpv() call left it, except that _setcpv_args_hash is cleared.
++
++        Why the values are those of setcpv(pkg):
++
++        setcpv() always calls reset() (its "previous_iuse_effective is not
++        None == ..." test is a chained comparison that is never true), so
++        what it computes for a package does not depend on the package of the
++        call before, except through package.env settings, repository
++        make.defaults and FEATURES=test. A template exists only if the last
++        complete setcpv() call had none of the three (see
++        _pkg_use_make_template), and it is dropped by modifying(), that is by
++        anything that changes this instance. With a template, the values
++        that regenerate() reads from the dbs of USE_ORDER differ from those
++        it read in that last call only in the USE strings of the "pkg",
++        "defaults" and "pkginternal" dicts. This method computes these three
++        strings, useforce, usemask and "stable" with the statements of
++        setcpv(), returns None for any package that has package.env or
++        repository settings, and stacks with the same _regenerate_use_stack()
++        (and the same memo) as regenerate(). The filtering by IUSE that
++        follows in setcpv() is repeated here for the case without "_*"
++        wildcards; None is returned in the other case.
++
++        Clearing _setcpv_args_hash keeps the next setcpv() call from
++        returning early for a package that this method was not called for
++        last (the hash contains id(pkg), which could be reused).
++        """
++        template = self._pkg_use_template
++        if template is None or self.locked or pkg.built:
++            return None
++        mydb = pkg._metadata
++        if "EAPI" not in mydb or "IUSE" not in mydb:
++            return None
++        if not _get_eapi_attrs(mydb["EAPI"]).iuse_effective:
++            return None
++        iuse = mydb["IUSE"]
++        repository = mydb["repository"] if "repository" in mydb else None
++        cp = cpv_getkey(pkg.cpv)
++        use_manager = self._use_manager
++
++        pkginternaluse_list = []
++        for x in iuse.split():
++            if x.startswith("+"):
++                pkginternaluse_list.append(x[1:])
++            elif x.startswith("-"):
++                pkginternaluse_list.append(x)
++        pkginternaluse = " ".join(pkginternaluse_list)
++
++        stable = self._isStable(pkg)
++
++        if repository and repository != Package.UNKNOWN_REPO:
++            repos = []
++            try:
++                repos.extend(
++                    repo.name for repo in self.repositories[repository].masters
++                )
++            except KeyError:
++                pass
++            repos.append(repository)
++            for repo in repos:
++                # Anything that could put an entry into setcpv()'s repo_env.
++                if (
++                    self._repo_make_defaults.get(repo)
++                    or (stable and use_manager._repo_use_stable_dict.get(repo, ()))
++                    or use_manager._repo_puse_dict.get(repo, {}).get(cp)
++                    or (
++                        stable
++                        and use_manager._repo_puse_stable_dict.get(repo, {}).get(cp)
++                    )
++                ):
++                    return None
++
++        defaults = []
++        for i, pkgprofileuse_dict in enumerate(use_manager._pkgprofileuse):
++            if self.make_defaults_use[i]:
++                defaults.append(self.make_defaults_use[i])
++
++            # package.use.stable > package.use > use.stable
++            if stable and use_manager._use_stable_list[i]:
++                defaults.append(" ".join(use_manager._use_stable_list[i]))
++
++            cpdict = pkgprofileuse_dict.get(cp)
++            if cpdict:
++                pkg_defaults = ordered_by_atom_specificity(cpdict, pkg)
++                if pkg_defaults:
++                    defaults.extend(pkg_defaults)
++
++            if stable:
++                cpdict = use_manager._puse_stable_list[i].get(cp)
++                if cpdict:
++                    pkg_defaults = ordered_by_atom_specificity(cpdict, pkg)
++                    if pkg_defaults:
++                        defaults.extend(pkg_defaults)
++
++        defaults = " ".join(defaults)
++
++        useforce = use_manager.getUseForce(pkg)
++        usemask = use_manager.getUseMask(pkg)
++        puse = use_manager.getPUSE(pkg)
++
++        cpdict = self._penvdict.get(cp)
++        if cpdict and ordered_by_atom_specificity(cpdict, pkg):
++            return None
++
++        # A token that makes _regenerate_use_stack() print a warning (which
++        # setcpv() would then print as well) or look at IUSE.
++        for use_str in (puse, defaults, pkginternaluse):
++            clean = _pkg_use_fast_clean_memo.get(use_str)
++            if clean is None:
++                clean = True
++                for x in use_str.split():
++                    if x[0] == "+" or (x[0] != "-" and x[-2:] == "_*"):
++                        clean = False
++                        break
++                if len(_pkg_use_fast_clean_memo) < _PKG_USE_FAST_MEMO_MAX:
++                    _pkg_use_fast_clean_memo[use_str] = clean
++            if not clean:
++                return None
++
++        (
++            use_stack_inputs,
++            pkg_index,
++            defaults_index,
++            pkginternal_index,
++            use_expand,
++            use_expand_hidden,
++        ) = template
++        # The items that regenerate() would read from the three dicts: the
++        # "pkg" and "pkginternal" dicts set no variable of USE_EXPAND or
++        # USE_EXPAND_UNPREFIXED (checked for the template).
++        use_stack_inputs = list(use_stack_inputs)
++        if pkg_index is not None:
++            use_stack_inputs[pkg_index] = (
++                use_stack_inputs[pkg_index][0],
++                puse,
++                (),
++                () if puse.split() else None,
++            )
++        if defaults_index is not None:
++            item = use_stack_inputs[defaults_index]
++            use_stack_inputs[defaults_index] = (item[0], defaults, item[2], None)
++        if pkginternal_index is not None:
++            use_stack_inputs[pkginternal_index] = (
++                use_stack_inputs[pkginternal_index][0],
++                pkginternaluse,
++                (),
++                () if pkginternaluse.split() else None,
++            )
++        use_stack_inputs = tuple(use_stack_inputs)
++
++        arch = self.configdict["defaults"].get("ARCH")
++        iuse_effective = self._iuse_effective
++        base_key = (use_stack_inputs, useforce, usemask, arch, iuse_effective)
++        base = _pkg_use_fast_base_memo.get(base_key)
++        if base is None:
++            myflags = _regenerate_use_stack_memo.get(use_stack_inputs)
++            if myflags is not None:
++                myflags = set(myflags)
++            else:
++                myflags, memoizable = _regenerate_use_stack(
++                    use_stack_inputs, [x.lstrip("+-") for x in iuse.split()]
++                )
++                if (
++                    memoizable
++                    and len(_regenerate_use_stack_memo)
++                    < _REGENERATE_USE_STACK_MEMO_MAX
++                ):
++                    _regenerate_use_stack_memo[use_stack_inputs] = frozenset(myflags)
++            # The end of regenerate() ...
++            myflags.update(useforce)
++            if arch:
++                myflags.add(arch)
++            myflags.difference_update(usemask)
++            # ... and what setcpv() reads back from it as self["USE"].
++            use = frozenset(" ".join(sorted(myflags)).split())
++            has_wildcard = False
++            for x in use:
++                if x[-2:] == "_*":
++                    has_wildcard = True
++                    break
++            # (flags that pass the IUSE filter whatever the package is,
++            #  USE as a whole, whether setcpv() has wildcards to expand)
++            base = (use.intersection(iuse_effective), use, has_wildcard)
++            if len(_pkg_use_fast_base_memo) < _PKG_USE_FAST_MEMO_MAX:
++                _pkg_use_fast_base_memo[base_key] = base
++        if base[2]:
++            return None
++
++        # setcpv() keeps the flags x of USE with
++        # "x in explicit_iuse or iuse_implicit_match(x)" (no "_*" here), and
++        # iuse_implicit_match is _iuse_effective_match for this EAPI.
++        portage_use = " ".join(sorted(base[0].union(base[1].intersection(pkg.iuse.all))))
++
++        result = (portage_use, use_expand, use_expand_hidden, useforce, usemask)
++        if _PKG_USE_FAST_SELFTEST is not None:
++            _PKG_USE_FAST_SELFTEST(self, pkg, result)
++        else:
++            self._setcpv_args_hash = None
++        return result
++
+     def _grab_pkg_env(self, penv, container, protected_keys=None):
+         if protected_keys is None:
+             protected_keys = ()

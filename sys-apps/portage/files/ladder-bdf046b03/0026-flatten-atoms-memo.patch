@@ -1,0 +1,78 @@
+depgraph: share the _flatten_atoms() cache between backtracking attempts
+
+Sub-series: L (flatten-atoms memo) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
+Ported to upstream 73646c35d: adapted: upstream's _flatten_atoms() has a keys parameter and the cache key (pkg, use, keys); the key is kept, only the dict moves to _frozen_config
+
+The cache of _flatten_atoms() (use_reduce of a package's dependency
+strings for a USE set) moves from the per-attempt state to _frozen_config,
+so that backtracking attempts share it. The result is a pure function of
+(pkg, use), since the metadata of a Package does not change. Exceptions
+are not cached, as before.
+
+This was one of the pieces of patch 0025 of the 25-patch ladder
+(config-trims-and-leftovers), which is now patches 0022, 0025, 0026, 0027
+and 0030. The pieces were not measured one by one in the ladder; together,
+on top of patches 0001-0024: sum of six states 95.9 -> 90.5 s (-5.5 s,
+-1.2 % of the stock sum 447.5). Alone on stock 3.0.83: see README
+(sub-series L).
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21; cut out of its
+former patch on 2026-11-21 without changing a line of code. Not a
+human-written change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on
+six states of one system image, one resolve at a time; every run gave the
+same merge list in the same order, the same number of backtracking attempts
+and the same package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -442,6 +442,9 @@
+         self._match_pkgs_atom_memo = {}
+         # (pkg, enabled USE flags) -> bool, see depgraph._add_pkg.
+         self._required_use_sat_memo = {}
++        # (pkg, USE flags, dependency variables) -> frozenset of atoms, see
++        # depgraph._flatten_atoms.
++        self._flatten_atoms_cache = {}
+         self._highest_license_masked = {}
+         # Whether the --cycle-break limit has already been reported, so
+         # that backtracking does not repeat the message.
+@@ -828,7 +831,6 @@
+         self._ignored_deps = []
+         self._highest_pkg_cache = {}
+         self._highest_pkg_cache_cp_map = {}
+-        self._flatten_atoms_cache = {}
+         self._changed_deps_pkgs = {}
+         # Cleared by depgraph._invalidate_probe_caches().
+         self._select_atoms_probe_cache = {}
+@@ -3601,10 +3603,17 @@
+         @return: set of evaluated atoms
+         """
+ 
++        # The result is use_reduce() of the package's dependency strings
++        # with the given USE, its IUSE and its EAPI: a pure function of
++        # (pkg, use, keys), since the metadata of a Package does not change
++        # (keys: upstream, after 3.0.83). So
++        # the cache is kept in _frozen_config, where all backtracking runs
++        # share it (they ask for the same packages again), instead of in
++        # _dynamic_config. Exceptions are not cached, as before.
+         cache_key = (pkg, use, keys)
+ 
+         try:
+-            return self._dynamic_config._flatten_atoms_cache[cache_key]
++            return self._frozen_config._flatten_atoms_cache[cache_key]
+         except KeyError:
+             pass
+ 
+@@ -3628,7 +3637,7 @@
+ 
+         atoms = frozenset(atoms)
+ 
+-        self._dynamic_config._flatten_atoms_cache[cache_key] = atoms
++        self._frozen_config._flatten_atoms_cache[cache_key] = atoms
+         return atoms
+ 
+     def _iter_similar_available(

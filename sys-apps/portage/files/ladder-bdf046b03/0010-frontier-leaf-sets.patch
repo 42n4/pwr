@@ -1,0 +1,377 @@
+_serialize_frontier: keep the leaves of each level as a set, journal the mutations
+
+Sub-series: B (cycle search and frontier) - patch 4 of 6; applies to 3.0.83 with only the earlier patches of this sub-series.
+Of these it needs 0003, 0006 only.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+_serialize_tasks asks the frontier for the leaves of a priority level in
+every pass of its selection loop. The frontier kept a heap of order-indices
+per level with lazy deletion, so ready_nodes() drained and rebuilt the heap
+on each call, and frontier_leaves() filtered the list again. Now every level
+owns the exact set of its current leaves, updated in remove(), add_edge()
+and _assign_index() at the points where a node's count of surviving children
+reaches or leaves zero (the same test that validated a heap entry), and a
+version counter that changes with the set. ready_nodes() sorts the set by
+order-index, which is the order the heap produced. frontier_leaves() keeps
+its last list per level and returns a copy while the level's version and
+the size of scheduled_uninstalls (which only grows) are unchanged.
+This patch also replaces the reduced form of patch 0006: its single
+`mutations` counter becomes a journal (the list of removed nodes and the
+number of add_edge calls). The no-cycle memo of 0006 keys on the two
+journal sizes, which change exactly when `mutations` changed; the later
+frontier patches read the same journal.
+
+On top of patches 0001-0009, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 60.8 -> 59.9, holds 26.2 -> 25.9, masks 46.5 -> 47.2,
+  py313 38.9 -> 38.0, bdeps 33.9 -> 34.1, policykit 26.2 -> 26.0
+  sum of six 232.3 -> 231.1 (-1.2 s, -0.3 % of the stock sum 447.5)
+Patches 0001-0010 together: 447.5 -> 231.1 s (-48 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Kept as its own patch although its step is inside the noise: it is the
+structural change (heaps to exact leaf sets, counter to journal) that
+patches 0011 and 0024 build on, and it carries the replacement of the
+reduced form of 0006.
+
+Weak spots and what was not checked:
+* The leaf sets are exact only if every graph mutation goes through the
+  frontier's remove()/add_edge(), which the counts already relied on. No
+  lock-step comparison with the heap version was run.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -10134,18 +10134,41 @@
+                 and (node.operation != "uninstall" or node in scheduled_uninstalls)
+             ]
+ 
++        # level -> (frontier.leaf_version[level], len(scheduled_uninstalls),
++        # result) of the last frontier_leaves() call for that level.
++        frontier_leaves_memo = {}
++
+         def frontier_leaves(ignore_priority):
+             """
+             Frontier equivalent of get_nodes(ignore_priority=...): the eligible
+             leaf nodes under `ignore_priority`, in mygraph.order.
++
++            The result depends on the leaf set of the level (the frontier
++            counts its changes in leaf_version), on scheduled_uninstalls
++            (which only grows, so its size identifies its content) and on
++            node.operation, which never changes. The list computed for the
++            same state is kept, and a copy of it is returned.
+             """
+             level = frontier.level_of(ignore_priority)
+-            return [
++            memo = frontier_leaves_memo.get(level)
++            if (
++                memo is not None
++                and memo[0] == frontier.leaf_version[level]
++                and memo[1] == len(scheduled_uninstalls)
++            ):
++                return memo[2][:]
++            result = [
+                 node
+                 for node in frontier.ready_nodes(level)
+                 if isinstance(node, Package)
+                 and (node.operation != "uninstall" or node in scheduled_uninstalls)
+             ]
++            frontier_leaves_memo[level] = (
++                frontier.leaf_version[level],
++                len(scheduled_uninstalls),
++                result,
++            )
++            return result[:]
+ 
+         # sys-apps/portage needs special treatment if ROOT="/"
+         running_root = self._frozen_config._running_root.root
+@@ -10292,8 +10315,8 @@
+             frontier = _SerializeFrontier(mygraph)
+             mygraph.frontier = frontier
+ 
+-        # local_priority_range -> the search state for which the runtime
+-        # cycle search of that range last came back empty.
++        # local_priority_range -> the search state for which the runtime cycle
++        # search of that range last came back empty, see below.
+         no_cycle_memo = {}
+ 
+         while mygraph:
+@@ -10511,24 +10534,25 @@
+                     priority_ranges.append(DepPrioritySatisfiedRange)
+ 
+                 for local_priority_range in priority_ranges:
+-                    search_state = None
+                     if frontier is not None:
+                         # Everything the search below reads besides constants:
+-                        # the graph, scheduled_uninstalls (only grows) and the
++                        # the graph (any mutation goes through the frontier
++                        # journal), scheduled_uninstalls (only grows), and the
+                         # asap/priority_range selection state. When the search
+                         # for this range found nothing in this very state, it
+                         # would find nothing again (this happens each time the
+                         # loop comes back with drop_satisfied set).
+                         search_state = (
+-                            frontier.mutations,
++                            len(frontier.removed_log),
++                            frontier.add_count,
+                             len(scheduled_uninstalls),
+                             priority_range,
+                             tuple(asap_nodes) if prefer_asap and asap_nodes else None,
+                         )
+                         if no_cycle_memo.get(local_priority_range) == search_state:
++                            # What find_smallest_cycle returned then.
+                             selected_nodes, ignore_priority = None, None
+                             continue
+-                    if frontier is not None:
+                         # ignore_medium is ignore_priority[MEDIUM] for both
+                         # ranges, and frontier_leaves() returns the nodes of
+                         # get_nodes() in the same order, without the scan of
+@@ -10552,7 +10576,7 @@
+                         )
+                         if selected_nodes:
+                             break
+-                        if search_state is not None:
++                        if frontier is not None:
+                             no_cycle_memo[local_priority_range] = search_state
+ 
+                 if not selected_nodes:
+@@ -10892,6 +10916,8 @@
+                 # remaining nodes are isolated (no parents or children). Since
+                 # the nodes must be isolated, ignore_priority is not needed.
+                 if frontier is not None:
++                    # get_nodes() without the scan of the whole graph, as
++                    # in the leaf selection above.
+                     selected_nodes = frontier_leaves(None)
+                 else:
+                     selected_nodes = get_nodes()
+diff -ruN a/lib/_emerge/_serialize_frontier.py b/lib/_emerge/_serialize_frontier.py
+--- a/lib/_emerge/_serialize_frontier.py
++++ b/lib/_emerge/_serialize_frontier.py
+@@ -13,10 +13,9 @@
+ count for L is zero. Removing a node decrements its parents' counts; adding an
+ edge increments the parent's counts.
+ 
+-Each level owns a min-heap of the order-indices of its current leaves, so leaves
+-can be enumerated in mygraph.order without an O(V) walk. Heaps use lazy deletion:
+-an entry is valid iff the node is still in the graph, still leaf under the level,
+-and the entry's index is the node's current order-index.
++Each level owns the exact set of its current leaves, so leaves can be enumerated
++(sorted by order-index, i.e. in mygraph.order) without an O(V) walk, and a
++version counter that changes whenever that set changes.
+ 
+ order-index is a node's position in mygraph.order; a node introduced later
+ (uninstall reversal / blocker edges) gets an appended index, as in digraph.add().
+@@ -25,7 +24,6 @@
+ digraph.leaf_nodes() path (frontier not built).
+ """
+ 
+-from heapq import heappop, heappush
+ 
+ from portage.util.digraph import digraph
+ 
+@@ -52,10 +50,10 @@
+ 
+ 
+ class _SerializeFrontier:
+-    """Per-node, per-level surviving-child counts and per-level ready heaps.
++    """Per-node, per-level surviving-child counts and per-level leaf sets.
+ 
+-    A node is a leaf under level L iff surv[node][L] == 0. Counts and heaps are
+-    maintained incrementally as the graph is mutated (see remove/add_edge).
++    A node is a leaf under level L iff surv[node][L] == 0. Counts and leaf sets
++    are maintained incrementally as the graph is mutated (see remove/add_edge).
+     """
+ 
+     def __init__(self, graph):
+@@ -66,18 +64,20 @@
+         self._surv = {}
+         # (parent, child) -> survival bitmask over levels
+         self._edge_mask = {}
+-        # node -> current order-index; index -> node
++        # node -> current order-index
+         self._index = {}
+-        self._by_index = {}
+-        # per-level min-heap of order-indices for nodes currently leaf under it
+-        self._ready = [[] for _ in range(nlevels)]
+-        # Mutation journal: every change of the graph goes through
+-        # remove() or add_edge(), so this number identifies its state.
+-        self.mutations = 0
++        # per-level set of the nodes that are currently leaves under it, and
++        # a counter that is incremented whenever that set changes
++        self._leaf = [set() for _ in range(nlevels)]
++        self.leaf_version = [0] * nlevels
++        # Mutation journal, read by _GatherOkTracker and by the no-cycle memo
++        # in _serialize_tasks: every node removed from the graph (in order),
++        # and the number of add() calls. Pure bookkeeping, never read here.
++        self.removed_log = []
++        self.add_count = 0
+ 
+         for i, node in enumerate(graph.order):
+             self._index[node] = i
+-            self._by_index[i] = node
+         self._next_index = len(graph.order)
+ 
+         for node in graph.order:
+@@ -92,14 +92,12 @@
+                     m ^= lb
+             self._surv[node] = counts
+ 
+-        # Seed each level's ready heap with its initial leaves. Appending in
+-        # order-index order yields a valid min-heap without heapify.
++        # Seed each level's leaf set with its initial leaves.
+         for node in graph.order:
+             counts = self._surv[node]
+-            idx = self._index[node]
+             for L in range(nlevels):
+                 if counts[L] == 0:
+-                    self._ready[L].append(idx)
++                    self._leaf[L].add(node)
+ 
+     def _compute_mask(self, priorities):
+         """Bitmask of the levels whose filter this edge survives.
+@@ -138,34 +136,18 @@
+         return result
+ 
+     def ready_nodes(self, level):
+-        """Return the nodes that are leaves under `level`, in mygraph.order.
+-
+-        Drains the level's heap, discarding stale/duplicate entries, and rebuilds
+-        it from the survivors. Entries pop in ascending order-index order, so the
+-        result is in mygraph.order and the rebuilt heap needs no heapify.
+-        """
+-        heap = self._ready[level]
+-        surv = self._surv
+-        index = self._index
+-        by_index = self._by_index
+-        result = []
+-        seen_idx = set()
+-        while heap:
+-            idx = heappop(heap)
+-            if idx in seen_idx:
+-                continue
+-            seen_idx.add(idx)
+-            node = by_index.get(idx)
+-            if node is None:
+-                continue
+-            counts = surv.get(node)
+-            # Valid iff still in graph, still leaf here, and this is the node's
+-            # current index.
+-            if counts is None or counts[level] != 0 or index.get(node) != idx:
+-                continue
+-            result.append(node)
+-        self._ready[level] = [index[node] for node in result]
+-        return result
++        """Return the nodes that are leaves under `level`, in mygraph.order
++        (ascending order-index; a node has exactly one current order-index)."""
++        leaves = self._leaf[level]
++        if not leaves:
++            return []
++        return sorted(leaves, key=self._index.__getitem__)
++
++    def leaf_set(self, level):
++        """The set of the nodes that are leaves under `level`: the same nodes
++        as ready_nodes(level), as a set that this object keeps up to date.
++        The caller must not modify it."""
++        return self._leaf[level]
+ 
+     def remove(self, node):
+         """Account for `node` leaving the graph. Must be called while the graph
+@@ -174,12 +156,12 @@
+         node_data = self._graph.nodes.get(node)
+         if node_data is None:
+             return
+-        self.mutations += 1
++        self.removed_log.append(node)
+         children, parents, _ = node_data
+         edge_mask = self._edge_mask
+         surv = self._surv
+-        index = self._index
+-        ready = self._ready
++        leaf = self._leaf
++        leaf_version = self.leaf_version
+         for parent in parents:
+             mask = edge_mask.pop((parent, node), None)
+             if mask is None:
+@@ -187,20 +169,25 @@
+             pcounts = surv.get(parent)
+             if pcounts is None:
+                 continue
+-            pidx = index.get(parent)
+             m = mask
+             while m:
+                 lb = m & -m
+                 L = lb.bit_length() - 1
+                 pcounts[L] -= 1
+-                if pcounts[L] == 0 and pidx is not None:
+-                    heappush(ready[L], pidx)
++                if pcounts[L] == 0:
++                    leaf[L].add(parent)
++                    leaf_version[L] += 1
+                 m ^= lb
+         for child in children:
+             edge_mask.pop((node, child), None)
+-        surv.pop(node, None)
+-        # Leave index/by_index in place; ready_nodes filters the stale entries.
+-        # Re-adding the node assigns it a fresh index.
++        counts = surv.pop(node, None)
++        if counts is not None:
++            for L in range(self._nlevels):
++                if counts[L] == 0:
++                    leaf[L].discard(node)
++                    leaf_version[L] += 1
++        # Leave the index in place. Re-adding the node assigns it a fresh
++        # index.
+ 
+     def difference_update(self, nodes):
+         for node in nodes:
+@@ -213,11 +200,11 @@
+             idx = self._next_index
+             self._next_index += 1
+             self._index[node] = idx
+-            self._by_index[idx] = node
+             self._surv[node] = [0] * self._nlevels
+             # A reintroduced node starts isolated, so it is a leaf everywhere.
+             for L in range(self._nlevels):
+-                heappush(self._ready[L], idx)
++                self._leaf[L].add(node)
++                self.leaf_version[L] += 1
+ 
+     def add_edge(self, node, parent, priority):
+         """Account for digraph.add(node, parent, priority), an edge from graph
+@@ -225,10 +212,10 @@
+         mutation, so the parent's priorities list is already updated.
+ 
+         Adding a priority only makes an edge survive more levels, so the parent's
+-        counts only increase. A parent may leave a level's ready set; that is
+-        handled lazily on pop.
++        counts only increase. The parent leaves the leaf set of each level where
++        its count was zero.
+         """
+-        self.mutations += 1
++        self.add_count += 1
+         self._assign_index(node)
+         if not parent:
+             return
+@@ -246,7 +233,11 @@
+         m = delta
+         while m:
+             lb = m & -m
+-            pcounts[lb.bit_length() - 1] += 1
++            L = lb.bit_length() - 1
++            if pcounts[L] == 0:
++                self._leaf[L].discard(parent)
++                self.leaf_version[L] += 1
++            pcounts[L] += 1
+             m ^= lb
+ 
+ 

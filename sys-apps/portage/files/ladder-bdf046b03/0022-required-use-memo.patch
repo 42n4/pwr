@@ -1,0 +1,74 @@
+depgraph: remember per package and USE whether REQUIRED_USE is satisfied
+
+Sub-series: I (REQUIRED_USE memo) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+_add_pkg() remembers per (package, enabled USE) whether REQUIRED_USE is
+satisfied, for all backtracking attempts: the memo is kept in
+_frozen_config, which the attempts share. Only the truth value is kept,
+and an exception is not recorded.
+
+This was one of the pieces of patch 0025 of the 25-patch ladder
+(config-trims-and-leftovers), which is now patches 0022, 0025, 0026, 0027
+and 0030. It stands before flatten-atoms-memo (0026) and
+probe-certain-atoms (now 0029, formerly 0022) because the three add their
+lines at the same place of _frozen_depgraph_config.__init__, and in this
+order each of them applies without the others. The pieces of 0025 were not measured one by one
+in the ladder; together, on top of patches 0001-0024: sum of six states
+95.9 -> 90.5 s (-5.5 s, -1.2 % of the stock sum 447.5). Alone on stock
+3.0.83: see README (sub-series I).
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21; cut out of its
+former patch on 2026-11-21 without changing a line of code. Not a
+human-written change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on
+six states of one system image, one resolve at a time; every run gave the
+same merge list in the same order, the same number of backtracking attempts
+and the same package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -436,6 +436,8 @@
+         self._pkg_cache = {}
+         # See depgraph._iter_match_pkgs_atom.
+         self._match_pkgs_atom_memo = {}
++        # (pkg, enabled USE flags) -> bool, see depgraph._add_pkg.
++        self._required_use_sat_memo = {}
+         self._highest_license_masked = {}
+         # Whether the --cycle-break limit has already been reported, so
+         # that backtracking does not repeat the message.
+@@ -4339,12 +4341,24 @@
+             and pkg._metadata.get("REQUIRED_USE")
+             and eapi_has_required_use(pkg.eapi)
+         ):
+-            required_use_is_sat = check_required_use(
+-                pkg._metadata["REQUIRED_USE"],
+-                self._pkg_use_enabled(pkg),
+-                pkg.iuse.is_valid_flag,
+-                eapi=pkg.eapi,
+-            )
++            # Whether REQUIRED_USE is satisfied depends on the package (its
++            # metadata does not change) and on the enabled USE flags, and
++            # only the truth value is used here. Every backtracking run adds
++            # the same packages again, so the answer is kept for all of them
++            # in _frozen_config. Exceptions are not recorded.
++            pkg_use_enabled = self._pkg_use_enabled(pkg)
++            required_use_memo = self._frozen_config._required_use_sat_memo
++            required_use_is_sat = required_use_memo.get((pkg, pkg_use_enabled))
++            if required_use_is_sat is None:
++                required_use_is_sat = bool(
++                    check_required_use(
++                        pkg._metadata["REQUIRED_USE"],
++                        pkg_use_enabled,
++                        pkg.iuse.is_valid_flag,
++                        eapi=pkg.eapi,
++                    )
++                )
++                required_use_memo[(pkg, pkg_use_enabled)] = required_use_is_sat
+             if not required_use_is_sat:
+                 if dep.atom is not None and dep.parent is not None:
+                     self._add_parent_atom(pkg, (dep.parent, dep.atom))

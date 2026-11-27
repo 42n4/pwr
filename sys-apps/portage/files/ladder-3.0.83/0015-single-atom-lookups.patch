@@ -1,0 +1,295 @@
+depgraph, sets: match one atom against one package without a package set
+
+Sub-series: E (single-atom lookups) - patch 1 of 1; applies to 3.0.83 with only the earlier patches of this sub-series.
+
+The resolver asks "does this one atom match this package" by building an
+InternalPackageSet of one atom and calling findAtomForPackage(), and it
+asks the argument, --exclude and similar sets about every package although
+they hold nothing for almost every cp. _find_single_atom() answers the
+first question with one match_from_list() call, with the same steps as the
+set (modified USE copy, cp test). PackageSet.findAtomForPackage() and
+iterAtomsForPackage() return at once when the set has no atom for the cp,
+and match a lone atom once instead of twice; _iter_atoms_for_pkg() returns
+an empty iterator in the same case. Two upstream commits made after
+3.0.83 are included unchanged: 98f5b2293 (ExtendedAtomDict.get without
+raising KeyError) and 969bcd5b7 (single match in findAtomForPackage).
+
+On top of patches 0001-0014, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 37.6 -> 34.2, holds 19.7 -> 18.0, masks 42.0 -> 36.9,
+  py313 23.1 -> 21.5, bdeps 28.3 -> 25.4, policykit 20.1 -> 18.4
+  sum of six 170.8 -> 154.4 (-16.4 s, -3.7 % of the stock sum 447.5)
+Patches 0001-0015 together: 447.5 -> 154.4 s (-65 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -31,6 +31,7 @@
+ from portage.dbapi.IndexedPortdb import IndexedPortdb
+ from portage.dep import (
+     Atom,
++    ExtendedAtomDict,
+     _build_id_separator,
+     _repo_separator,
+     _slot_separator,
+@@ -374,4 +375,39 @@
+ 
+ 
++def _find_single_atom(atom, pkg, modified_use=None):
++    """
++    For an atom that is an instance of exactly Atom without extended
++    (wildcard) syntax, return what
++
++        InternalPackageSet(initial_atoms=(atom,), allow_repo=True)
++            .findAtomForPackage(pkg, modified_use=modified_use)
++
++    returns, without building the set. Such a set accepts the atom as it is
++    and files it under its cp, and findAtomForPackage() then does this:
++    it replaces pkg by a copy with the modified USE if that is not the USE
++    of pkg; it returns None if the set has nothing for the cp of pkg, i.e.
++    if that is not the cp of the atom; and for a set with this one atom it
++    returns the atom if match_from_list() matches it with pkg, else None
++    (see the single atom shortcut in PackageSet.findAtomForPackage). The
++    resolver asks this question for every parent atom of every package it
++    probes.
++    """
++    if modified_use is not None and modified_use is not pkg.use.enabled:
++        pkg = pkg.copy()
++        pkg._metadata["USE"] = " ".join(modified_use)
++    atom_cp = atom.cp
++    if atom_cp != portage.cpv_getkey(pkg.cpv):
++        return None
++    if atom_cp != pkg.cp:
++        # Not expected (the cp of a package is that of its cpv): the
++        # general code decides.
++        return InternalPackageSet(
++            initial_atoms=(atom,), allow_repo=True
++        ).findAtomForPackage(pkg)
++    if match_from_list(atom, [pkg]):
++        return atom
++    return None
++
++
+ class _frozen_depgraph_config:
+     def __init__(self, settings, trees, myopts, params, spinner):
+@@ -2646,10 +2682,19 @@
+                         # by backtracking if necessary.
+                         continue
+ 
+-            atom_set = InternalPackageSet(initial_atoms=(atom,), allow_repo=True)
+-            if not atom_set.findAtomForPackage(
+-                candidate_pkg, modified_use=self._pkg_use_enabled(candidate_pkg)
+-            ):
++            if atom.__class__ is Atom and not atom.extended_syntax:
++                # See _find_single_atom: the same answer without the set.
++                atom_found = _find_single_atom(
++                    atom,
++                    candidate_pkg,
++                    modified_use=self._pkg_use_enabled(candidate_pkg),
++                )
++            else:
++                atom_set = InternalPackageSet(initial_atoms=(atom,), allow_repo=True)
++                atom_found = atom_set.findAtomForPackage(
++                    candidate_pkg, modified_use=self._pkg_use_enabled(candidate_pkg)
++                )
++            if not atom_found:
+                 if debug:
+                     parent_atoms = []
+                     for (
+@@ -5270,6 +5315,37 @@
+         return ret
+ 
+     def _iter_atoms_for_pkg(self, pkg):
++        # This is asked for every package that the resolver looks at, and
++        # for most of them the argument atoms have nothing: when there is no
++        # extended (wildcard) atom and no atom for the cp of pkg,
++        # iterAtomsForPackage() yields nothing after exactly the three steps
++        # made here (cpv_getkey, _load, the lookup), so the generator below
++        # would yield nothing either. In that case an empty iterator is
++        # returned without creating the two generators. Every caller
++        # consumes the result at once, so it makes no difference that these
++        # steps run at the call instead of at the first next().
++        atoms = self._dynamic_config.sets[pkg.root].atoms
++        if atoms.__class__ is InternalPackageSet:
++            # cpv_getkey(pkg.cpv) and atoms._load() as in
++            # PackageSet.findAtomForPackage: without the calls where they
++            # would only return the cp attribute and do nothing.
++            cpv = pkg.cpv
++            try:
++                cp = cpv.cp
++            except AttributeError:
++                cp = portage.cpv_getkey(cpv)
++            if not (atoms._loaded or atoms._loading):
++                atoms._load()
++            atommap = atoms._atommap
++            if (
++                atommap.__class__ is ExtendedAtomDict
++                and not atommap._extended
++                and atommap._normal.get(cp) is None
++            ):
++                return iter(())
++        return self._iter_atoms_for_pkg_imp(pkg)
++
++    def _iter_atoms_for_pkg_imp(self, pkg):
+         depgraph_sets = self._dynamic_config.sets[pkg.root]
+         atom_arg_map = depgraph_sets.atom_arg_map
+         for atom in depgraph_sets.atoms.iterAtomsForPackage(pkg):
+@@ -7562,7 +7638,11 @@
+         installed = pkg_type == "installed"
+ 
+         if cp_list:
+-            atom_set = InternalPackageSet(initial_atoms=(atom,), allow_repo=True)
++            if atom.__class__ is Atom and not atom.extended_syntax:
++                # See _find_single_atom: the same answers without the set.
++                atom_set = None
++            else:
++                atom_set = InternalPackageSet(initial_atoms=(atom,), allow_repo=True)
+ 
+             # descending order
+             cp_list.reverse()
+@@ -7612,7 +7692,13 @@
+                         # are deferred until we have cached the metadata in a
+                         # Package instance.
+-                        if not atom_set.findAtomForPackage(
+-                            pkg, modified_use=self._pkg_use_enabled(pkg)
+-                        ):
++                        if atom_set is None:
++                            atom_found = _find_single_atom(
++                                atom, pkg, modified_use=self._pkg_use_enabled(pkg)
++                            )
++                        else:
++                            atom_found = atom_set.findAtomForPackage(
++                                pkg, modified_use=self._pkg_use_enabled(pkg)
++                            )
++                        if not atom_found:
+                             continue
+                         matched_something = True
+--- a/lib/portage/_sets/base.py
++++ b/lib/portage/_sets/base.py
+@@ -123,6 +123,59 @@
+             pkg = pkg.copy()
+             pkg._metadata["USE"] = " ".join(modified_use)
+ 
++        # Shortcut for a set that has no atom for the cp of pkg, which is the
++        # usual state of the sets that the resolver consults for every
++        # package it looks at (--exclude and friends are empty unless the
++        # option is given). iterAtomsForPackage() below would do these same
++        # three steps and yield nothing when ExtendedAtomDict.get() returns
++        # nothing for the cp; without extended (wildcard) atoms that is the
++        # case exactly when there is no non-empty entry for the cp in
++        # _normal. best_match_to_list() of no atoms is None.
++        # cpv_getkey(pkg.cpv) and self._load(), without the two calls where
++        # they would do nothing else: cpv_getkey() returns the cp attribute
++        # of a cpv that has one, and _load() (not overridden in an
++        # InternalPackageSet) does nothing once the set is loaded or while
++        # it is loading. This method is called for every candidate package.
++        cpv = pkg.cpv
++        try:
++            cp = cpv.cp
++        except AttributeError:
++            cp = cpv_getkey(cpv)
++        if not (
++            self.__class__ is InternalPackageSet and (self._loaded or self._loading)
++        ):
++            self._load()
++        atommap = self._atommap
++        if (
++            atommap.__class__ is ExtendedAtomDict
++            and not atommap._extended
++            and not atommap._normal.get(cp)
++        ):
++            return None
++
++        # Shortcut for exactly one atom with the cp of pkg and no extended
++        # atoms, which is what a set made from a single atom looks like to a
++        # package of that cp (the resolver makes such sets all the time).
++        # iterAtomsForPackage() below would yield this atom if
++        # match_from_list() matches it, and nothing otherwise. With nothing,
++        # the result is None. With the atom (its cp equals that of pkg, so
++        # it is not transformed), best_match_to_list() matches it a second
++        # time, with the same result, and returns it whatever its operator
++        # is, since it is the only candidate; an Atom is always true.
++        if atommap.__class__ is ExtendedAtomDict and not atommap._extended:
++            atoms = atommap._normal[cp]
++            if len(atoms) == 1:
++                for atom in atoms:
++                    break
++                if (
++                    atom.__class__ is Atom
++                    and atom.cp == pkg.cp
++                    and not atom.extended_syntax
++                ):
++                    if match_from_list(atom, [pkg]):
++                        return atom
++                    return None
++
+         # Atoms matched via PROVIDE must be temporarily transformed since
+         # match_from_list() only works correctly when atom.cp == pkg.cp.
+         rev_transform = {}
+@@ -131,6 +184,16 @@
+                 rev_transform[atom] = atom
+             else:
+                 rev_transform[atom.with_cp(pkg.cp)] = atom
++        if len(rev_transform) == 1:
++            # Upstream commit 969bcd5b7 (after 3.0.83): iterAtomsForPackage()
++            # yielded this atom because match_from_list(atom, [pkg]) found
++            # pkg, and best_match_to_list() of a single atom does nothing but
++            # repeat that match and return the atom. Only for an atom that
++            # was not transformed above: a transformed one is a different
++            # atom that has not been matched yet.
++            for atom, orig_atom in rev_transform.items():
++                if atom is orig_atom:
++                    return atom
+         best_match = best_match_to_list(pkg, iter(rev_transform))
+         if best_match:
+             return rev_transform[best_match]
+@@ -146,6 +209,19 @@
+         cp = cpv_getkey(pkg.cpv)
+         self._load()  # make sure the atoms are loaded
+ 
++        atommap = self._atommap
++        if (
++            atommap.__class__ is ExtendedAtomDict
++            and not atommap._extended
++            and atommap._normal.get(cp) is None
++        ):
++            # ExtendedAtomDict.get() below would return None: without
++            # extended (wildcard) atoms it finds nothing but the _normal
++            # entry of the cp, and there is none. This is the answer for
++            # most packages, and get() reaches it by raising and catching
++            # KeyError.
++            return
++
+         atoms = self._atommap.get(cp)
+         if atoms:
+             for atom in atoms:
+--- a/lib/portage/dep/__init__.py
++++ b/lib/portage/dep/__init__.py
+@@ -2540,6 +2540,20 @@
+ 
+         return ret
+ 
++    def get(self, cp, default=None):
++        # Upstream commit 98f5b2293 (after 3.0.83), unchanged. The inherited
++        # Mapping.get() returns default when __getitem__ raises KeyError.
++        # Without extended keys, __getitem__ raises KeyError for a str that
++        # is not a normal key: for one with "*" from the empty _extended,
++        # for any other because neither _normal nor _extended matches. Most
++        # lookups are such misses; answer them without raising and catching.
++        if not self._extended and isinstance(cp, str) and cp not in self._normal:
++            return default
++        try:
++            return self[cp]
++        except KeyError:
++            return default
++
+     def __setitem__(self, cp, val):
+         if "*" in cp:
+             self._extended[cp] = val

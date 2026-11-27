@@ -1,0 +1,3872 @@
+diff -ruN a/lib/_emerge/AbstractDepPriority.py b/lib/_emerge/AbstractDepPriority.py
+--- a/lib/_emerge/AbstractDepPriority.py
++++ b/lib/_emerge/AbstractDepPriority.py
+@@ -7,7 +7,17 @@
+ from portage.util.SlotObject import SlotObject
+ 
+ 
+-class AbstractDepPriority(SlotObject):
++try:
++    # C base type with the six comparisons below
++    # (src/portage_util__hashbase.c).
++    from portage.util._hashbase import PriorityBase as _PriorityBase
++except ImportError:
++    _PriorityBase = None
++
++
++class AbstractDepPriority(
++    *((SlotObject,) if _PriorityBase is None else (_PriorityBase, SlotObject))
++):
+     __slots__ = (
+         "buildtime",
+         "buildtime_slot_op",
+@@ -17,23 +27,29 @@
+         "runtime_slot_op",
+     )
+ 
+-    def __lt__(self, other):
+-        return self.__int__() < other
++    if _PriorityBase is None:
++
++        def __lt__(self, other):
++            return self.__int__() < other
++
++        def __le__(self, other):
++            return self.__int__() <= other
+ 
+-    def __le__(self, other):
+-        return self.__int__() <= other
++        def __eq__(self, other):
++            return self.__int__() == other
+ 
+-    def __eq__(self, other):
+-        return self.__int__() == other
++        def __ne__(self, other):
++            return self.__int__() != other
+ 
+-    def __ne__(self, other):
+-        return self.__int__() != other
++        def __gt__(self, other):
++            return self.__int__() > other
+ 
+-    def __gt__(self, other):
+-        return self.__int__() > other
++        def __ge__(self, other):
++            return self.__int__() >= other
+ 
+-    def __ge__(self, other):
+-        return self.__int__() >= other
++    else:
++        # as for a class that defines __eq__
++        __hash__ = None
+ 
+     def copy(self):
+         # What copy.copy() does for an instance of a class that has only
+diff -ruN a/lib/_emerge/DepPriority.py b/lib/_emerge/DepPriority.py
+--- a/lib/_emerge/DepPriority.py
++++ b/lib/_emerge/DepPriority.py
+@@ -82,3 +82,13 @@
+         if self.runtime_post:
+             return "runtime_post"
+         return "soft"
++
++
++try:
++    from portage.util._hashbase import register_dep_priority as _c_register
++except ImportError:
++    pass
++else:
++    # The comparisons of the C base read the value of DepPriority.__int__()
++    # from the slots of an instance of exactly this class.
++    _c_register(DepPriority)
+diff -ruN a/lib/_emerge/Package.py b/lib/_emerge/Package.py
+--- a/lib/_emerge/Package.py
++++ b/lib/_emerge/Package.py
+@@ -868,7 +868,7 @@
+         """
+         return iter(self._hash_key[:4])
+ 
+-    def __lt__(self, other):
++    def _py_lt(self, other):
+         if other.cp != self.cp:
+             return self.cp < other.cp
+         result = portage.vercmp(self.version, other.version)
+@@ -878,7 +878,7 @@
+             return self.build_time < other.build_time
+         return False
+ 
+-    def __le__(self, other):
++    def _py_le(self, other):
+         if other.cp != self.cp:
+             return self.cp <= other.cp
+         result = portage.vercmp(self.version, other.version)
+@@ -888,7 +888,7 @@
+             return self.build_time <= other.build_time
+         return False
+ 
+-    def __gt__(self, other):
++    def _py_gt(self, other):
+         if other.cp != self.cp:
+             return self.cp > other.cp
+         result = portage.vercmp(self.version, other.version)
+@@ -898,7 +898,7 @@
+             return self.build_time > other.build_time
+         return False
+ 
+-    def __ge__(self, other):
++    def _py_ge(self, other):
+         if other.cp != self.cp:
+             return self.cp >= other.cp
+         result = portage.vercmp(self.version, other.version)
+@@ -925,6 +925,28 @@
+         return pkg
+ 
+ 
++try:
++    from portage.util._hashbase import register_package as _c_register_package
++except ImportError:
++    _c_register_package = None
++
++# The ordering of Package. With the C base of Task and the three slots it
++# reads, __lt__ and friends are its comparison (src/portage_util__hashbase.c),
++# which hands every unusual operand to the _py_* methods; otherwise these
++# are the methods.
++if _c_register_package is None or not _c_register_package(
++    Package,
++    portage.versions.vercmp,
++    Package._py_lt,
++    Package._py_le,
++    Package._py_gt,
++    Package._py_ge,
++):
++    Package.__lt__ = Package._py_lt
++    Package.__le__ = Package._py_le
++    Package.__gt__ = Package._py_gt
++    Package.__ge__ = Package._py_ge
++
+ _all_metadata_keys = frozenset(set(portage.auxdbkeys).union(Package.metadata_keys))
+ 
+ _PackageMetadataWrapperBase = slot_dict_class(_all_metadata_keys)
+@@ -978,7 +1000,7 @@
+         else:
+             self.update(metadata)
+ 
+-    def __getitem__(self, k):
++    def _py_getitem(self, k):
+         v = _PackageMetadataWrapperBase.__getitem__(self, k)
+         if k in self._use_conditional_keys:
+             if self._pkg.root_config.settings.local_config and "?" in v:
+@@ -1004,6 +1026,15 @@
+ 
+         return v
+ 
++    if hasattr(_PackageMetadataWrapperBase, "_c_getitem_hooked"):
++        # C __getitem__ (src/portage_util__cfast.c): the keys that
++        # _py_getitem treats specially go to it, every other key is the
++        # plain slot lookup that _py_getitem starts with and returns.
++        _c_slow_keys = _use_conditional_keys | frozenset(["USE"])
++        __getitem__ = _PackageMetadataWrapperBase._c_getitem_hooked
++    else:
++        __getitem__ = _py_getitem
++
+     def __setitem__(self, k, v):
+         _PackageMetadataWrapperBase.__setitem__(self, k, v)
+         if k in self._wrapped_keys:
+diff -ruN a/lib/_emerge/Task.py b/lib/_emerge/Task.py
+--- a/lib/_emerge/Task.py
++++ b/lib/_emerge/Task.py
+@@ -3,26 +3,39 @@
+ 
+ from portage.util.SlotObject import SlotObject
+ 
++try:
++    # C base type with _hash_key, _hash_value and the hash and equality
++    # methods below (src/portage_util__hashbase.c). Every dict and set of
++    # packages calls them, a few million times per dependency calculation.
++    from portage.util._hashbase import TaskBase as _TaskBase
++except ImportError:
++    _TaskBase = None
++
++
++class Task(*((SlotObject,) if _TaskBase is None else (_TaskBase, SlotObject))):
++    # With the C base, the two fields are its members (it names them in
++    # its own __slots__ for SlotObject), and it provides __eq__, __ne__
++    # and __hash__ with the semantics of the Python methods here.
++    __slots__ = ("_hash_key", "_hash_value") if _TaskBase is None else ()
++
++    if _TaskBase is None:
++
++        def __eq__(self, other):
++            try:
++                return self._hash_key == other._hash_key
++            except AttributeError:
++                # depgraph._pkg() generates _hash_key
++                # for lookups here, so handle that
++                return self._hash_key == other
++
++        def __ne__(self, other):
++            try:
++                return self._hash_key != other._hash_key
++            except AttributeError:
++                return True
+ 
+-class Task(SlotObject):
+-    __slots__ = ("_hash_key", "_hash_value")
+-
+-    def __eq__(self, other):
+-        try:
+-            return self._hash_key == other._hash_key
+-        except AttributeError:
+-            # depgraph._pkg() generates _hash_key
+-            # for lookups here, so handle that
+-            return self._hash_key == other
+-
+-    def __ne__(self, other):
+-        try:
+-            return self._hash_key != other._hash_key
+-        except AttributeError:
+-            return True
+-
+-    def __hash__(self):
+-        return self._hash_value
++        def __hash__(self):
++            return self._hash_value
+ 
+     def __len__(self):
+         return len(self._hash_key)
+diff -ruN a/lib/portage/cache/mappings.py b/lib/portage/cache/mappings.py
+--- a/lib/portage/cache/mappings.py
++++ b/lib/portage/cache/mappings.py
+@@ -11,6 +11,7 @@
+     "slot_dict_class",
+ ]
+ 
++from types import MemberDescriptorType
+ import weakref
+ 
+ 
+@@ -271,7 +272,45 @@
+     keys = __iter__
+ 
+ 
+-class _SlotDict:
++try:
++    # C base type with __getitem__ and get() of _SlotDict
++    # (src/portage_util__cfast.c).
++    from portage.util._cfast import SlotDictBase as _SlotDictBase
++    from portage.util._cfast import set_keymap_builder as _set_keymap_builder
++except ImportError:
++    _SlotDictBase = None
++
++
++def _build_c_keymap(cls):
++    """
++    Make cls._c_keymap for the C __getitem__: the allowed keys of cls that
++    are stored in an ordinary slot, each with its slot descriptor. A key
++    that is left out (or anything that is not exactly a str) is looked up
++    by _SlotDict._py_raw_getitem instead.
++    """
++    keymap = {}
++    prefix = None
++    for c in cls.__mro__:
++        if "_prefix" in c.__dict__:
++            prefix = c.__dict__["_prefix"]
++            break
++    allowed_keys = getattr(cls, "allowed_keys", ())
++    # _PickledSlotDict keeps prefix, keys and values in the instance
++    if type(prefix) is str and not issubclass(cls, _PickledSlotDict):
++        for k in allowed_keys:
++            if type(k) is not str:
++                continue
++            name = prefix + k
++            for c in cls.__mro__:
++                if name in c.__dict__:
++                    if type(c.__dict__[name]) is MemberDescriptorType:
++                        keymap[k] = c.__dict__[name]
++                    break
++    cls._c_keymap = keymap
++    return keymap
++
++
++class _SlotDict(*(() if _SlotDictBase is None else (_SlotDictBase,))):
+     """
+     Base class for classes returned from slot_dict_class.
+     """
+@@ -367,17 +406,20 @@
+         if kwargs:
+             self.update(kwargs)
+ 
+-    def __getitem__(self, k):
++    def _py_raw_getitem(self, k):
+         try:
+             return getattr(self, self._prefix + k)
+         except AttributeError:
+             raise KeyError(k)
+ 
+-    def get(self, key, default=None):
+-        try:
+-            return self[key]
+-        except KeyError:
+-            return default
++    if _SlotDictBase is None:
++        __getitem__ = _py_raw_getitem
++
++        def get(self, key, default=None):
++            try:
++                return self[key]
++            except KeyError:
++                return default
+ 
+     def __contains__(self, k):
+         return hasattr(self, self._prefix + k)
+@@ -440,6 +482,9 @@
+         super().__init__(*args, **kwargs)
+ 
+ 
++if _SlotDictBase is not None:
++    _set_keymap_builder(_build_c_keymap)
++
+ _slot_dict_classes = weakref.WeakValueDictionary()
+ 
+ 
+diff -ruN a/lib/portage/dep/__init__.py b/lib/portage/dep/__init__.py
+--- a/lib/portage/dep/__init__.py
++++ b/lib/portage/dep/__init__.py
+@@ -255,9 +255,31 @@
+     return out
+ 
+ 
++try:
++    # _c_convert_result and _c_flatten_result in C
++    # (src/portage_util__cfast.c).
++    from portage.util._cfast import convert as _c_convert
++except ImportError:
++    _c_convert = None
++
++
+ def _c_fast_use_reduce(depstr, uselist, matchall, eapi, flat):
+     raw = _c_dep_parser.parse(depstr, uselist=uselist, matchall=matchall)
+     eapi_attrs = _get_eapi_attrs(eapi)
++    if _c_convert is not None and type(raw) is list:
++        result = _c_convert(
++            raw,
++            flat,
++            _c_atom_memo,
++            _c_atom_from_c,
++            eapi,
++            eapi_attrs,
++            uselist,
++            matchall,
++        )
++        if flat:
++            return result
++        return _c_normalize_seq(result, eapi_attrs.empty_groups_always_true)
+     if flat:
+         return _c_flatten_result(raw, [], eapi, eapi_attrs, uselist, matchall)
+     result = _c_convert_result(raw, eapi, eapi_attrs, uselist, matchall)
+@@ -1884,28 +1906,42 @@
+     )
+ 
+ 
+-class Atom:
+-    __slots__ = (
+-        "__weakref__",
+-        "_blocker_obj",
+-        "_build_id",
+-        "_cp",
+-        "_cpv",
+-        "_eapi",
+-        "_extended_syntax",
+-        "_intern_key",
+-        "_match_kind",
+-        "_operator",
+-        "_orig_atom",
+-        "_repo",
+-        "_slot",
+-        "_slot_operator",
+-        "_string",
+-        "_sub_slot",
+-        "_unevaluated_atom",
+-        "_use",
+-        "_version",
+-        "_without_use",
++try:
++    # C base type with the _string field and the hash and equality methods
++    # of Atom (src/portage_util__hashbase.c).
++    from portage.util._hashbase import AtomBase as _AtomBase
++except ImportError:
++    _AtomBase = None
++
++
++class Atom(*(() if _AtomBase is None else (_AtomBase,))):
++    # With the C base, _string is its member, and it provides __eq__ and
++    # __hash__ with the semantics of the Python methods below.
++    __slots__ = tuple(
++        name
++        for name in (
++            "__weakref__",
++            "_blocker_obj",
++            "_build_id",
++            "_cp",
++            "_cpv",
++            "_eapi",
++            "_extended_syntax",
++            "_intern_key",
++            "_match_kind",
++            "_operator",
++            "_orig_atom",
++            "_repo",
++            "_slot",
++            "_slot_operator",
++            "_string",
++            "_sub_slot",
++            "_unevaluated_atom",
++            "_use",
++            "_version",
++            "_without_use",
++        )
++        if _AtomBase is None or name != "_string"
+     )
+ 
+     def __str__(self) -> str:
+@@ -1914,15 +1950,17 @@
+     def __repr__(self) -> str:
+         return f"Atom({self._string!r})"
+ 
+-    def __eq__(self, value: object) -> bool:
+-        if isinstance(value, Atom):
+-            return self._string == value._string
+-        if isinstance(value, str):
+-            return self._string == value
+-        return super().__eq__(value)
++    if _AtomBase is None:
++
++        def __eq__(self, value: object) -> bool:
++            if isinstance(value, Atom):
++                return self._string == value._string
++            if isinstance(value, str):
++                return self._string == value
++            return super().__eq__(value)
+ 
+-    def __hash__(self) -> int:
+-        return hash(self._string)
++        def __hash__(self) -> int:
++            return hash(self._string)
+ 
+     @property
+     def category(self) -> str:
+diff -ruN a/lib/portage/tests/util/meson.build b/lib/portage/tests/util/meson.build
+--- a/lib/portage/tests/util/meson.build
++++ b/lib/portage/tests/util/meson.build
+@@ -1,12 +1,14 @@
+ py.install_sources(
+     [
+         'test_atomic_ofstream.py',
++        'test_cfast.py',
+         'test_cgroup.py',
+         'test_checksum.py',
+         'test_digraph.py',
+         'test_file_copier.py',
+         'test_getconfig.py',
+         'test_grabdict.py',
++        'test_hashbase.py',
+         'test_install_mask.py',
+         'test_manifest.py',
+         'test_mtimedb.py',
+diff -ruN a/lib/portage/tests/util/test_cfast.py b/lib/portage/tests/util/test_cfast.py
+--- a/lib/portage/tests/util/test_cfast.py
++++ b/lib/portage/tests/util/test_cfast.py
+@@ -0,0 +1,403 @@
++# Copyright 2026 Gentoo Authors
++# Distributed under the terms of the GNU General Public License v2
++
++"""
++portage.util._cfast against the Python code it replaces: the slot dict
++lookups of portage.cache.mappings and the conversion of the C parser's tree
++in portage.dep. Same results and same exception types.
++"""
++
++import itertools
++
++import pytest
++
++import portage.dep as dep
++from portage.cache import mappings
++from portage.dep import Atom
++
++try:
++    from portage.util import _cfast
++except ImportError:
++    _cfast = None
++
++pytestmark = pytest.mark.skipif(_cfast is None, reason="native extensions are not built")
++
++
++def outcome(func):
++    try:
++        result = func()
++    except Exception as e:  # noqa: BLE001 - the type is the result
++        return ("raised", type(e))
++    return ("value", type(result), result)
++
++
++# ---- slot dict -----------------------------------------------------------
++
++
++def py_getitem(self, k):
++    """_SlotDict.__getitem__ before the C base."""
++    try:
++        return getattr(self, self._prefix + k)
++    except AttributeError:
++        raise KeyError(k)
++
++
++def py_get(self, key, default=None):
++    try:
++        return py_getitem(self, key)
++    except KeyError:
++        return default
++
++
++class StrSub(str):
++    pass
++
++
++KEYS = ["SLOT", "EAPI", "USE", "KEYWORDS", "DEFINED_PHASES"]
++PROBES = [
++    "SLOT",
++    "EAPI",
++    "USE",
++    "KEYWORDS",
++    "nope",
++    "",
++    StrSub("SLOT"),
++    StrSub("nope"),
++    Atom("dev-libs/foo"),
++    b"SLOT",
++    1,
++    None,
++    ("SLOT",),
++    ["SLOT"],
++    3.5,
++]
++
++
++def test_slot_dict_uses_the_c_base():
++    cls = mappings.slot_dict_class(KEYS)
++    assert issubclass(cls, _cfast.SlotDictBase)
++    assert "__getitem__" not in mappings._SlotDict.__dict__
++    assert "get" not in mappings._SlotDict.__dict__
++
++
++@pytest.mark.parametrize("prefix", ["_val_", "", "x"])
++def test_slot_dict_getitem_and_get_match_python(prefix):
++    cls = mappings.slot_dict_class(KEYS, prefix=prefix)
++    d = cls({"SLOT": "0/1", "EAPI": "8", "USE": ""})  # KEYWORDS, DEFINED_PHASES unset
++    for k in PROBES:
++        assert outcome(lambda: d[k]) == outcome(lambda: py_getitem(d, k)), (prefix, k)
++        assert outcome(lambda: d.get(k)) == outcome(lambda: py_get(d, k)), (prefix, k)
++        assert outcome(lambda: d.get(k, 7)) == outcome(lambda: py_get(d, k, 7)), (prefix, k)
++    assert d.get("KEYWORDS") is None and d.get("KEYWORDS", "x") == "x"
++    with pytest.raises(TypeError):
++        d.get()
++    with pytest.raises(TypeError):
++        d.get("SLOT", 1, 2)
++    # the keymap follows later changes of a value, deletion included
++    d["KEYWORDS"] = "amd64"
++    assert d["KEYWORDS"] == "amd64" and d.get("KEYWORDS") == "amd64"
++    del d["KEYWORDS"]
++    with pytest.raises(KeyError):
++        d["KEYWORDS"]
++    assert set(cls._c_keymap) == set(KEYS)
++
++
++def test_slot_dict_rest_of_the_mapping_api():
++    cls = mappings.slot_dict_class(KEYS)
++    d = cls(SLOT="0")
++    assert dict(d) == {"SLOT": "0"} and len(d) == 1 and "SLOT" in d
++    assert d.setdefault("EAPI", "8") == "8" and d.pop("EAPI") == "8"
++    assert d.pop("EAPI", "gone") == "gone"
++    c = d.copy()
++    assert c == d and c is not d and c["SLOT"] == "0"
++    d.update({"USE": "a b"})
++    assert sorted(d.items()) == [("SLOT", "0"), ("USE", "a b")]
++
++
++def test_slot_dict_subclass_with_python_getitem():
++    cls = mappings.slot_dict_class(KEYS)
++
++    class Loud(cls):
++        __slots__ = ()
++
++        def __getitem__(self, k):
++            return cls.__getitem__(self, k).upper()
++
++    d = Loud(SLOT="abc")
++    assert d["SLOT"] == "ABC"
++    # get() goes through the overriding __getitem__, as the Python get() did
++    assert d.get("SLOT") == "ABC" and d.get("EAPI", "dflt") == "dflt"
++
++
++def test_pickled_slot_dict_stays_on_python_path():
++    import pickle
++
++    cls = mappings.slot_dict_class(KEYS)
++    d = cls(SLOT="0", EAPI="8")
++    p = pickle.loads(pickle.dumps(d))
++    assert type(p) is mappings._PickledSlotDict
++    assert p["SLOT"] == "0" and p.get("EAPI") == "8" and p.get("USE", 5) == 5
++    assert type(p)._c_keymap == {}
++    with pytest.raises(KeyError):
++        p["USE"]
++
++
++def test_package_metadata_wrapper_hooked_getitem():
++    from _emerge.Package import _PackageMetadataWrapper as W
++    from _emerge.Package import _PackageMetadataWrapperBase as B
++
++    assert W.__dict__["__getitem__"] is _cfast.SlotDictBase._c_getitem_hooked
++    assert W._c_slow_keys == W._use_conditional_keys | {"USE"}
++
++    class FakePkg:
++        built = True
++
++    w = W.__new__(W)
++    B.__init__(w)
++    w._pkg = FakePkg()
++    B.__setitem__(w, "SLOT", "0")
++    B.__setitem__(w, "USE", "a b")
++    calls = []
++    orig = W._py_getitem
++
++    def spy(self, k):
++        calls.append(k)
++        return orig(self, k)
++
++    W._py_getitem = spy
++    try:
++        assert w["SLOT"] == "0" and calls == []  # plain key: no Python call
++        assert w["USE"] == "a b" and calls == ["USE"]  # special key: Python method
++        assert w.get("SLOT") == "0" and w.get("EAPI", "x") == "x"
++        with pytest.raises(KeyError):
++            w["EAPI"]
++        for k in PROBES:
++            assert outcome(lambda: w[k]) == outcome(lambda: orig(w, k)), k
++    finally:
++        W._py_getitem = orig
++    # the raw base lookup has no hook, for a wrapper instance too
++    assert B.__getitem__(w, "USE") == "a b"
++
++
++# ---- convert() -----------------------------------------------------------
++
++DEPSTRINGS = [
++    "",
++    "dev-libs/a",
++    "dev-libs/a dev-libs/b",
++    ">=dev-libs/a-1.2:0= !dev-libs/b !!<dev-libs/c-3 ~dev-libs/d-1 =dev-libs/e-2*",
++    "|| ( dev-libs/a dev-libs/b )",
++    "|| ( dev-libs/a ( dev-libs/b dev-libs/c ) )",
++    "|| ( ( dev-libs/a ) )",
++    "|| ( || ( dev-libs/a dev-libs/b ) dev-libs/c )",
++    "|| ( )",
++    "x? ( dev-libs/a ) !x? ( dev-libs/b )",
++    "x? ( y? ( dev-libs/a ) || ( dev-libs/b z? ( dev-libs/c ) ) )",
++    "dev-libs/a[x,y?,-z,w=,!v?] dev-libs/b[x(+),y(-)?]",
++    "dev-libs/a:2/3= dev-libs/b:* dev-libs/c:=",
++    "( dev-libs/a ( dev-libs/b ) ) dev-libs/c",
++    "x? ( ) dev-libs/a",
++    "dev-libs/a::gentoo",
++]
++USELISTS = [(), ("x",), ("x", "y"), ("y", "z", "w", "v")]
++EAPIS = ["8", "7", "6", None]
++
++
++def py_fast_use_reduce(depstr, uselist, matchall, eapi, flat):
++    """_c_fast_use_reduce with the Python conversion."""
++    saved = dep._c_convert
++    dep._c_convert = None
++    try:
++        return dep._c_fast_use_reduce(depstr, uselist, matchall, eapi, flat)
++    finally:
++        dep._c_convert = saved
++
++
++def same_tree(a, b):
++    """Same nesting, types and strings; the very same Atom objects (both
++    trees are alive, so the weak intern caches hand out one instance)."""
++    if isinstance(a, list) or isinstance(b, list):
++        return (
++            type(a) is type(b)
++            and len(a) == len(b)
++            and all(same_tree(x, y) for x, y in zip(a, b))
++        )
++    if isinstance(a, Atom) or isinstance(b, Atom):
++        return a is b
++    return type(a) is type(b) and a == b
++
++
++@pytest.mark.skipif(dep._c_dep_parser is None, reason="no C dependency parser")
++def test_convert_matches_python():
++    n = 0
++    for depstr, uselist, eapi, matchall, flat in itertools.product(
++        DEPSTRINGS, USELISTS, EAPIS, (False, True), (False, True)
++    ):
++        # twice: the first call fills the atom memo, the second one reads it
++        for _ in range(2):
++            expected = outcome(
++                lambda: py_fast_use_reduce(depstr, uselist, matchall, eapi, flat)
++            )
++            got = outcome(
++                lambda: dep._c_fast_use_reduce(depstr, uselist, matchall, eapi, flat)
++            )
++            where = (depstr, uselist, eapi, matchall, flat)
++            assert got[:2] == expected[:2], where
++            if got[0] == "value":
++                assert same_tree(got[2], expected[2]), (where, got[2], expected[2])
++            n += 1
++    assert n == len(DEPSTRINGS) * len(USELISTS) * len(EAPIS) * 8
++
++
++def test_convert_argument_checks_and_errors():
++    with pytest.raises(TypeError):
++        _cfast.convert([], False, {}, None, "8", None, (), False, "extra")
++    with pytest.raises(TypeError):
++        _cfast.convert((), False, {}, None, "8", None, (), False)
++    with pytest.raises(TypeError):
++        _cfast.convert([], False, [], None, "8", None, (), False)
++
++    class Token:
++        def __str__(self):
++            return "tok"
++
++    def boom(*args):
++        raise ValueError("from the slow path")
++
++    with pytest.raises(ValueError):
++        _cfast.convert([Token()], False, {}, boom, "8", None, (), False)
++
++    seen = []
++
++    def slow(catom, eapi, eapi_attrs, uselist, matchall):
++        seen.append((str(catom), eapi, eapi_attrs, uselist, matchall))
++        return "converted"
++
++    t = Token()
++    assert _cfast.convert(["||", [t, [t]], t], False, {}, slow, "8", "attrs", ("u",), 0) == [
++        "||",
++        ["converted", ["converted"]],
++        "converted",
++    ]
++    assert seen[0] == ("tok", "8", "attrs", ("u",), 0) and len(seen) == 3
++    assert _cfast.convert(["||", [t, [t]], t], True, {}, slow, "8", None, (), 0) == [
++        "||",
++        "converted",
++        "converted",
++        "converted",
++    ]
++    # a remembered value of None is not a hit, as in the Python code
++    assert _cfast.convert([t], False, {("tok", "8"): None}, slow, "8", None, (), 1) == [
++        "converted"
++    ]
++    # a remembered atom is returned as it is when matchall is true
++    marker = object()
++    assert _cfast.convert([t], False, {("tok", "8"): marker}, boom, "8", None, (), 1) == [
++        marker
++    ]
++
++
++# ---- vercmp, catpkgsplit, _pkg_str -----------------------------------------
++# The heavy differential runs are qagent/emerge-fast/corpus-vercmp.py and
++# corpus-split.py (every version and cpv of a repository); these are the
++# cases that pin the corners.
++
++from portage import versions  # noqa: E402
++
++VERSIONS = [
++    "0", "1", "01", "1.0", "1.00", "1.01", "1.1", "1.10", "1.9", "1.0.0", "1.0.1",
++    "1a", "1z", "1.0a", "1_p", "1_p0", "1_p1", "1_pre", "1_pre1", "1_rc1", "1_alpha",
++    "1_beta2", "1_p1_p2", "1_rc1_p1", "1.0-r0", "1.0-r1", "1.0-r01", "1.0_p1-r2",
++    "9" * 30, "1." + "9" * 30, "1_p" + "9" * 30, "1-r" + "9" * 30, "1" + ".1" * 80,
++    "", "x", "1.", "1_", "1_foo", "1-r", "1\n", "١", "1.٢", "1A", " 1",
++]
++
++
++def test_vercmp_matches_python():
++    assert versions.vercmp.__wrapped__ is _cfast.vercmp
++    for a in VERSIONS:
++        for b in VERSIONS:
++            assert outcome(lambda: _cfast.vercmp(a, b)) == outcome(
++                lambda: versions._py_vercmp(a, b)
++            ), (a, b)
++    for args in ((1, "1"), ("1", None), ("1",), ("1", "2", 0), ("1", "2", 1, 3)):
++        assert outcome(lambda: _cfast.vercmp(*args)) == outcome(
++            lambda: versions._py_vercmp(*args)
++        ), args
++    assert versions.vercmp("1.10", "1.9") == 1 and versions.vercmp("1.01", "1.1") == -1
++
++
++CPVS = [
++    "dev-libs/foo-1.2", "dev-libs/foo-1.2-r3", "dev-libs/foo-1.2-r0", "foo-1.2",
++    "dev-libs/foo-bar-1.2_p3", "dev-libs/foo-1.0-2.0", "dev-libs/foo", "x/y-1",
++    "gtk+/gtk+-3.0", "a/b-1.0-r1-r2", "a/b-c-1", "a/b-1a_alpha2-r5", "a/b-1-1",
++    "a/-b-1", "a/+b-1", "-a/b-1", "a/b/c-1", "a/b-1.", "a/b-", "/b-1", "a/", "",
++    "a/b-1\n", "a/bé-1", "a/b-١", "a/9-9", "a/b-1" + ".1" * 80, "a b/c-1", "a/b_c-1",
++]
++
++
++def test_catpkgsplit_matches_python():
++    assert versions.catpkgsplit.__wrapped__ is _cfast.catpkgsplit
++    for s in CPVS:
++        for kw in ({}, {"eapi": "8"}, {"eapi": None}):
++            assert outcome(lambda: _cfast.catpkgsplit(s, **kw)) == outcome(
++                lambda: versions._py_catpkgsplit(s, **kw)
++            ), (s, kw)
++    for args, kw in (((1,), {}), ((None,), {}), (("a/b-1", 0), {}), (("a/b-1",), {"silent": 0}),
++                     (("a/b-1",), {"eapi": 5}), ((), {})):
++        assert outcome(lambda: _cfast.catpkgsplit(*args, **kw)) == outcome(
++            lambda: versions._py_catpkgsplit(*args, **kw)
++        ), (args, kw)
++    # a _pkg_str answers with its own cpv_split
++    p = versions._pkg_str("dev-libs/foo-1.2")
++    assert versions.catpkgsplit(p) is p.cpv_split
++
++
++def pkg_str_state(init, cpv, kw):
++    try:
++        p = str.__new__(versions._pkg_str, cpv)
++        init(p, cpv, **kw)
++    except Exception as e:  # noqa: BLE001
++        return ("raised", type(e))
++    d = dict(vars(p))
++    cpv_is_self = d.pop("cpv", None) is p
++    return ("value", list(d), [(k, type(v), v) for k, v in d.items()], cpv_is_self)
++
++
++def test_pkg_str_constructor_matches_python():
++    assert not hasattr(versions._pkg_str.__dict__["__init__"], "__code__")
++    metadatas = [
++        None,
++        {},
++        {"SLOT": "0/1.2", "repository": "gentoo", "EAPI": "8"},
++        {"SLOT": "2", "repository": "my repo!", "EAPI": "4", "BUILD_TIME": "17", "SIZE": "x",
++         "BUILD_ID": "2", "_mtime_": 5},
++        {"SLOT": "bad slot", "EAPI": "8", "BUILD_TIME": "", "BUILD_ID": None},
++        {"SLOT": "", "repository": "", "EAPI": None},
++        mappings.slot_dict_class(["SLOT", "repository", "EAPI"])(SLOT="0", EAPI="8"),
++    ]
++    kws = [
++        {},
++        {"eapi": "8", "slot": "1/2", "repo": "gentoo"},
++        {"slot": "0", "build_time": "77", "build_id": "3", "file_size": 10, "mtime": "9"},
++        {"settings": object(), "db": object(), "repoconfig": object()},
++        {"slot": 5},
++        {"repo": 7},
++        {"eapi": ["8"], "slot": "0"},
++        {"nope": 1},
++    ]
++    for cpv in CPVS:
++        for md in metadatas:
++            for kw in kws:
++                k = dict(kw)
++                if md is not None:
++                    k["metadata"] = md
++                assert pkg_str_state(_cfast.pkg_str_init, cpv, k) == pkg_str_state(
++                    versions._pkg_str._py_init, cpv, k
++                ), (cpv, k)
++    p = versions._pkg_str("dev-libs/foo-1.2-r3", slot="0/2", repo="gentoo", eapi="8")
++    assert (p.cp, p.version, p.slot, p.sub_slot, p.repo, p.cpv is p) == (
++        "dev-libs/foo", "1.2-r3", "0", "2", "gentoo", True
++    )
++    with pytest.raises(AttributeError):
++        p.cp = "x"
+diff -ruN a/lib/portage/tests/util/test_hashbase.py b/lib/portage/tests/util/test_hashbase.py
+--- a/lib/portage/tests/util/test_hashbase.py
++++ b/lib/portage/tests/util/test_hashbase.py
+@@ -0,0 +1,624 @@
++# Copyright 2026 Gentoo Authors
++# Distributed under the terms of the GNU General Public License v2
++
++"""
++The C base types of portage.util._hashbase against the Python methods they
++replace in _emerge.Task and portage.dep.Atom: same results, same exception
++types, same hash values, for every pair of operands below.
++"""
++
++import itertools
++
++import pytest
++
++from portage.dep import Atom
++from portage.util.SlotObject import SlotObject
++
++try:
++    from portage.util import _hashbase
++except ImportError:
++    _hashbase = None
++
++pytestmark = pytest.mark.skipif(
++    _hashbase is None, reason="native extensions are not built"
++)
++
++
++# ---- the reference: the Python bodies, copied from Task.py and dep/__init__.py
++
++
++class PyTask(SlotObject):
++    __slots__ = ("_hash_key", "_hash_value")
++
++    def __eq__(self, other):
++        try:
++            return self._hash_key == other._hash_key
++        except AttributeError:
++            return self._hash_key == other
++
++    def __ne__(self, other):
++        try:
++            return self._hash_key != other._hash_key
++        except AttributeError:
++            return True
++
++    def __hash__(self):
++        return self._hash_value
++
++
++class PyAtom:
++    __slots__ = ("__weakref__", "_string", "_cp")
++
++    def __eq__(self, value):
++        if isinstance(value, PyAtom):
++            return self._string == value._string
++        if isinstance(value, str):
++            return self._string == value
++        return super().__eq__(value)
++
++    def __hash__(self):
++        return hash(self._string)
++
++
++if _hashbase is not None:
++
++    class CTask(_hashbase.TaskBase, SlotObject):
++        __slots__ = ()
++
++    class CTaskSub(CTask):
++        # like Package: more slots, ordering methods, the explicit __hash__
++        __hash__ = CTask.__hash__
++        __slots__ = ("extra",)
++
++        def __lt__(self, other):
++            return self._hash_key < other._hash_key
++
++    class CAtom(_hashbase.AtomBase):
++        __slots__ = ("__weakref__", "_cp")
++
++
++class PyTaskSub(PyTask):
++    __hash__ = PyTask.__hash__
++    __slots__ = ("extra",)
++
++    def __lt__(self, other):
++        return self._hash_key < other._hash_key
++
++
++class Odd:
++    """A foreign operand with a _hash_key of its own."""
++
++    def __init__(self, key):
++        self._hash_key = key
++
++
++class Raiser:
++    """Its _hash_key raises something other than AttributeError."""
++
++    @property
++    def _hash_key(self):
++        raise ValueError("boom")
++
++
++class EqAttributeError:
++    """A key element whose comparison raises AttributeError."""
++
++    def __eq__(self, other):
++        raise AttributeError("from __eq__")
++
++    def __hash__(self):
++        return 7
++
++
++def outcome(func):
++    """The result of func(), or the exception type it raised."""
++    try:
++        result = func()
++    except Exception as e:  # noqa: BLE001 - the type is the result
++        return ("raised", type(e))
++    if result is NotImplemented:
++        return ("NotImplemented",)
++    return ("value", type(result), result)
++
++
++KEYS = [
++    ("ebuild", "/", "dev-libs/foo-1", "merge", "gentoo"),
++    ("ebuild", "/", "dev-libs/foo-1", "merge", "gentoo"),  # equal, not identical
++    ("ebuild", "/", "dev-libs/foo-2", "merge", "gentoo"),
++    ("installed", "/", "dev-libs/foo-1", "nomerge", "gentoo"),
++    ("blocks", "/", "!dev-libs/foo", "8"),
++    (),
++    "a string key",
++    42,
++    None,
++]
++
++
++def make_tasks(cls, sub):
++    tasks = []
++    for key in KEYS:
++        for c in (cls, sub):
++            t = c()
++            t._hash_key = key
++            t._hash_value = hash(key)
++            tasks.append(t)
++    unset = object.__new__(cls)  # neither field set
++    odd_hash = cls()
++    odd_hash._hash_key = ("x",)
++    odd_hash._hash_value = 2**70 + 3  # outside Py_hash_t
++    minus_one = cls()
++    minus_one._hash_key = ("y",)
++    minus_one._hash_value = -1
++    bad_eq = cls()
++    bad_eq._hash_key = (EqAttributeError(),)
++    bad_eq._hash_value = 5
++    return tasks + [unset, odd_hash, minus_one, bad_eq]
++
++
++FOREIGN = [
++    ("ebuild", "/", "dev-libs/foo-1", "merge", "gentoo"),
++    ["ebuild"],
++    "a string key",
++    42,
++    None,
++    3.5,
++    Odd(("ebuild", "/", "dev-libs/foo-1", "merge", "gentoo")),
++    Odd(("other",)),
++    Raiser(),
++    object(),
++]
++
++
++def test_task_fields_and_slots():
++    assert _hashbase.TaskBase.__slots__ == ("_hash_key", "_hash_value")
++    t = CTask()
++    # SlotObject.__init__ set both to None, as it does for the Python class
++    assert t._hash_key is None and t._hash_value is None
++    raw = object.__new__(CTask)
++    with pytest.raises(AttributeError):
++        raw._hash_key
++    with pytest.raises(AttributeError):
++        raw._hash_value
++    t._hash_key = ("k",)
++    t._hash_value = 9
++    c = t.copy()
++    assert c._hash_key == ("k",) and c._hash_value == 9 and c == t
++    del t._hash_key
++    with pytest.raises(AttributeError):
++        t._hash_key
++
++
++def test_task_keyword_constructor():
++    t = CTaskSub(extra=1)
++    assert t.extra == 1 and t._hash_key is None
++    with pytest.raises(TypeError):
++        CTaskSub(nosuch=1)
++
++
++def test_task_compare_matches_python():
++    py = make_tasks(PyTask, PyTaskSub)
++    c = make_tasks(CTask, CTaskSub)
++    assert len(py) == len(c)
++    for (i, a_py), (j, b_py) in itertools.product(enumerate(py), repeat=2):
++        a_c, b_c = c[i], c[j]
++        for name, op in (("eq", lambda x, y: x == y), ("ne", lambda x, y: x != y)):
++            expected = outcome(lambda: op(a_py, b_py))
++            got = outcome(lambda: op(a_c, b_c))
++            assert got == expected, (name, i, j, got, expected)
++    for i, a_py in enumerate(py):
++        a_c = c[i]
++        for k, other in enumerate(FOREIGN):
++            for name, op in (
++                ("eq", lambda x, y: x == y),
++                ("ne", lambda x, y: x != y),
++                ("req", lambda x, y: y == x),
++                ("rne", lambda x, y: y != x),
++                ("dunder_eq", lambda x, y: x.__eq__(y)),
++                ("dunder_ne", lambda x, y: x.__ne__(y)),
++            ):
++                expected = outcome(lambda: op(a_py, other))
++                got = outcome(lambda: op(a_c, other))
++                assert got == expected, (name, i, k, got, expected)
++        for name in ("__lt__", "__le__", "__gt__", "__ge__"):
++            if isinstance(a_py, PyTaskSub) and name == "__lt__":
++                continue
++            assert outcome(lambda: getattr(a_c, name)(a_c)) == outcome(
++                lambda: getattr(a_py, name)(a_py)
++            )
++
++
++def test_task_hash_matches_python():
++    py = make_tasks(PyTask, PyTaskSub)
++    c = make_tasks(CTask, CTaskSub)
++    for a_py, a_c in zip(py, c):
++        assert outcome(lambda: hash(a_c)) == outcome(lambda: hash(a_py))
++    for bad in ("text", 1.5, None):
++        t_py, t_c = PyTask(), CTask()
++        t_py._hash_value = t_c._hash_value = bad
++        assert outcome(lambda: hash(t_c)) == outcome(lambda: hash(t_py))
++
++
++def test_task_set_and_dict_order_matches_python():
++    def build(cls):
++        tasks = []
++        for n in range(2000):
++            t = cls()
++            t._hash_key = ("ebuild", "/", f"cat-{n % 37}/pkg-{n}-{n % 7}", "merge", "repo")
++            t._hash_value = hash(t._hash_key)
++            tasks.append(t)
++        return tasks
++
++    py, c = build(PyTask), build(CTask)
++    assert [t._hash_key for t in set(py)] == [t._hash_key for t in set(c)]
++    assert [t._hash_key for t in set(py[::3]) | set(py[::5])] == [
++        t._hash_key for t in set(c[::3]) | set(c[::5])
++    ]
++    d = {t: n for n, t in enumerate(c)}
++    # lookup by the bare key tuple, as depgraph._pkg() does
++    assert all(d[t._hash_key] == n for n, t in enumerate(c))
++    assert all(t._hash_key in d for t in c)
++
++
++ATOM_STRINGS = ["dev-libs/foo", "dev-libs/foo", ">=dev-libs/foo-1:0=", "", "ż/ó"]
++
++
++def make_atoms(cls):
++    atoms = []
++    for s in ATOM_STRINGS:
++        a = object.__new__(cls)
++        a._string = s
++        atoms.append(a)
++    unset = object.__new__(cls)
++    nonstr = object.__new__(cls)
++    nonstr._string = ("not", "a", "string")
++    unhashable = object.__new__(cls)
++    unhashable._string = ["list"]
++    return atoms + [unset, nonstr, unhashable]
++
++
++class StrSub(str):
++    pass
++
++
++ATOM_FOREIGN = ["dev-libs/foo", StrSub("dev-libs/foo"), "", b"dev-libs/foo", 1, None, object()]
++
++
++def test_atom_matches_python():
++    py, c = make_atoms(PyAtom), make_atoms(CAtom)
++    ops = (
++        ("eq", lambda x, y: x == y),
++        ("ne", lambda x, y: x != y),
++        ("req", lambda x, y: y == x),
++        ("rne", lambda x, y: y != x),
++        ("dunder_eq", lambda x, y: x.__eq__(y)),
++        ("dunder_ne", lambda x, y: x.__ne__(y)),
++        ("dunder_lt", lambda x, y: x.__lt__(y)),
++    )
++    for (i, a_py), (j, b_py) in itertools.product(enumerate(py), repeat=2):
++        for name, op in ops:
++            expected = outcome(lambda: op(a_py, b_py))
++            got = outcome(lambda: op(c[i], c[j]))
++            assert got == expected, (name, i, j, got, expected)
++    for i, a_py in enumerate(py):
++        for k, other in enumerate(ATOM_FOREIGN):
++            for name, op in ops:
++                expected = outcome(lambda: op(a_py, other))
++                got = outcome(lambda: op(c[i], other))
++                assert got == expected, (name, i, k, got, expected)
++        assert outcome(lambda: hash(c[i])) == outcome(lambda: hash(a_py))
++
++
++def test_atom_field():
++    a = object.__new__(CAtom)
++    assert getattr(a, "_string", None) is None
++    a._string = "x/y"
++    assert a._string == "x/y" and hash(a) == hash("x/y")
++    assert {a: 1}["x/y"] == 1  # a str finds an Atom key and the reverse
++    assert a in {"x/y"}
++
++
++def test_real_classes_use_the_c_bases():
++    from _emerge.Blocker import Blocker
++    from _emerge.Package import Package
++    from _emerge.Task import Task
++    from portage.dep import Atom
++
++    assert issubclass(Task, _hashbase.TaskBase)
++    assert issubclass(Atom, _hashbase.AtomBase)
++    for cls in (Task, Package, Blocker):
++        assert cls.__hash__ is _hashbase.TaskBase.__hash__
++        assert "__eq__" not in cls.__dict__
++    assert "_string" not in Atom.__slots__
++    a = Atom("dev-libs/foo")
++    assert a == "dev-libs/foo" and a == Atom("dev-libs/foo") and a != Atom("dev-libs/bar")
++    assert hash(a) == hash("dev-libs/foo")
++    b = Blocker(atom=Atom("!dev-libs/foo"), eapi="8", root="/")
++    assert b == ("blocks", "/", Atom("!dev-libs/foo"), "8")
++    assert hash(b) == hash(("blocks", "/", Atom("!dev-libs/foo"), "8"))
++
++
++# ---- ordering of Package ---------------------------------------------------
++
++import operator  # noqa: E402
++import random  # noqa: E402
++
++OPS = (
++    ("lt", operator.lt, "_py_lt"),
++    ("le", operator.le, "_py_le"),
++    ("gt", operator.gt, "_py_gt"),
++    ("ge", operator.ge, "_py_ge"),
++)
++
++
++class FakeCpv:
++    def __init__(self, build_time):
++        self.build_time = build_time
++
++
++def make_package(cp="dev-libs/foo", version="1.0", built=False, build_time=None):
++    """An instance of the real class with only the slots the ordering reads."""
++    from _emerge.Package import Package
++
++    pkg = object.__new__(Package)
++    pkg.cp = cp
++    pkg.version = version
++    pkg.built = built
++    if build_time is not None:
++        pkg.cpv = FakeCpv(build_time)
++    pkg._hash_key = ("fake", cp, version, built, build_time)
++    pkg._hash_value = hash(pkg._hash_key)
++    return pkg
++
++
++def package_cases():
++    pkgs = [
++        make_package(),
++        make_package(),
++        make_package(version="1.0-r1"),
++        make_package(version="2.0"),
++        make_package(version="1.0_rc1"),
++        make_package(cp="dev-libs/bar"),
++        make_package(cp="sys-apps/foo", version="0.1"),
++        make_package(built=True, build_time=100),
++        make_package(built=True, build_time=100),
++        make_package(built=True, build_time=200),
++        make_package(built=True),  # built without cpv: build_time raises
++        make_package(version="2.0", built=True, build_time=50),
++        make_package(version="not a version"),  # vercmp() returns None
++        make_package(cp=None),
++        make_package(cp=5),
++        make_package(built=1, build_time=7),
++        make_package(cp="x/y"),
++    ]
++    for slot in ("cp", "version", "built"):
++        pkgs.append(_missing(slot))  # the slot is unset: AttributeError
++    return pkgs
++
++
++def _missing(slot):
++    from _emerge.Package import Package
++
++    pkg = object.__new__(Package)
++    for name, value in (("cp", "dev-libs/foo"), ("version", "1.0"), ("built", False)):
++        if name != slot:
++            setattr(pkg, name, value)
++    pkg._hash_key = ("missing", slot)
++    pkg._hash_value = hash(pkg._hash_key)
++    return pkg
++
++
++def test_package_ordering_is_in_c():
++    from _emerge.Package import Package
++
++    for name in ("__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__"):
++        assert name not in Package.__dict__, name
++    assert Package.__lt__ is _hashbase.TaskBase.__lt__
++
++
++def test_package_ordering_matches_python():
++    from _emerge.Blocker import Blocker
++    from _emerge.Package import Package
++
++    class SubPackage(Package):
++        __slots__ = ()
++
++    sub = object.__new__(SubPackage)
++    sub.cp, sub.version, sub.built = "dev-libs/foo", "1.5", False
++    sub._hash_key = ("sub",)
++    sub._hash_value = 1
++    blocker = Blocker(atom=Atom("!dev-libs/foo"), eapi="8", root="/")
++    pkgs = package_cases() + [sub]
++    others = pkgs + [blocker, 5, None, "dev-libs/foo", object(), 1.5]
++    n = 0
++    for a in pkgs:
++        for b in others:
++            for name, op, py_name in OPS:
++                expected = outcome(lambda: getattr(Package, py_name)(a, b))
++                got = outcome(lambda: op(a, b))
++                assert got == expected, (name, a._hash_key, getattr(b, "_hash_key", b), got, expected)
++                # the method called directly, as min() and sort() do
++                got = outcome(lambda: getattr(type(a), f"__{name}__")(a, b))
++                assert got == expected, (name, "direct", a._hash_key, got, expected)
++                n += 1
++    assert n == len(pkgs) * len(others) * 4
++    # reflected: a foreign left operand falls back on the Package's method
++    for b in pkgs[:6]:
++        assert outcome(lambda: 5 < b) == outcome(lambda: Package._py_gt(b, 5))
++
++
++def test_package_sort_and_min_match_python():
++    from _emerge.Package import Package
++
++    rng = random.Random(7)
++    pkgs = [
++        make_package(
++            cp=rng.choice(["a/b", "a/c", "d/e"]),
++            version=rng.choice(["1", "1.0", "1.1", "2", "2-r1", "10"]),
++            built=rng.random() < 0.5,
++            build_time=rng.randrange(5),
++        )
++        for _ in range(400)
++    ]
++    key = _py_cmp_sort_key(lambda x, y: -1 if Package._py_lt(x, y) else (1 if Package._py_lt(y, x) else 0))
++    assert [id(p) for p in sorted(pkgs)] == [id(p) for p in sorted(pkgs, key=key)]
++    assert min(pkgs) is min(pkgs, key=key)
++    assert max(pkgs) is max(pkgs, key=key)
++
++
++# ---- priorities ------------------------------------------------------------
++
++from portage.util import _py_cmp_sort_key  # noqa: E402
++
++FLAGS = ("optional", "buildtime_slot_op", "buildtime", "runtime_slot_op", "runtime", "runtime_post")
++
++
++def py_priority_int(p):
++    """DepPriority.__int__, the method itself."""
++    from _emerge.DepPriority import DepPriority
++
++    return DepPriority.__int__(p)
++
++
++def priority_cases():
++    from _emerge.BlockerDepPriority import BlockerDepPriority
++    from _emerge.DepPriority import DepPriority
++    from _emerge.UnmergeDepPriority import UnmergeDepPriority
++
++    cases = []
++    for bits in itertools.product((False, True), repeat=6):
++        cases.append(DepPriority(**dict(zip(FLAGS, bits))))
++    cases.append(DepPriority(buildtime=1, runtime="yes"))  # truthy, not bool
++    cases.append(DepPriority(optional=0, runtime=[1]))
++    cases.append(DepPriority())  # every flag None
++    raw = object.__new__(DepPriority)  # no slot set: __int__ raises
++    cases.append(raw)
++
++    class Sub(DepPriority):
++        __slots__ = ()
++
++        def __int__(self):
++            return 42
++
++    cases.append(Sub(buildtime=True))
++    cases.append(BlockerDepPriority())
++    cases.append(UnmergeDepPriority(runtime=True))
++    cases.append(UnmergeDepPriority(optional=True))
++    return cases
++
++
++def test_priority_comparisons_match_python():
++    from _emerge.AbstractDepPriority import AbstractDepPriority
++    from _emerge.DepPriority import DepPriority
++
++    assert issubclass(AbstractDepPriority, _hashbase.PriorityBase)
++    assert "__lt__" not in AbstractDepPriority.__dict__
++    assert AbstractDepPriority.__hash__ is None
++    with pytest.raises(TypeError):
++        hash(DepPriority())
++
++    cases = priority_cases()
++    others = cases + [-6, -5, -3, 0, 42, 1.5, None, "x", object()]
++    ops = (
++        ("lt", operator.lt),
++        ("le", operator.le),
++        ("eq", operator.eq),
++        ("ne", operator.ne),
++        ("gt", operator.gt),
++        ("ge", operator.ge),
++    )
++    for a in cases:
++        for b in others:
++            for name, op in ops:
++                # the Python method: self.__int__() <op> other
++                expected = outcome(lambda: op(a.__int__(), b))
++                got = outcome(lambda: op(a, b))
++                assert got == expected, (name, a, b, got, expected)
++    # reflected: an int on the left ends in the priority's mirrored method
++    mirrored = {"lt": operator.gt, "le": operator.ge, "gt": operator.lt, "ge": operator.le,
++                "eq": operator.eq, "ne": operator.ne}
++    for a in cases:
++        for name, op in ops:
++            expected = outcome(lambda: mirrored[name](a.__int__(), -3))
++            assert outcome(lambda: op(-3, a)) == expected, (name, a)
++
++
++def test_priority_value_from_slots_matches_int_method():
++    from _emerge.DepPriority import DepPriority
++
++    for bits in itertools.product((False, True, None, 0, 1, "x", ""), repeat=3):
++        for rest in itertools.product((False, True), repeat=3):
++            p = DepPriority(**dict(zip(FLAGS, bits + rest)))
++            value = py_priority_int(p)
++            # p == value compares the C-read value with the method's value
++            assert p == value and not (p != value) and p >= value and p <= value
++            assert not (p < value) and not (p > value)
++            assert (p < value + 1) and (p > value - 1)
++
++
++def test_priority_bisect_and_sort_match_python():
++    import bisect
++
++    from _emerge.DepPriority import DepPriority
++
++    rng = random.Random(3)
++    prios = [DepPriority(**{rng.choice(FLAGS): True}) for _ in range(300)]
++    out_c = []
++    for p in prios:
++        bisect.insort_right(out_c, p)
++    out_py = []
++    for p in prios:
++        bisect.insort_right(out_py, p, key=py_priority_int)
++    assert [id(p) for p in out_c] == [id(p) for p in out_py]
++    assert [id(p) for p in sorted(prios)] == [id(p) for p in sorted(prios, key=py_priority_int)]
++    c = prios[0].copy()
++    assert c == prios[0] and c is not prios[0] and type(c) is DepPriority
++
++
++# ---- cmp_sort_key ----------------------------------------------------------
++
++
++def test_cmp_sort_key_matches_python():
++    from portage.util import cmp_sort_key
++
++    assert cmp_sort_key is _hashbase.cmp_sort_key
++    assert _py_cmp_sort_key is not cmp_sort_key
++
++    def raising(x, y):
++        raise ValueError("cmp")
++
++    cmps = [
++        lambda x, y: (x > y) - (x < y),
++        lambda x, y: y - x,
++        lambda x, y: 0,
++        lambda x, y: float(x - y),
++        lambda x, y: None,  # "None < 0" raises TypeError
++        lambda x, y: "text",
++        raising,
++    ]
++    rng = random.Random(5)
++    lists = [[], [1], [2, 1], [rng.randrange(50) for _ in range(200)]]
++    for cmp_func in cmps:
++        for data in lists:
++            expected = outcome(lambda: sorted(data, key=_py_cmp_sort_key(cmp_func)))
++            got = outcome(lambda: sorted(data, key=cmp_sort_key(cmp_func)))
++            assert got == expected, (cmp_func, len(data), got, expected)
++            expected = outcome(lambda: max(data, key=_py_cmp_sort_key(cmp_func)))
++            got = outcome(lambda: max(data, key=cmp_sort_key(cmp_func)))
++            assert got == expected
++
++    key = cmp_sort_key(cmps[0])
++    assert key._cmp_func is cmps[0]
++    k1, k2 = key(1), key(2)
++    assert type(k1) is cmp_sort_key._cmp_key and k1._obj == 1 and k1._cmp_func is cmps[0]
++    assert (k1 < k2) is True and (k2 < k1) is False
++    for other in (5, None, _py_cmp_sort_key(cmps[0])(1)):
++        with pytest.raises(TypeError):
++            k1 < other
++    pk1 = _py_cmp_sort_key(cmps[0])(1)
++    with pytest.raises(TypeError):
++        pk1 < 5
++    with pytest.raises(TypeError):
++        cmp_sort_key()
++    with pytest.raises(TypeError):
++        key(1, 2)
++    assert cmp_sort_key(cmp_func=cmps[1])(3)._obj == 3
+diff -ruN a/lib/portage/util/__init__.py b/lib/portage/util/__init__.py
+--- a/lib/portage/util/__init__.py
++++ b/lib/portage/util/__init__.py
+@@ -1085,6 +1085,15 @@
+             return self._cmp_func(self._obj, other._obj) < 0
+ 
+ 
++_py_cmp_sort_key = cmp_sort_key
++try:
++    # the same in C (src/portage_util__hashbase.c): sort() calls the __lt__
++    # of the key objects for every comparison
++    from portage.util._hashbase import cmp_sort_key
++except ImportError:
++    pass
++
++
+ def unique_array(s):
+     """lifted from python cookbook, credit: Tim Peters
+     Return a list of the elements in s in arbitrary order, sans duplicates"""
+diff -ruN a/lib/portage/versions.py b/lib/portage/versions.py
+--- a/lib/portage/versions.py
++++ b/lib/portage/versions.py
+@@ -114,8 +114,7 @@
+ # pairs of versions than that, again and again, and the function is a pure
+ # function of its arguments (no caller passes silent=0, the only thing
+ # that makes it print), so a larger cache returns the same values.
+-@lru_cache(None)
+-def vercmp(ver1: str, ver2: str, silent: int = 1) -> Optional[int]:
++def _py_vercmp(ver1: str, ver2: str, silent: int = 1) -> Optional[int]:
+     """
+     Compare two versions
+     Example usage:
+@@ -262,6 +261,17 @@
+     return rval
+ 
+ 
++try:
++    # The comparison of two valid ASCII versions in C
++    # (src/portage_util__cfast.c); _py_vercmp() for the rest.
++    from portage.util import _cfast as _c_vercmp
++
++    _c_vercmp.register("py_vercmp", _py_vercmp)
++    vercmp = lru_cache(None)(_c_vercmp.vercmp)
++except (ImportError, AttributeError, ValueError):
++    vercmp = lru_cache(None)(_py_vercmp)
++
++
+ def pkgcmp(pkg1: tuple[str, str, str], pkg2: tuple[str, str, str]) -> Optional[int]:
+     """
+     Compare 2 package versions created in pkgsplit format.
+@@ -318,8 +328,7 @@
+ 
+ # Unbounded (it was 10240 entries, fewer than the cpvs that one resolver run
+ # splits): a pure function of its arguments, silent is not used.
+-@lru_cache(None)
+-def catpkgsplit(
++def _py_catpkgsplit(
+     mydata: Union[str, "_pkg_str"],
+     silent: int = 1,
+     eapi: Any = None,
+@@ -356,6 +365,19 @@
+     return retval
+ 
+ 
++try:
++    # The split of a plain ASCII string in C (src/portage_util__cfast.c);
++    # _py_catpkgsplit() for the rest (_pkg_str instances, other types).
++    from portage.util import _cfast as _c_catpkgsplit
++
++    if _missing_cat != "null":
++        raise ImportError("the C catpkgsplit returns 'null' for a missing category")
++    _c_catpkgsplit.register("py_catpkgsplit", _py_catpkgsplit)
++    catpkgsplit = lru_cache(None)(_c_catpkgsplit.catpkgsplit)
++except (ImportError, AttributeError, ValueError):
++    catpkgsplit = lru_cache(None)(_py_catpkgsplit)
++
++
+ class _pkg_str(str):
+     """
+     This class represents a cpv. It inherits from str and has attributes
+@@ -389,7 +411,7 @@
+     ):
+         return str.__new__(cls, cpv)
+ 
+-    def __init__(
++    def _py_init(
+         self,
+         cpv: str,
+         metadata: Optional[dict[str, Any]] = None,
+@@ -504,6 +526,49 @@
+             return stable
+ 
+ 
++
++def _pkg_str_slot_parts(slot, eapi):
++    """
++    (slot, sub_slot, slot_invalid or None) as _pkg_str._py_init() sets them
++    for a slot that is not None: a pure function of two strings.
++    """
++    eapi_attrs = _get_eapi_attrs(eapi)
++    slot_match = _get_slot_re(eapi_attrs).match(slot)
++    if slot_match is None:
++        # Avoid an InvalidAtom exception when creating SLOT atoms
++        return ("0", "0", slot)
++    if eapi_attrs.slot_operator:
++        slot_split = slot.split("/")
++        if len(slot_split) > 1:
++            return (slot_split[0], slot_split[1], None)
++        return (slot_split[0], slot_split[0], None)
++    return (slot, slot, None)
++
++
++def _pkg_str_repo_name(repo):
++    """The repo attribute that _pkg_str._py_init() sets for this repo."""
++    from portage.repository.config import _gen_valid_repo
++
++    repo = _gen_valid_repo(repo)
++    if not repo:
++        repo = _unknown_repo
++    return repo
++
++
++try:
++    # The constructor in C for the usual arguments
++    # (src/portage_util__cfast.c); _py_init() for the rest.
++    from portage.util import _cfast as _c_pkg_str
++
++    _c_pkg_str.register("catpkgsplit", catpkgsplit)
++    _c_pkg_str.register("pkg_str_py_init", _pkg_str._py_init)
++    _c_pkg_str.register("pkg_str_slot_parts", _pkg_str_slot_parts)
++    _c_pkg_str.register("pkg_str_repo_name", _pkg_str_repo_name)
++    _pkg_str.__init__ = _c_pkg_str.as_method(_c_pkg_str.pkg_str_init)
++except (ImportError, AttributeError):
++    _pkg_str.__init__ = _pkg_str._py_init
++
++
+ def pkgsplit(
+     mypkg: str, silent: int = 1, eapi: Any = None
+ ) -> Optional[tuple[str, str, str]]:
+diff -ruN a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -20,6 +20,42 @@
+     check : true
+ )
+ 
++hashbase_ext = py.extension_module(
++    '_hashbase',
++    'portage_util__hashbase.c',
++    dependencies : py.dependency(),
++    subdir : 'portage' / 'util',
++    install : true
++)
++
++run_command(
++    [
++        'ln', '-srnf',
++        hashbase_ext.full_path(),
++        meson.project_source_root() / 'lib' / 'portage' / 'util/'
++    ],
++    capture : false,
++    check : true
++)
++
++cfast_ext = py.extension_module(
++    '_cfast',
++    'portage_util__cfast.c',
++    dependencies : py.dependency(),
++    subdir : 'portage' / 'util',
++    install : true
++)
++
++run_command(
++    [
++        'ln', '-srnf',
++        cfast_ext.full_path(),
++        meson.project_source_root() / 'lib' / 'portage' / 'util/'
++    ],
++    capture : false,
++    check : true
++)
++
+ dep_parser_ext = py.extension_module(
+     '_parser',
+     'dep_parser_core.c',
+@@ -40,7 +76,7 @@
+     check : true
+ )
+ 
+-foreach mod : ['portage.util._whirlpool', 'portage.dep._parser']
++foreach mod : ['portage.util._whirlpool', 'portage.util._hashbase', 'portage.util._cfast', 'portage.dep._parser']
+     test(
+         'import ' + mod,
+         py,
+diff -ruN a/src/portage_util__cfast.c b/src/portage_util__cfast.c
+--- a/src/portage_util__cfast.c
++++ b/src/portage_util__cfast.c
+@@ -0,0 +1,1241 @@
++/* Copyright 2026 Gentoo Authors
++ * Distributed under the terms of the GNU General Public License v2
++ *
++ * Two hot paths of the dependency resolver that are plain data work:
++ *
++ *   SlotDictBase   base of portage.cache.mappings._SlotDict: __getitem__ and
++ *                  get() without a Python frame, plus a "hooked" __getitem__
++ *                  for _emerge.Package._PackageMetadataWrapper (about a
++ *                  million metadata lookups per dependency calculation).
++ *   convert()      turns the tree returned by portage.dep._parser.parse()
++ *                  into lists of portage.dep.Atom, taking remembered atoms
++ *                  straight from the memo dict (_c_convert_result and
++ *                  _c_flatten_result of portage/dep/__init__.py).
++ *
++ *   pkg_str_init() the constructor of portage.versions._pkg_str.
++ *
++ * Whatever is not the common case is handed to the Python code that these
++ * replace, which stays in place as the fallback for builds without native
++ * extensions and as the reference of
++ * lib/portage/tests/util/test_cfast.py.
++ */
++
++#define PY_SSIZE_T_CLEAN
++#include <Python.h>
++#include <string.h>
++
++static PyObject *str_c_keymap = NULL;		/* "_c_keymap" */
++static PyObject *str_c_slow_keys = NULL;	/* "_c_slow_keys" */
++static PyObject *str_py_raw_getitem = NULL;	/* "_py_raw_getitem" */
++static PyObject *str_py_getitem = NULL;		/* "_py_getitem" */
++static PyObject *str_use = NULL;		/* "_use" */
++static PyObject *str_conditional = NULL;	/* "conditional" */
++static PyObject *keymap_builder = NULL;		/* set by set_keymap_builder() */
++
++/* ------------------------------------------------------------------ */
++/* SlotDictBase                                                         */
++
++/* The class's {key: slot descriptor} dict, a new reference. It lives in the
++ * class's own __dict__ as _c_keymap; the Python builder makes it on first
++ * use (portage.cache.mappings._build_c_keymap). */
++static PyObject *
++slotdict_keymap(PyTypeObject *tp)
++{
++	PyObject *dict, *map;
++
++	dict = PyType_GetDict(tp);
++	if (dict == NULL)
++		return NULL;
++	map = PyDict_GetItemWithError(dict, str_c_keymap);
++	Py_XINCREF(map);
++	Py_DECREF(dict);
++	if (map != NULL)
++		return map;
++	if (PyErr_Occurred())
++		return NULL;
++	if (keymap_builder == NULL) {
++		PyErr_SetString(PyExc_RuntimeError,
++			"portage.util._cfast: no keymap builder registered");
++		return NULL;
++	}
++	map = PyObject_CallOneArg(keymap_builder, (PyObject *)tp);
++	if (map != NULL && !PyDict_Check(map)) {
++		Py_DECREF(map);
++		PyErr_SetString(PyExc_TypeError, "keymap builder must return a dict");
++		return NULL;
++	}
++	return map;
++}
++
++/*  def __getitem__(self, k):
++ *      try:
++ *          return getattr(self, self._prefix + k)
++ *      except AttributeError:
++ *          raise KeyError(k)
++ *
++ * Fast path: k is exactly a str and names an ordinary slot of the class.
++ * Everything else is answered by the Python body (_py_raw_getitem).
++ * With quiet set, an unset slot returns NULL with *missing = 1 and no
++ * exception. */
++static PyObject *
++slotdict_lookup(PyObject *self, PyObject *k, int quiet, int *missing)
++{
++	PyObject *map, *descr, *value;
++	descrgetfunc get;
++
++	if (PyUnicode_CheckExact(k)) {
++		map = slotdict_keymap(Py_TYPE(self));
++		if (map == NULL)
++			return NULL;
++		descr = PyDict_GetItemWithError(map, k);
++		Py_XINCREF(descr);
++		Py_DECREF(map);
++		if (descr != NULL) {
++			get = Py_TYPE(descr)->tp_descr_get;
++			if (get == NULL) {
++				Py_DECREF(descr);
++				PyErr_SetString(PyExc_TypeError,
++					"_c_keymap value is not a descriptor");
++				return NULL;
++			}
++			value = get(descr, self, (PyObject *)Py_TYPE(self));
++			Py_DECREF(descr);
++			if (value == NULL && PyErr_ExceptionMatches(PyExc_AttributeError)) {
++				PyErr_Clear();
++				if (quiet)
++					*missing = 1;
++				else
++					PyErr_SetObject(PyExc_KeyError, k);
++			}
++			return value;
++		}
++		if (PyErr_Occurred())
++			return NULL;
++	}
++	return PyObject_CallMethodOneArg(self, str_py_raw_getitem, k);
++}
++
++static PyObject *
++slotdict_subscript(PyObject *self, PyObject *k)
++{
++	return slotdict_lookup(self, k, 0, NULL);
++}
++
++/* The __getitem__ of a subclass that treats some keys specially: a key in
++ * the class's _c_slow_keys goes to the subclass's Python method
++ * _py_getitem, any other key is a plain lookup. */
++static PyObject *
++slotdict_getitem_hooked(PyObject *self, PyObject *k)
++{
++	PyObject *slow;
++	int is_slow;
++
++	slow = PyObject_GetAttr((PyObject *)Py_TYPE(self), str_c_slow_keys);
++	if (slow == NULL)
++		return NULL;
++	is_slow = PySequence_Contains(slow, k);
++	Py_DECREF(slow);
++	if (is_slow < 0)
++		return NULL;
++	if (is_slow)
++		return PyObject_CallMethodOneArg(self, str_py_getitem, k);
++	return slotdict_lookup(self, k, 0, NULL);
++}
++
++/*  def get(self, key, default=None):
++ *      try:
++ *          return self[key]
++ *      except KeyError:
++ *          return default
++ */
++static PyObject *
++slotdict_get(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
++{
++	PyObject *key, *fallback = Py_None, *value;
++	PyMappingMethods *mapping = Py_TYPE(self)->tp_as_mapping;
++	int missing = 0;
++
++	if (nargs < 1 || nargs > 2) {
++		PyErr_Format(PyExc_TypeError,
++			"get expected 1 or 2 arguments, got %zd", nargs);
++		return NULL;
++	}
++	key = args[0];
++	if (nargs == 2)
++		fallback = args[1];
++
++	if (mapping != NULL && mapping->mp_subscript == slotdict_subscript)
++		value = slotdict_lookup(self, key, 1, &missing);
++	else
++		value = PyObject_GetItem(self, key);	/* an overriding __getitem__ */
++	if (value != NULL)
++		return value;
++	if (!missing) {
++		if (!PyErr_ExceptionMatches(PyExc_KeyError))
++			return NULL;
++		PyErr_Clear();
++	}
++	return Py_NewRef(fallback);
++}
++
++static PyMethodDef slotdict_methods[] = {
++	{"get", (PyCFunction)(void (*)(void))slotdict_get, METH_FASTCALL,
++	 "get(key, default=None): self[key], or default if the key is unset"},
++	{"_c_getitem_hooked", slotdict_getitem_hooked, METH_O,
++	 "__getitem__ for a subclass with _c_slow_keys and _py_getitem"},
++	{NULL}
++};
++
++static PyType_Slot slotdict_slots[] = {
++	{Py_mp_subscript, slotdict_subscript},
++	{Py_tp_methods, slotdict_methods},
++	{0, NULL}
++};
++
++static PyType_Spec slotdict_spec = {
++	.name = "portage.util._cfast.SlotDictBase",
++	.basicsize = sizeof(PyObject),
++	.flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
++	.slots = slotdict_slots,
++};
++
++static PyObject *
++cfast_set_keymap_builder(PyObject *Py_UNUSED(module), PyObject *func)
++{
++	if (!PyCallable_Check(func)) {
++		PyErr_SetString(PyExc_TypeError, "expected a callable");
++		return NULL;
++	}
++	Py_XSETREF(keymap_builder, Py_NewRef(func));
++	Py_RETURN_NONE;
++}
++
++/* ------------------------------------------------------------------ */
++/* convert()                                                            */
++
++typedef struct {
++	PyObject *memo;		/* {(token string, eapi): Atom} */
++	PyObject *slow;		/* _c_atom_from_c */
++	PyObject *eapi;
++	PyObject *eapi_attrs;
++	PyObject *uselist;
++	PyObject *matchall;
++	int matchall_true;
++} convert_ctx;
++
++/* _c_atom_from_c(catom, eapi, eapi_attrs, uselist, matchall) for a token
++ * whose Atom is remembered and needs no USE evaluation; the Python function
++ * for every other token. Returns a new reference. */
++static PyObject *
++convert_atom(PyObject *catom, convert_ctx *ctx)
++{
++	PyObject *token, *key, *atom, *use, *conditional;
++	int truth;
++
++	token = PyObject_Str(catom);
++	if (token == NULL)
++		return NULL;
++	key = PyTuple_Pack(2, token, ctx->eapi);
++	Py_DECREF(token);
++	if (key == NULL)
++		return NULL;
++	atom = PyDict_GetItemWithError(ctx->memo, key);
++	Py_XINCREF(atom);
++	Py_DECREF(key);
++	if (atom == NULL && PyErr_Occurred())
++		return NULL;
++
++	if (atom != NULL && atom != Py_None) {
++		if (ctx->matchall_true)
++			return atom;
++		use = PyObject_GetAttr(atom, str_use);
++		if (use == NULL) {
++			Py_DECREF(atom);
++			return NULL;
++		}
++		if (use == Py_None) {
++			Py_DECREF(use);
++			return atom;
++		}
++		conditional = PyObject_GetAttr(use, str_conditional);
++		Py_DECREF(use);
++		if (conditional == NULL) {
++			Py_DECREF(atom);
++			return NULL;
++		}
++		truth = PyObject_IsTrue(conditional);
++		Py_DECREF(conditional);
++		if (truth < 0) {
++			Py_DECREF(atom);
++			return NULL;
++		}
++		if (!truth)
++			return atom;
++	}
++	Py_XDECREF(atom);
++	return PyObject_CallFunctionObjArgs(ctx->slow, catom, ctx->eapi,
++		ctx->eapi_attrs, ctx->uselist, ctx->matchall, NULL);
++}
++
++/* Append the conversion of items to out: nested lists stay nested
++ * (_c_convert_result) or are spliced in (flat, _c_flatten_result). */
++static int
++convert_into(PyObject *items, PyObject *out, int flat, convert_ctx *ctx)
++{
++	Py_ssize_t i;
++	PyObject *item, *converted;
++	int rc;
++
++	if (Py_EnterRecursiveCall(" while converting a dependency string"))
++		return -1;
++	/* the list can change while Python code runs: re-read its size */
++	for (i = 0; i < PyList_GET_SIZE(items); i++) {
++		item = Py_NewRef(PyList_GET_ITEM(items, i));
++		if (PyUnicode_Check(item)) {
++			rc = PyList_Append(out, item);
++		}
++		else if (PyList_Check(item)) {
++			if (flat) {
++				rc = convert_into(item, out, 1, ctx);
++			}
++			else {
++				converted = PyList_New(0);
++				rc = -1;
++				if (converted != NULL) {
++					rc = convert_into(item, converted, 0, ctx);
++					if (rc == 0)
++						rc = PyList_Append(out, converted);
++					Py_DECREF(converted);
++				}
++			}
++		}
++		else {
++			converted = convert_atom(item, ctx);
++			rc = -1;
++			if (converted != NULL) {
++				rc = PyList_Append(out, converted);
++				Py_DECREF(converted);
++			}
++		}
++		Py_DECREF(item);
++		if (rc < 0) {
++			Py_LeaveRecursiveCall();
++			return -1;
++		}
++	}
++	Py_LeaveRecursiveCall();
++	return 0;
++}
++
++static PyObject *
++cfast_convert(PyObject *Py_UNUSED(module), PyObject *const *args, Py_ssize_t nargs)
++{
++	convert_ctx ctx;
++	PyObject *raw, *out;
++	int flat;
++
++	if (nargs != 8) {
++		PyErr_Format(PyExc_TypeError,
++			"convert expected 8 arguments, got %zd", nargs);
++		return NULL;
++	}
++	raw = args[0];
++	if (!PyList_Check(raw)) {
++		PyErr_SetString(PyExc_TypeError, "convert: the parse tree must be a list");
++		return NULL;
++	}
++	flat = PyObject_IsTrue(args[1]);
++	if (flat < 0)
++		return NULL;
++	ctx.memo = args[2];
++	if (!PyDict_Check(ctx.memo)) {
++		PyErr_SetString(PyExc_TypeError, "convert: the memo must be a dict");
++		return NULL;
++	}
++	ctx.slow = args[3];
++	ctx.eapi = args[4];
++	ctx.eapi_attrs = args[5];
++	ctx.uselist = args[6];
++	ctx.matchall = args[7];
++	ctx.matchall_true = PyObject_IsTrue(ctx.matchall);
++	if (ctx.matchall_true < 0)
++		return NULL;
++
++	out = PyList_New(0);
++	if (out == NULL)
++		return NULL;
++	if (convert_into(raw, out, flat, &ctx) < 0) {
++		Py_DECREF(out);
++		return NULL;
++	}
++	return out;
++}
++
++/* ------------------------------------------------------------------ */
++/* _pkg_str.__init__                                                    */
++
++/* portage.versions._pkg_str.__init__ for the usual arguments; the Python
++ * method (_py_init) for the rest, which starts again from the beginning:
++ * everything done here before that point it does again, with the same
++ * values.
++ *
++ * Registered with register():
++ *   catpkgsplit           portage.versions.catpkgsplit
++ *   pkg_str_py_init       _pkg_str._py_init
++ *   pkg_str_slot_parts    (slot, eapi) -> (slot, sub_slot, slot_invalid or None)
++ *   pkg_str_repo_name     repo -> the "repo" attribute
++ * The last two are pure functions of str arguments; their results are
++ * remembered here. */
++static PyObject *reg_catpkgsplit = NULL;
++static PyObject *reg_pkg_str_py_init = NULL;
++static PyObject *reg_slot_parts = NULL;
++static PyObject *reg_repo_name = NULL;
++static PyObject *slot_parts_memo = NULL;	/* {(slot, eapi): tuple} */
++static PyObject *repo_name_memo = NULL;	/* {repo: str} */
++static PyObject *kw_eapi = NULL;		/* ("eapi",) */
++
++static PyObject *ps_metadata = NULL, *ps_settings = NULL, *ps_db = NULL;
++static PyObject *ps_repoconfig = NULL, *ps_eapi = NULL, *ps_build_time = NULL;
++static PyObject *ps_file_size = NULL, *ps_build_id = NULL, *ps_mtime = NULL;
++static PyObject *ps_cpv_split = NULL, *ps_cp = NULL, *ps_version = NULL;
++static PyObject *ps_cpv = NULL, *ps_slot = NULL, *ps_sub_slot = NULL;
++static PyObject *ps_slot_invalid = NULL, *ps_repo = NULL, *ps_get = NULL;
++static PyObject *ps_SLOT = NULL, *ps_repository = NULL, *ps_EAPI = NULL;
++static PyObject *ps_BUILD_TIME = NULL, *ps_SIZE = NULL, *ps_BUILD_ID = NULL;
++static PyObject *ps_mtime_key = NULL, *ps_r0 = NULL, *ps_dash_r0 = NULL;
++static PyObject *ps_slash = NULL, *ps_dash = NULL;
++
++/*  @staticmethod
++ *  def _long(var, default):
++ *      if var is not None:
++ *          try:
++ *              var = int(var)
++ *          except ValueError:
++ *              if var: var = -1
++ *              else:   var = default
++ *      return var
++ * A new reference. */
++static PyObject *
++pkg_str_long(PyObject *var, PyObject *fallback)
++{
++	PyObject *value;
++	int truth;
++
++	if (var == Py_None)
++		return Py_NewRef(var);
++	if (PyLong_CheckExact(var))
++		return Py_NewRef(var);
++	value = PyObject_CallOneArg((PyObject *)&PyLong_Type, var);
++	if (value != NULL)
++		return value;
++	if (!PyErr_ExceptionMatches(PyExc_ValueError))
++		return NULL;
++	PyErr_Clear();
++	truth = PyObject_IsTrue(var);
++	if (truth < 0)
++		return NULL;
++	if (truth)
++		return PyLong_FromLong(-1);
++	return Py_NewRef(fallback);
++}
++
++/* metadata.get(key, fallback), a new reference */
++static PyObject *
++metadata_get(PyObject *metadata, PyObject *key, PyObject *fallback)
++{
++	PyObject *value;
++
++	if (PyDict_CheckExact(metadata)) {
++		value = PyDict_GetItemWithError(metadata, key);
++		if (value != NULL)
++			return Py_NewRef(value);
++		if (PyErr_Occurred())
++			return NULL;
++		return Py_NewRef(fallback);
++	}
++	return PyObject_CallMethodObjArgs(metadata, ps_get, key, fallback, NULL);
++}
++
++/* memo[key], computed with func(*key_args) on first use; a new reference */
++static PyObject *
++memo_call(PyObject *memo, PyObject *key, PyObject *func, PyObject *a, PyObject *b)
++{
++	PyObject *value = PyDict_GetItemWithError(memo, key);
++
++	if (value != NULL)
++		return Py_NewRef(value);
++	if (PyErr_Occurred())
++		return NULL;
++	value = PyObject_CallFunctionObjArgs(func, a, b, NULL);
++	if (value == NULL)
++		return NULL;
++	if (PyDict_SetItem(memo, key, value) < 0) {
++		Py_DECREF(value);
++		return NULL;
++	}
++	return value;
++}
++
++static PyObject *
++cfast_pkg_str_init(PyObject *Py_UNUSED(module), PyObject *args, PyObject *kwargs)
++{
++	static char *kwlist[] = {
++		"self", "cpv", "metadata", "settings", "eapi", "repo", "slot",
++		"build_time", "build_id", "file_size", "mtime", "db", "repoconfig", NULL
++	};
++	PyObject *self, *cpv, *metadata = Py_None, *settings = Py_None;
++	PyObject *eapi = Py_None, *repo = Py_None, *slot = Py_None;
++	PyObject *build_time = Py_None, *build_id = Py_None, *file_size = Py_None;
++	PyObject *mtime = Py_None, *db = Py_None, *repoconfig = Py_None;
++	PyObject *dict = NULL, *split = NULL, *tmp = NULL, *key = NULL, *parts = NULL;
++	PyObject *zero = NULL, *stack[2];
++	/* owned copies of the values that metadata may replace */
++	PyObject *o_slot = NULL, *o_repo = NULL, *o_eapi = NULL, *o_build_time = NULL;
++	PyObject *o_file_size = NULL, *o_build_id = NULL, *o_mtime = NULL;
++	PyObject *cat, *pn, *ver, *rev;
++	Py_ssize_t len;
++	int rc, plain_version;
++
++	if (reg_catpkgsplit == NULL || reg_pkg_str_py_init == NULL
++		|| reg_slot_parts == NULL || reg_repo_name == NULL)
++		goto python;
++	if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|OOOOOOOOOOO:_pkg_str",
++			kwlist, &self, &cpv, &metadata, &settings, &eapi, &repo, &slot,
++			&build_time, &build_id, &file_size, &mtime, &db, &repoconfig)) {
++		/* the Python method reports the argument error in its own words */
++		PyErr_Clear();
++		goto python;
++	}
++	if (!PyUnicode_Check(cpv) || !PyUnicode_Check(self))
++		goto python;
++
++	dict = PyObject_GenericGetDict(self, NULL);
++	if (dict == NULL)
++		return NULL;
++
++	o_slot = Py_NewRef(slot);
++	o_repo = Py_NewRef(repo);
++	o_eapi = Py_NewRef(eapi);
++	o_build_time = Py_NewRef(build_time);
++	o_file_size = Py_NewRef(file_size);
++	o_build_id = Py_NewRef(build_id);
++	o_mtime = Py_NewRef(mtime);
++
++#define SET(name, value) \
++	do { \
++		if (PyDict_SetItem(dict, (name), (value)) < 0) \
++			goto error; \
++	} while (0)
++#define FROM_METADATA(var, mkey) \
++	do { \
++		tmp = metadata_get(metadata, (mkey), (var)); \
++		if (tmp == NULL) \
++			goto error; \
++		Py_SETREF(var, tmp); \
++		tmp = NULL; \
++	} while (0)
++
++	if (metadata != Py_None) {
++		SET(ps_metadata, metadata);
++		FROM_METADATA(o_slot, ps_SLOT);
++		FROM_METADATA(o_repo, ps_repository);
++		FROM_METADATA(o_eapi, ps_EAPI);
++		FROM_METADATA(o_build_time, ps_BUILD_TIME);
++		FROM_METADATA(o_file_size, ps_SIZE);
++		FROM_METADATA(o_build_id, ps_BUILD_ID);
++		FROM_METADATA(o_mtime, ps_mtime_key);
++	}
++	if (settings != Py_None)
++		SET(ps_settings, settings);
++	if (db != Py_None)
++		SET(ps_db, db);
++	if (repoconfig != Py_None)
++		SET(ps_repoconfig, repoconfig);
++	if (o_eapi != Py_None)
++		SET(ps_eapi, o_eapi);
++
++	zero = PyLong_FromLong(0);
++	if (zero == NULL)
++		goto error;
++#define SET_LONG(name, var, fallback) \
++	do { \
++		tmp = pkg_str_long((var), (fallback)); \
++		if (tmp == NULL) \
++			goto error; \
++		rc = PyDict_SetItem(dict, (name), tmp); \
++		Py_CLEAR(tmp); \
++		if (rc < 0) \
++			goto error; \
++	} while (0)
++	SET_LONG(ps_build_time, o_build_time, zero);
++	SET_LONG(ps_file_size, o_file_size, Py_None);
++	SET_LONG(ps_build_id, o_build_id, Py_None);
++	SET_LONG(ps_mtime, o_mtime, Py_None);
++
++	/* self.__dict__["cpv_split"] = catpkgsplit(cpv, eapi=eapi) */
++	stack[0] = cpv;
++	stack[1] = o_eapi;
++	split = PyObject_Vectorcall(reg_catpkgsplit, stack, 1, kw_eapi);
++	if (split == NULL)
++		goto error;
++	SET(ps_cpv_split, split);
++	/* None raises InvalidData(cpv); anything that is not the usual
++	 * (cat, pn, ver, rev) of strings goes the Python way too */
++	if (!PyTuple_CheckExact(split) || PyTuple_GET_SIZE(split) != 4)
++		goto python_cleanup;
++	cat = PyTuple_GET_ITEM(split, 0);
++	pn = PyTuple_GET_ITEM(split, 1);
++	ver = PyTuple_GET_ITEM(split, 2);
++	rev = PyTuple_GET_ITEM(split, 3);
++	if (!PyUnicode_CheckExact(cat) || !PyUnicode_CheckExact(pn)
++		|| !PyUnicode_CheckExact(ver) || !PyUnicode_CheckExact(rev))
++		goto python_cleanup;
++
++	/* cp = cpv_split[0] + "/" + cpv_split[1] */
++	tmp = PyUnicode_FromFormat("%U/%U", cat, pn);
++	if (tmp == NULL)
++		goto error;
++	rc = PyDict_SetItem(dict, ps_cp, tmp);
++	Py_CLEAR(tmp);
++	if (rc < 0)
++		goto error;
++
++	/* if cpv_split[-1] == "r0" and cpv[-3:] != "-r0":
++	 *     version = "-".join(cpv_split[2:-1])
++	 * else:
++	 *     version = "-".join(cpv_split[2:]) */
++	plain_version = 0;
++	if (PyUnicode_Compare(rev, ps_r0) == 0) {
++		len = PyUnicode_GET_LENGTH(cpv);
++		rc = (int)PyUnicode_Tailmatch(cpv, ps_dash_r0, 0, len, 1);
++		if (rc < 0)
++			goto error;
++		plain_version = !rc;
++	}
++	if (PyErr_Occurred())
++		goto error;
++	if (plain_version) {
++		SET(ps_version, ver);
++	}
++	else {
++		tmp = PyUnicode_FromFormat("%U-%U", ver, rev);
++		if (tmp == NULL)
++			goto error;
++		rc = PyDict_SetItem(dict, ps_version, tmp);
++		Py_CLEAR(tmp);
++		if (rc < 0)
++			goto error;
++	}
++
++	/* for match_from_list introspection */
++	SET(ps_cpv, self);
++
++	if (o_slot != Py_None) {
++		if (!PyUnicode_CheckExact(o_slot)
++			|| !(o_eapi == Py_None || PyUnicode_CheckExact(o_eapi)))
++			goto python_cleanup;
++		key = PyTuple_Pack(2, o_slot, o_eapi);
++		if (key == NULL)
++			goto error;
++		parts = memo_call(slot_parts_memo, key, reg_slot_parts, o_slot, o_eapi);
++		Py_CLEAR(key);
++		if (parts == NULL)
++			goto error;
++		if (!PyTuple_CheckExact(parts) || PyTuple_GET_SIZE(parts) != 3) {
++			PyErr_SetString(PyExc_TypeError, "slot parts must be a 3-tuple");
++			goto error;
++		}
++		SET(ps_slot, PyTuple_GET_ITEM(parts, 0));
++		SET(ps_sub_slot, PyTuple_GET_ITEM(parts, 1));
++		if (PyTuple_GET_ITEM(parts, 2) != Py_None)
++			SET(ps_slot_invalid, PyTuple_GET_ITEM(parts, 2));
++		Py_CLEAR(parts);
++	}
++
++	if (o_repo != Py_None) {
++		if (!PyUnicode_CheckExact(o_repo))
++			goto python_cleanup;
++		tmp = memo_call(repo_name_memo, o_repo, reg_repo_name, o_repo, NULL);
++		if (tmp == NULL)
++			goto error;
++		rc = PyDict_SetItem(dict, ps_repo, tmp);
++		Py_CLEAR(tmp);
++		if (rc < 0)
++			goto error;
++	}
++#undef SET
++#undef SET_LONG
++#undef FROM_METADATA
++
++	rc = 0;
++	goto cleanup;
++error:
++	rc = -1;
++	goto cleanup;
++python_cleanup:
++	rc = 1;
++cleanup:
++	Py_XDECREF(dict);
++	Py_XDECREF(split);
++	Py_XDECREF(tmp);
++	Py_XDECREF(key);
++	Py_XDECREF(parts);
++	Py_XDECREF(zero);
++	Py_XDECREF(o_slot);
++	Py_XDECREF(o_repo);
++	Py_XDECREF(o_eapi);
++	Py_XDECREF(o_build_time);
++	Py_XDECREF(o_file_size);
++	Py_XDECREF(o_build_id);
++	Py_XDECREF(o_mtime);
++	if (rc < 0)
++		return NULL;
++	if (rc == 0)
++		Py_RETURN_NONE;
++python:
++	if (reg_pkg_str_py_init == NULL) {
++		PyErr_SetString(PyExc_RuntimeError,
++			"portage.util._cfast: _pkg_str.__init__ is not set up");
++		return NULL;
++	}
++	return PyObject_Call(reg_pkg_str_py_init, args, kwargs);
++}
++
++/* ------------------------------------------------------------------ */
++/* vercmp                                                               */
++
++/* portage.versions.vercmp(ver1, ver2, silent=1) for two ASCII strings that
++ * match ver_regexp; the Python function (registered as "py_vercmp") for
++ * everything else: invalid versions (it returns None), non-ASCII digits and
++ * a trailing newline (both of which the regular expression accepts), and
++ * silent=0. */
++static PyObject *reg_py_vercmp = NULL;
++
++#define VER_MAX_PARTS 64
++
++typedef struct {
++	const char *start;
++	Py_ssize_t len;
++} ver_span;
++
++typedef struct {
++	ver_span major;
++	ver_span comp[VER_MAX_PARTS];	/* the .N components */
++	int ncomp;
++	int letter;			/* 0 if none */
++	int suffix[VER_MAX_PARTS];	/* index into ver_suffix_value */
++	ver_span suffix_num[VER_MAX_PARTS];
++	int nsuffix;
++	ver_span rev;			/* len 0 if none */
++} ver_parsed;
++
++/* (pre|p|beta|alpha|rc), in the order the regular expression tries them */
++static const char *const ver_suffix_name[5] = {"pre", "p", "beta", "alpha", "rc"};
++static const int ver_suffix_len[5] = {3, 1, 4, 5, 2};
++static const int ver_suffix_value[5] = {-2, 0, -3, -4, -1};
++
++static Py_ssize_t
++ver_digits(const char *s, Py_ssize_t i, Py_ssize_t n)
++{
++	while (i < n && s[i] >= '0' && s[i] <= '9')
++		i++;
++	return i;
++}
++
++/* ^(\d+)((\.\d+)*)([a-z]?)((_(pre|p|beta|alpha|rc)\d*)*)(-r(\d+))?$
++ * 1 if s is such a version, 0 if not, -1 if it has more parts than fit
++ * here (the caller then asks the Python function). */
++static int
++ver_parse(const char *s, Py_ssize_t n, ver_parsed *v)
++{
++	Py_ssize_t i = 0, j;
++	int k;
++
++	j = ver_digits(s, 0, n);
++	if (j == 0)
++		return 0;
++	v->major.start = s;
++	v->major.len = j;
++	i = j;
++	v->ncomp = 0;
++	while (i < n && s[i] == '.') {
++		j = ver_digits(s, i + 1, n);
++		if (j == i + 1)
++			return 0;
++		if (v->ncomp == VER_MAX_PARTS)
++			return -1;
++		v->comp[v->ncomp].start = s + i + 1;
++		v->comp[v->ncomp].len = j - i - 1;
++		v->ncomp++;
++		i = j;
++	}
++	v->letter = 0;
++	if (i < n && s[i] >= 'a' && s[i] <= 'z') {
++		v->letter = (unsigned char)s[i];
++		i++;
++	}
++	v->nsuffix = 0;
++	while (i < n && s[i] == '_') {
++		for (k = 0; k < 5; k++) {
++			if (n - (i + 1) >= ver_suffix_len[k]
++				&& memcmp(s + i + 1, ver_suffix_name[k], ver_suffix_len[k]) == 0) {
++				/* what follows the name must be digits and then
++				 * '_', '-' or the end, or this alternative fails */
++				j = ver_digits(s, i + 1 + ver_suffix_len[k], n);
++				if (j == n || s[j] == '_' || s[j] == '-')
++					break;
++			}
++		}
++		if (k == 5)
++			return 0;
++		if (v->nsuffix == VER_MAX_PARTS)
++			return -1;
++		v->suffix[v->nsuffix] = k;
++		v->suffix_num[v->nsuffix].start = s + i + 1 + ver_suffix_len[k];
++		v->suffix_num[v->nsuffix].len = j - (i + 1 + ver_suffix_len[k]);
++		v->nsuffix++;
++		i = j;
++	}
++	v->rev.start = NULL;
++	v->rev.len = 0;
++	if (i < n) {
++		if (n - i < 3 || s[i] != '-' || s[i + 1] != 'r')
++			return 0;
++		j = ver_digits(s, i + 2, n);
++		if (j == i + 2 || j != n)
++			return 0;
++		v->rev.start = s + i + 2;
++		v->rev.len = j - i - 2;
++		i = j;
++	}
++	return i == n;
++}
++
++/* int(a) against int(b) for two strings of digits (an empty one counts as
++ * zero): -1, 0 or 1 */
++static int
++ver_cmp_int(ver_span a, ver_span b)
++{
++	int c;
++
++	while (a.len > 0 && *a.start == '0') {
++		a.start++;
++		a.len--;
++	}
++	while (b.len > 0 && *b.start == '0') {
++		b.start++;
++		b.len--;
++	}
++	if (a.len != b.len)
++		return a.len > b.len ? 1 : -1;
++	c = memcmp(a.start, b.start, (size_t)a.len);
++	return (c > 0) - (c < 0);
++}
++
++/* int(a.ljust(m, "0")) against int(b.ljust(m, "0")), m the longer length */
++static int
++ver_cmp_padded(ver_span a, ver_span b)
++{
++	Py_ssize_t i, m = a.len > b.len ? a.len : b.len;
++	char ca, cb;
++
++	for (i = 0; i < m; i++) {
++		ca = i < a.len ? a.start[i] : '0';
++		cb = i < b.len ? b.start[i] : '0';
++		if (ca != cb)
++			return ca > cb ? 1 : -1;
++	}
++	return 0;
++}
++
++static int
++ver_compare(const ver_parsed *a, const ver_parsed *b)
++{
++	int i, n, c, la, lb;
++	ver_span sa, sb, minus;
++
++	c = ver_cmp_int(a->major, b->major);
++	if (c)
++		return c;
++	/* the components: a missing one is -1 against the other's number */
++	n = a->ncomp > b->ncomp ? a->ncomp : b->ncomp;
++	for (i = 0; i < n; i++) {
++		if (i >= a->ncomp)
++			return -1;	/* -1 < int(...) >= 0 */
++		if (i >= b->ncomp)
++			return 1;
++		sa = a->comp[i];
++		sb = b->comp[i];
++		if (sa.start[0] != '0' && sb.start[0] != '0')
++			c = ver_cmp_int(sa, sb);
++		else
++			c = ver_cmp_padded(sa, sb);
++		if (c)
++			return c;
++	}
++	/* the letter is one more list element; the shorter list is less */
++	la = a->letter;
++	lb = b->letter;
++	if (la && lb) {
++		if (la != lb)
++			return la > lb ? 1 : -1;
++	}
++	else if (la || lb) {
++		return la ? 1 : -1;
++	}
++	/* the suffixes: a missing one is ("p", "-1") */
++	n = a->nsuffix > b->nsuffix ? a->nsuffix : b->nsuffix;
++	minus.start = NULL;
++	minus.len = 0;
++	for (i = 0; i < n; i++) {
++		int ka = i < a->nsuffix ? a->suffix[i] : 1;
++		int kb = i < b->nsuffix ? b->suffix[i] : 1;
++		if (ka != kb)
++			return ver_suffix_value[ka] > ver_suffix_value[kb] ? 1 : -1;
++		/* same name: compare the numbers, "" is 0, missing is -1 */
++		if (i >= a->nsuffix || i >= b->nsuffix) {
++			/* exactly one is missing (-1); the other is >= 0 */
++			if (i >= a->nsuffix && i >= b->nsuffix)
++				continue;
++			return i >= a->nsuffix ? -1 : 1;
++		}
++		c = ver_cmp_int(a->suffix_num[i], b->suffix_num[i]);
++		if (c)
++			return c;
++	}
++	(void)minus;
++	sa = a->rev;
++	sb = b->rev;
++	return ver_cmp_int(sa, sb);
++}
++
++static PyObject *
++cfast_vercmp(PyObject *Py_UNUSED(module), PyObject *const *args,
++	Py_ssize_t nargs, PyObject *kwnames)
++{
++	PyObject *ver1, *ver2;
++	const char *s1, *s2;
++	Py_ssize_t n1, n2;
++	ver_parsed a, b;
++
++	if (reg_py_vercmp == NULL) {
++		PyErr_SetString(PyExc_RuntimeError,
++			"portage.util._cfast: vercmp is not set up");
++		return NULL;
++	}
++	if (nargs != 2 || (kwnames != NULL && PyTuple_GET_SIZE(kwnames) != 0))
++		goto python;	/* silent, or an argument error */
++	ver1 = args[0];
++	ver2 = args[1];
++	if (!PyUnicode_CheckExact(ver1) || !PyUnicode_CheckExact(ver2)
++		|| !PyUnicode_IS_ASCII(ver1) || !PyUnicode_IS_ASCII(ver2))
++		goto python;
++	s1 = (const char *)PyUnicode_1BYTE_DATA(ver1);
++	s2 = (const char *)PyUnicode_1BYTE_DATA(ver2);
++	n1 = PyUnicode_GET_LENGTH(ver1);
++	n2 = PyUnicode_GET_LENGTH(ver2);
++	/* if ver1 == ver2: return 0 */
++	if (n1 == n2 && memcmp(s1, s2, (size_t)n1) == 0)
++		return PyLong_FromLong(0);
++	if (ver_parse(s1, n1, &a) <= 0 || ver_parse(s2, n2, &b) <= 0)
++		goto python;
++	return PyLong_FromLong(ver_compare(&a, &b));
++python:
++	return PyObject_Vectorcall(reg_py_vercmp, args, (size_t)nargs, kwnames);
++}
++
++/* ------------------------------------------------------------------ */
++/* catpkgsplit                                                          */
++
++/* portage.versions.catpkgsplit(mydata, silent=1, eapi=None) for a plain
++ * ASCII str without a newline; the Python function (registered as
++ * "py_catpkgsplit") for everything else.
++ *
++ * _pkgsplit() matches
++ *   ^(?P<pn>[\w][\w+-]*?(?P<pn_inval>-VR)?)-(?P<ver>V)(-r(?P<rev>\d+))?$
++ * and returns None if there is no match or if pn_inval took part in it.
++ * The lazy part of pn grows one character at a time, so the match that the
++ * regular expression finds is the one with the shortest such prefix that
++ * can be completed, first with pn_inval and then without it. */
++static PyObject *reg_py_catpkgsplit = NULL;
++static PyObject *str_null = NULL;	/* "null", portage.versions._missing_cat */
++
++static int
++is_word(char c)
++{
++	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
++		|| (c >= '0' && c <= '9') || c == '_';
++}
++
++/* 1 with *pn_len, the version span and the revision span set; 0 for None;
++ * -1 if the Python function has to decide. */
++static int
++pv_split(const char *s, Py_ssize_t n, Py_ssize_t *pn_len,
++	ver_span *ver, ver_span *rev)
++{
++	Py_ssize_t p, q;
++	ver_parsed v;
++	int r;
++
++	if (n == 0 || !is_word(s[0]))
++		return 0;
++	for (p = 1; p < n; p++) {
++		if (s[p] == '-') {
++			/* with pn_inval: -VR at p, then -V(-rN)? to the end */
++			for (q = p + 2; q < n - 1; q++) {
++				if (s[q] != '-')
++					continue;
++				r = ver_parse(s + p + 1, q - p - 1, &v);
++				if (r < 0)
++					return -1;
++				if (!r)
++					continue;
++				r = ver_parse(s + q + 1, n - q - 1, &v);
++				if (r < 0)
++					return -1;
++				if (r)
++					return 0;	/* pn ends in a version */
++			}
++			/* without it: -V(-rN)? to the end */
++			r = ver_parse(s + p + 1, n - p - 1, &v);
++			if (r < 0)
++				return -1;
++			if (r) {
++				*pn_len = p;
++				ver->start = s + p + 1;
++				ver->len = (v.rev.len ? v.rev.start - 2 - (s + p + 1)
++					: n - p - 1);
++				*rev = v.rev;
++				return 1;
++			}
++		}
++		else if (!is_word(s[p]) && s[p] != '+') {
++			return 0;	/* not a character of a package name */
++		}
++	}
++	return 0;
++}
++
++static PyObject *
++cfast_catpkgsplit(PyObject *Py_UNUSED(module), PyObject *const *args,
++	Py_ssize_t nargs, PyObject *kwnames)
++{
++	PyObject *mydata, *eapi = Py_None, *cat, *pn, *ver, *rev, *result;
++	const char *s, *slash, *pv;
++	Py_ssize_t n, i, cat_len, pv_len, pn_len = 0;
++	ver_span vspan = {NULL, 0}, rspan = {NULL, 0};
++	int r;
++
++	if (reg_py_catpkgsplit == NULL) {
++		PyErr_SetString(PyExc_RuntimeError,
++			"portage.util._cfast: catpkgsplit is not set up");
++		return NULL;
++	}
++	if (nargs != 1)
++		goto python;
++	if (kwnames != NULL && PyTuple_GET_SIZE(kwnames) != 0) {
++		if (PyTuple_GET_SIZE(kwnames) != 1
++			|| PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(kwnames, 0), "eapi") != 0)
++			goto python;
++		eapi = args[1];
++	}
++	mydata = args[0];
++	/* _get_eapi_attrs(eapi) is called with it: None or a str is fine */
++	if (!PyUnicode_CheckExact(mydata) || !PyUnicode_IS_ASCII(mydata)
++		|| !(eapi == Py_None || PyUnicode_CheckExact(eapi)))
++		goto python;
++	s = (const char *)PyUnicode_1BYTE_DATA(mydata);
++	n = PyUnicode_GET_LENGTH(mydata);
++	for (i = 0; i < n; i++)
++		if (s[i] == '\n' || s[i] == '\0')
++			goto python;
++
++	slash = memchr(s, '/', (size_t)n);
++	if (slash == NULL) {
++		cat_len = -1;
++		pv = s;
++		pv_len = n;
++	}
++	else {
++		/* ^[\w][\w+.-]*$ */
++		cat_len = slash - s;
++		if (cat_len == 0 || !is_word(s[0]))
++			Py_RETURN_NONE;
++		for (i = 1; i < cat_len; i++)
++			if (!is_word(s[i]) && s[i] != '+' && s[i] != '.' && s[i] != '-')
++				Py_RETURN_NONE;
++		pv = slash + 1;
++		pv_len = n - cat_len - 1;
++	}
++	r = pv_split(pv, pv_len, &pn_len, &vspan, &rspan);
++	if (r < 0)
++		goto python;
++	if (r == 0)
++		Py_RETURN_NONE;
++
++	cat = cat_len < 0 ? Py_NewRef(str_null) : PyUnicode_FromStringAndSize(s, cat_len);
++	pn = PyUnicode_FromStringAndSize(pv, pn_len);
++	ver = PyUnicode_FromStringAndSize(vspan.start, vspan.len);
++	rev = rspan.len ? PyUnicode_FromFormat("r%.*s", (int)rspan.len, rspan.start)
++		: PyUnicode_FromString("r0");
++	if (cat == NULL || pn == NULL || ver == NULL || rev == NULL) {
++		Py_XDECREF(cat);
++		Py_XDECREF(pn);
++		Py_XDECREF(ver);
++		Py_XDECREF(rev);
++		return NULL;
++	}
++	result = PyTuple_Pack(4, cat, pn, ver, rev);
++	Py_DECREF(cat);
++	Py_DECREF(pn);
++	Py_DECREF(ver);
++	Py_DECREF(rev);
++	return result;
++python:
++	return PyObject_Vectorcall(reg_py_catpkgsplit, args, (size_t)nargs, kwnames);
++}
++
++/* register(name, obj): hand over a function of the Python side */
++static PyObject *
++cfast_register(PyObject *Py_UNUSED(module), PyObject *args)
++{
++	const char *name;
++	PyObject *obj, **slot;
++
++	if (!PyArg_ParseTuple(args, "sO:register", &name, &obj))
++		return NULL;
++	if (strcmp(name, "catpkgsplit") == 0)
++		slot = &reg_catpkgsplit;
++	else if (strcmp(name, "pkg_str_py_init") == 0)
++		slot = &reg_pkg_str_py_init;
++	else if (strcmp(name, "pkg_str_slot_parts") == 0)
++		slot = &reg_slot_parts;
++	else if (strcmp(name, "pkg_str_repo_name") == 0)
++		slot = &reg_repo_name;
++	else if (strcmp(name, "py_vercmp") == 0)
++		slot = &reg_py_vercmp;
++	else if (strcmp(name, "py_catpkgsplit") == 0)
++		slot = &reg_py_catpkgsplit;
++	else {
++		PyErr_Format(PyExc_ValueError, "register: unknown name '%s'", name);
++		return NULL;
++	}
++	Py_XSETREF(*slot, Py_NewRef(obj));
++	Py_RETURN_NONE;
++}
++
++/* as_method(func): func wrapped so that it binds as a method when it is a
++ * class attribute (a builtin function does not). */
++static PyObject *
++cfast_as_method(PyObject *Py_UNUSED(module), PyObject *func)
++{
++	return PyInstanceMethod_New(func);
++}
++
++/* ------------------------------------------------------------------ */
++/* module                                                               */
++
++static PyMethodDef cfast_functions[] = {
++	{"set_keymap_builder", cfast_set_keymap_builder, METH_O,
++	 "set_keymap_builder(func): func(cls) makes and returns cls._c_keymap"},
++	{"register", cfast_register, METH_VARARGS,
++	 "register(name, obj): hand over a function of the Python side"},
++	{"as_method", cfast_as_method, METH_O,
++	 "as_method(func): func as a class attribute that binds like a method"},
++	{"catpkgsplit", (PyCFunction)(void (*)(void))cfast_catpkgsplit,
++	 METH_FASTCALL | METH_KEYWORDS,
++	 "catpkgsplit(mydata, silent=1, eapi=None), see portage.versions"},
++	{"vercmp", (PyCFunction)(void (*)(void))cfast_vercmp,
++	 METH_FASTCALL | METH_KEYWORDS,
++	 "vercmp(ver1, ver2, silent=1), see portage.versions"},
++	{"pkg_str_init", (PyCFunction)(void (*)(void))cfast_pkg_str_init,
++	 METH_VARARGS | METH_KEYWORDS,
++	 "_pkg_str.__init__(self, cpv, metadata=None, ...), see portage.versions"},
++	{"convert", (PyCFunction)(void (*)(void))cfast_convert, METH_FASTCALL,
++	 "convert(raw, flat, memo, slow, eapi, eapi_attrs, uselist, matchall)\n"
++	 "The parse tree raw with every parser atom replaced by its Atom."},
++	{NULL}
++};
++
++static struct PyModuleDef cfast_module = {
++	PyModuleDef_HEAD_INIT,
++	.m_name = "_cfast",
++	.m_doc = "C fast paths of the dependency resolver",
++	.m_size = -1,
++	.m_methods = cfast_functions,
++};
++
++PyMODINIT_FUNC
++PyInit__cfast(void)
++{
++	PyObject *m, *type;
++
++	m = PyModule_Create(&cfast_module);
++	if (m == NULL)
++		return NULL;
++
++#define INTERN(var, text) \
++	do { \
++		var = PyUnicode_InternFromString(text); \
++		if (var == NULL) \
++			goto fail; \
++	} while (0)
++	INTERN(str_c_keymap, "_c_keymap");
++	INTERN(str_c_slow_keys, "_c_slow_keys");
++	INTERN(str_py_raw_getitem, "_py_raw_getitem");
++	INTERN(str_py_getitem, "_py_getitem");
++	INTERN(str_use, "_use");
++	INTERN(str_conditional, "conditional");
++	INTERN(ps_metadata, "_metadata");
++	INTERN(ps_settings, "_settings");
++	INTERN(ps_db, "_db");
++	INTERN(ps_repoconfig, "_repoconfig");
++	INTERN(ps_eapi, "eapi");
++	INTERN(ps_build_time, "build_time");
++	INTERN(ps_file_size, "file_size");
++	INTERN(ps_build_id, "build_id");
++	INTERN(ps_mtime, "mtime");
++	INTERN(ps_cpv_split, "cpv_split");
++	INTERN(ps_cp, "cp");
++	INTERN(ps_version, "version");
++	INTERN(ps_cpv, "cpv");
++	INTERN(ps_slot, "slot");
++	INTERN(ps_sub_slot, "sub_slot");
++	INTERN(ps_slot_invalid, "slot_invalid");
++	INTERN(ps_repo, "repo");
++	INTERN(ps_get, "get");
++	INTERN(ps_SLOT, "SLOT");
++	INTERN(ps_repository, "repository");
++	INTERN(ps_EAPI, "EAPI");
++	INTERN(ps_BUILD_TIME, "BUILD_TIME");
++	INTERN(ps_SIZE, "SIZE");
++	INTERN(ps_BUILD_ID, "BUILD_ID");
++	INTERN(ps_mtime_key, "_mtime_");
++	INTERN(ps_r0, "r0");
++	INTERN(ps_dash_r0, "-r0");
++	INTERN(ps_slash, "/");
++	INTERN(ps_dash, "-");
++	slot_parts_memo = PyDict_New();
++	repo_name_memo = PyDict_New();
++	kw_eapi = Py_BuildValue("(s)", "eapi");
++	str_null = PyUnicode_InternFromString("null");
++	if (str_null == NULL)
++		goto fail;
++	if (slot_parts_memo == NULL || repo_name_memo == NULL || kw_eapi == NULL)
++		goto fail;
++#undef INTERN
++
++	type = PyType_FromSpec(&slotdict_spec);
++	if (type == NULL)
++		goto fail;
++	if (PyModule_AddObjectRef(m, "SlotDictBase", type) < 0) {
++		Py_DECREF(type);
++		goto fail;
++	}
++	Py_DECREF(type);
++	return m;
++
++fail:
++	Py_DECREF(m);
++	return NULL;
++}
+diff -ruN a/src/portage_util__hashbase.c b/src/portage_util__hashbase.c
+--- a/src/portage_util__hashbase.c
++++ b/src/portage_util__hashbase.c
+@@ -0,0 +1,919 @@
++/* Copyright 2026 Gentoo Authors
++ * Distributed under the terms of the GNU General Public License v2
++ *
++ * C base types that carry the hash and equality of two resolver classes,
++ * so that dict and set operations on them do not call back into Python:
++ *
++ *   TaskBase  base of _emerge.Task (Package, Blocker): hashes by the stored
++ *             _hash_value and compares by _hash_key.
++ *   AtomBase  base of portage.dep.Atom: hashes and compares by _string.
++ *
++ *   (same module) the ordering of Package (__lt__ and friends, through
++ *             TaskBase), PriorityBase with the comparisons of
++ *             AbstractDepPriority, and cmp_sort_key of portage.util.
++ *
++ * Both reproduce the Python methods they replace exactly, including which
++ * exception is raised when a field is unset and what is returned for a
++ * foreign operand. The Python bodies stay in Task.py and dep/__init__.py as
++ * the fallback for builds without native extensions, and are the reference:
++ * lib/portage/tests/util/test_hashbase.py compares the two.
++ */
++
++#define PY_SSIZE_T_CLEAN
++#include <Python.h>
++#include <stddef.h>
++
++static PyTypeObject *TaskBase_Type = NULL;
++static PyTypeObject *AtomBase_Type = NULL;
++static PyObject *str_hash_key = NULL;	/* interned "_hash_key" */
++
++/* ------------------------------------------------------------------ */
++/* shared helpers                                                       */
++
++static int
++unset_attribute(PyObject *self, const char *name)
++{
++	PyErr_Format(PyExc_AttributeError,
++		"'%.100s' object has no attribute '%s'",
++		Py_TYPE(self)->tp_name, name);
++	return -1;
++}
++
++static void
++base_dealloc_finish(PyObject *self)
++{
++	PyTypeObject *tp = Py_TYPE(self);
++	tp->tp_free(self);
++	Py_DECREF(tp);
++}
++
++/* ------------------------------------------------------------------ */
++/* TaskBase                                                             */
++
++typedef struct {
++	PyObject_HEAD
++	PyObject *hash_key;
++	PyObject *hash_value;
++} TaskBaseObject;
++
++static int
++taskbase_traverse(PyObject *op, visitproc visit, void *arg)
++{
++	TaskBaseObject *self = (TaskBaseObject *)op;
++	Py_VISIT(Py_TYPE(op));
++	Py_VISIT(self->hash_key);
++	Py_VISIT(self->hash_value);
++	return 0;
++}
++
++static int
++taskbase_clear(PyObject *op)
++{
++	TaskBaseObject *self = (TaskBaseObject *)op;
++	Py_CLEAR(self->hash_key);
++	Py_CLEAR(self->hash_value);
++	return 0;
++}
++
++static void
++taskbase_dealloc(PyObject *op)
++{
++	PyObject_GC_UnTrack(op);
++	(void)taskbase_clear(op);
++	base_dealloc_finish(op);
++}
++
++/* def __hash__(self): return self._hash_value
++ * followed by what CPython does with the result of a Python-level
++ * __hash__ (slot_tp_hash in Objects/typeobject.c). */
++static Py_hash_t
++taskbase_hash(PyObject *op)
++{
++	PyObject *value = ((TaskBaseObject *)op)->hash_value;
++	Py_hash_t h;
++
++	if (value == NULL)
++		return unset_attribute(op, "_hash_value");
++	if (!PyLong_Check(value)) {
++		PyErr_SetString(PyExc_TypeError,
++			"__hash__ method should return an integer");
++		return -1;
++	}
++	h = PyLong_AsSsize_t(value);
++	if (h == -1 && PyErr_Occurred()) {
++		PyErr_Clear();
++		h = PyLong_Type.tp_hash(value);
++	}
++	if (h == -1)
++		h = -2;
++	return h;
++}
++
++/* The key the other operand compares by: a new reference, or NULL with
++ * AttributeError (or another exception) set, as other._hash_key does. */
++static PyObject *
++task_other_key(PyObject *other)
++{
++	if (PyObject_TypeCheck(other, TaskBase_Type)) {
++		PyObject *key = ((TaskBaseObject *)other)->hash_key;
++		if (key == NULL) {
++			(void)unset_attribute(other, "_hash_key");
++			return NULL;
++		}
++		return Py_NewRef(key);
++	}
++	return PyObject_GetAttr(other, str_hash_key);
++}
++
++/*  def __eq__(self, other):
++ *      try:
++ *          return self._hash_key == other._hash_key
++ *      except AttributeError:
++ *          return self._hash_key == other
++ *
++ *  def __ne__(self, other):
++ *      try:
++ *          return self._hash_key != other._hash_key
++ *      except AttributeError:
++ *          return True
++ */
++static PyTypeObject *Package_Type;
++static PyObject *package_order(PyObject *self, PyObject *other, int op);
++
++static PyObject *
++taskbase_richcompare(PyObject *op, PyObject *other, int cmp)
++{
++	PyObject *key = ((TaskBaseObject *)op)->hash_key;
++	PyObject *other_key, *res;
++
++	if (cmp != Py_EQ && cmp != Py_NE) {
++		/* the ordering of Package, see package_order() */
++		if (Package_Type != NULL && PyObject_TypeCheck(op, Package_Type))
++			return package_order(op, other, cmp);
++		Py_RETURN_NOTIMPLEMENTED;
++	}
++
++	if (key != NULL) {
++		other_key = task_other_key(other);
++		if (other_key != NULL) {
++			/* op may be released by the comparison */
++			Py_INCREF(key);
++			res = PyObject_RichCompare(key, other_key, cmp);
++			Py_DECREF(key);
++			Py_DECREF(other_key);
++			if (res != NULL)
++				return res;
++		}
++		if (!PyErr_ExceptionMatches(PyExc_AttributeError))
++			return NULL;
++		PyErr_Clear();
++	}
++
++	/* the "except AttributeError" branch */
++	if (cmp == Py_NE)
++		Py_RETURN_TRUE;
++	key = ((TaskBaseObject *)op)->hash_key;
++	if (key == NULL) {
++		(void)unset_attribute(op, "_hash_key");
++		return NULL;
++	}
++	Py_INCREF(key);
++	res = PyObject_RichCompare(key, other, Py_EQ);
++	Py_DECREF(key);
++	return res;
++}
++
++static PyMemberDef taskbase_members[] = {
++	{"_hash_key", Py_T_OBJECT_EX, offsetof(TaskBaseObject, hash_key), 0, NULL},
++	{"_hash_value", Py_T_OBJECT_EX, offsetof(TaskBaseObject, hash_value), 0, NULL},
++	{NULL}
++};
++
++static PyType_Slot taskbase_slots[] = {
++	{Py_tp_dealloc, taskbase_dealloc},
++	{Py_tp_traverse, taskbase_traverse},
++	{Py_tp_clear, taskbase_clear},
++	{Py_tp_hash, taskbase_hash},
++	{Py_tp_richcompare, taskbase_richcompare},
++	{Py_tp_members, taskbase_members},
++	{0, NULL}
++};
++
++static PyType_Spec taskbase_spec = {
++	.name = "portage.util._hashbase.TaskBase",
++	.basicsize = sizeof(TaskBaseObject),
++	.flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,
++	.slots = taskbase_slots,
++};
++
++/* ------------------------------------------------------------------ */
++/* AtomBase                                                             */
++
++typedef struct {
++	PyObject_HEAD
++	PyObject *string;
++} AtomBaseObject;
++
++static int
++atombase_traverse(PyObject *op, visitproc visit, void *arg)
++{
++	Py_VISIT(Py_TYPE(op));
++	Py_VISIT(((AtomBaseObject *)op)->string);
++	return 0;
++}
++
++static int
++atombase_clear(PyObject *op)
++{
++	Py_CLEAR(((AtomBaseObject *)op)->string);
++	return 0;
++}
++
++static void
++atombase_dealloc(PyObject *op)
++{
++	PyObject_GC_UnTrack(op);
++	(void)atombase_clear(op);
++	base_dealloc_finish(op);
++}
++
++/* def __hash__(self) -> int: return hash(self._string) */
++static Py_hash_t
++atombase_hash(PyObject *op)
++{
++	PyObject *string = ((AtomBaseObject *)op)->string;
++	Py_hash_t h;
++
++	if (string == NULL)
++		return unset_attribute(op, "_string");
++	Py_INCREF(string);
++	h = PyObject_Hash(string);
++	Py_DECREF(string);
++	return h;
++}
++
++/*  def __eq__(self, value):
++ *      if isinstance(value, Atom):
++ *          return self._string == value._string
++ *      if isinstance(value, str):
++ *          return self._string == value
++ *      return super().__eq__(value)      # object.__eq__: NotImplemented,
++ *                                        # an identical operand is an Atom
++ *  __ne__ is not defined, so it is object's: the inverse of __eq__ unless
++ *  that returns NotImplemented.
++ */
++static PyObject *
++atombase_eq(PyObject *op, PyObject *other)
++{
++	PyObject *string, *other_string, *res;
++	int other_is_atom = PyObject_TypeCheck(other, AtomBase_Type);
++
++	if (!other_is_atom && !PyUnicode_Check(other))
++		Py_RETURN_NOTIMPLEMENTED;
++
++	string = ((AtomBaseObject *)op)->string;
++	if (string == NULL) {
++		(void)unset_attribute(op, "_string");
++		return NULL;
++	}
++	if (other_is_atom) {
++		other_string = ((AtomBaseObject *)other)->string;
++		if (other_string == NULL) {
++			(void)unset_attribute(other, "_string");
++			return NULL;
++		}
++	}
++	else {
++		other_string = other;
++	}
++	Py_INCREF(string);
++	Py_INCREF(other_string);
++	res = PyObject_RichCompare(string, other_string, Py_EQ);
++	Py_DECREF(string);
++	Py_DECREF(other_string);
++	return res;
++}
++
++static PyObject *
++atombase_richcompare(PyObject *op, PyObject *other, int cmp)
++{
++	PyObject *res;
++	int truth;
++
++	if (cmp == Py_EQ)
++		return atombase_eq(op, other);
++	if (cmp != Py_NE)
++		Py_RETURN_NOTIMPLEMENTED;
++
++	res = atombase_eq(op, other);
++	if (res == NULL || res == Py_NotImplemented)
++		return res;
++	truth = PyObject_IsTrue(res);
++	Py_DECREF(res);
++	if (truth < 0)
++		return NULL;
++	return PyBool_FromLong(!truth);
++}
++
++static PyMemberDef atombase_members[] = {
++	{"_string", Py_T_OBJECT_EX, offsetof(AtomBaseObject, string), 0, NULL},
++	{NULL}
++};
++
++static PyType_Slot atombase_slots[] = {
++	{Py_tp_dealloc, atombase_dealloc},
++	{Py_tp_traverse, atombase_traverse},
++	{Py_tp_clear, atombase_clear},
++	{Py_tp_hash, atombase_hash},
++	{Py_tp_richcompare, atombase_richcompare},
++	{Py_tp_members, atombase_members},
++	{0, NULL}
++};
++
++static PyType_Spec atombase_spec = {
++	.name = "portage.util._hashbase.AtomBase",
++	.basicsize = sizeof(AtomBaseObject),
++	.flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,
++	.slots = atombase_slots,
++};
++
++/* ------------------------------------------------------------------ */
++/* ordering of Package                                                  */
++
++/* Set by register_package(): the exact class, the offsets of three of its
++ * slots, portage.versions.vercmp and the Python methods (the reference,
++ * and the answer for every unusual operand). */
++static PyTypeObject *Package_Type = NULL;
++static Py_ssize_t pkg_off_cp = -1, pkg_off_version = -1, pkg_off_built = -1;
++static PyObject *pkg_vercmp = NULL;
++static PyObject *pkg_py_compare[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
++static PyObject *str_build_time = NULL;
++
++#define SLOT_AT(obj, offset) (*(PyObject **)((char *)(obj) + (offset)))
++
++/* The offset of an ordinary slot of tp (a member descriptor for an object
++ * that raises AttributeError when unset), or -1. */
++static Py_ssize_t
++slot_offset(PyTypeObject *tp, const char *name)
++{
++	PyObject *descr = PyObject_GetAttrString((PyObject *)tp, name);
++	Py_ssize_t offset = -1;
++
++	if (descr == NULL) {
++		PyErr_Clear();
++		return -1;
++	}
++	if (Py_IS_TYPE(descr, &PyMemberDescr_Type)) {
++		PyMemberDescrObject *md = (PyMemberDescrObject *)descr;
++		if (md->d_member->type == Py_T_OBJECT_EX
++			&& PyType_IsSubtype(tp, md->d_common.d_type))
++			offset = md->d_member->offset;
++	}
++	Py_DECREF(descr);
++	return offset;
++}
++
++static int
++truth_of(PyObject *a, PyObject *b, int op)
++{
++	PyObject *res = PyObject_RichCompare(a, b, op);
++	int truth;
++
++	if (res == NULL)
++		return -1;
++	truth = PyObject_IsTrue(res);
++	Py_DECREF(res);
++	return truth;
++}
++
++/*  def __lt__(self, other):                    (__le__, __gt__, __ge__ alike)
++ *      if other.cp != self.cp:
++ *          return self.cp < other.cp
++ *      result = portage.vercmp(self.version, other.version)
++ *      if result < 0:
++ *          return True
++ *      if result == 0 and self.built and other.built:
++ *          return self.build_time < other.build_time
++ *      return False
++ *
++ * For two instances of exactly Package with these slots set and an int from
++ * vercmp(); the Python method for anything else. */
++static PyObject *
++package_order(PyObject *self, PyObject *other, int op)
++{
++	PyObject *scp, *ocp, *sver, *over, *result, *a, *b, *res;
++	int truth, overflow;
++	long r;
++
++	if (Py_TYPE(self) != Package_Type || Py_TYPE(other) != Package_Type)
++		goto python;
++	scp = SLOT_AT(self, pkg_off_cp);
++	ocp = SLOT_AT(other, pkg_off_cp);
++	if (scp == NULL || ocp == NULL)
++		goto python;
++	Py_INCREF(scp);
++	Py_INCREF(ocp);
++	truth = truth_of(ocp, scp, Py_NE);
++	if (truth < 0) {
++		Py_DECREF(scp);
++		Py_DECREF(ocp);
++		return NULL;
++	}
++	if (truth) {
++		res = PyObject_RichCompare(scp, ocp, op);
++		Py_DECREF(scp);
++		Py_DECREF(ocp);
++		return res;
++	}
++	Py_DECREF(scp);
++	Py_DECREF(ocp);
++
++	sver = SLOT_AT(self, pkg_off_version);
++	over = SLOT_AT(other, pkg_off_version);
++	if (sver == NULL || over == NULL)
++		goto python;
++	Py_INCREF(sver);
++	Py_INCREF(over);
++	result = PyObject_CallFunctionObjArgs(pkg_vercmp, sver, over, NULL);
++	Py_DECREF(sver);
++	Py_DECREF(over);
++	if (result == NULL)
++		return NULL;
++	if (!PyLong_CheckExact(result)) {
++		/* None for versions that cannot be compared: the Python method
++		 * raises what "None < 0" raises */
++		Py_DECREF(result);
++		goto python;
++	}
++	r = PyLong_AsLongAndOverflow(result, &overflow);
++	Py_DECREF(result);
++	if (overflow)
++		r = overflow;
++	else if (r == -1 && PyErr_Occurred())
++		return NULL;
++
++	if ((op == Py_LT && r < 0) || (op == Py_LE && r <= 0)
++		|| (op == Py_GT && r > 0) || (op == Py_GE && r >= 0))
++		Py_RETURN_TRUE;
++	if (r != 0)
++		Py_RETURN_FALSE;
++
++	/* result == 0 and self.built and other.built */
++	a = SLOT_AT(self, pkg_off_built);
++	if (a == NULL)
++		goto python;
++	Py_INCREF(a);
++	truth = PyObject_IsTrue(a);
++	Py_DECREF(a);
++	if (truth < 0)
++		return NULL;
++	if (!truth)
++		Py_RETURN_FALSE;
++	b = SLOT_AT(other, pkg_off_built);
++	if (b == NULL)
++		goto python;
++	Py_INCREF(b);
++	truth = PyObject_IsTrue(b);
++	Py_DECREF(b);
++	if (truth < 0)
++		return NULL;
++	if (!truth)
++		Py_RETURN_FALSE;
++	a = PyObject_GetAttr(self, str_build_time);
++	if (a == NULL)
++		return NULL;
++	b = PyObject_GetAttr(other, str_build_time);
++	if (b == NULL) {
++		Py_DECREF(a);
++		return NULL;
++	}
++	res = PyObject_RichCompare(a, b, op);
++	Py_DECREF(a);
++	Py_DECREF(b);
++	return res;
++
++python:
++	return PyObject_CallFunctionObjArgs(pkg_py_compare[op], self, other, NULL);
++}
++
++/* register_package(cls, vercmp, lt, le, gt, ge): returns True if instances
++ * of exactly cls are now ordered in C, False if cls does not have the three
++ * slots (then it keeps its Python methods). */
++static PyObject *
++hashbase_register_package(PyObject *Py_UNUSED(module), PyObject *args)
++{
++	PyObject *cls, *vercmp, *lt, *le, *gt, *ge;
++	PyTypeObject *tp;
++	Py_ssize_t cp, version, built;
++
++	if (!PyArg_ParseTuple(args, "OOOOOO:register_package",
++			&cls, &vercmp, &lt, &le, &gt, &ge))
++		return NULL;
++	if (!PyType_Check(cls) || !PyType_IsSubtype((PyTypeObject *)cls, TaskBase_Type)) {
++		PyErr_SetString(PyExc_TypeError,
++			"register_package: expected a subclass of TaskBase");
++		return NULL;
++	}
++	tp = (PyTypeObject *)cls;
++	cp = slot_offset(tp, "cp");
++	version = slot_offset(tp, "version");
++	built = slot_offset(tp, "built");
++	if (cp < 0 || version < 0 || built < 0)
++		Py_RETURN_FALSE;
++	pkg_off_cp = cp;
++	pkg_off_version = version;
++	pkg_off_built = built;
++	Py_XSETREF(pkg_vercmp, Py_NewRef(vercmp));
++	Py_XSETREF(pkg_py_compare[Py_LT], Py_NewRef(lt));
++	Py_XSETREF(pkg_py_compare[Py_LE], Py_NewRef(le));
++	Py_XSETREF(pkg_py_compare[Py_GT], Py_NewRef(gt));
++	Py_XSETREF(pkg_py_compare[Py_GE], Py_NewRef(ge));
++	Py_XSETREF(Package_Type, (PyTypeObject *)Py_NewRef(cls));
++	Py_RETURN_TRUE;
++}
++
++/* ------------------------------------------------------------------ */
++/* PriorityBase                                                         */
++
++/* Base of _emerge.AbstractDepPriority: its six comparisons,
++ *
++ *     def __lt__(self, other):
++ *         return self.__int__() < other
++ *
++ * and, for an instance of exactly the registered DepPriority class, the
++ * value of its __int__() read from the slots. */
++static PyTypeObject *DepPriority_Type = NULL;
++static Py_ssize_t prio_off[6] = {-1, -1, -1, -1, -1, -1};
++static const long prio_value[6] = {-5, 0, -1, -2, -3, -4};
++static const char *const prio_name[6] = {
++	"optional", "buildtime_slot_op", "buildtime",
++	"runtime_slot_op", "runtime", "runtime_post",
++};
++static PyObject *str_dunder_int = NULL;
++
++/*  def __int__(self):                               (DepPriority)
++ *      if self.optional: return -5
++ *      if self.buildtime_slot_op: return 0
++ *      if self.buildtime: return -1
++ *      if self.runtime_slot_op: return -2
++ *      if self.runtime: return -3
++ *      if self.runtime_post: return -4
++ *      return -6
++ */
++static PyObject *
++priority_int(PyObject *self)
++{
++	PyObject *flag;
++	int i, truth;
++
++	if (Py_TYPE(self) == DepPriority_Type) {
++		for (i = 0; i < 6; i++) {
++			flag = SLOT_AT(self, prio_off[i]);
++			if (flag == NULL)
++				goto python;	/* unset slot: AttributeError there */
++			if (flag == Py_True)
++				return PyLong_FromLong(prio_value[i]);
++			if (flag == Py_False || flag == Py_None)
++				continue;
++			Py_INCREF(flag);
++			truth = PyObject_IsTrue(flag);
++			Py_DECREF(flag);
++			if (truth < 0)
++				return NULL;
++			if (truth)
++				return PyLong_FromLong(prio_value[i]);
++		}
++		return PyLong_FromLong(-6);
++	}
++python:
++	return PyObject_CallMethodNoArgs(self, str_dunder_int);
++}
++
++static PyObject *
++prioritybase_richcompare(PyObject *self, PyObject *other, int op)
++{
++	PyObject *value, *res;
++
++	value = priority_int(self);
++	if (value == NULL)
++		return NULL;
++	res = PyObject_RichCompare(value, other, op);
++	Py_DECREF(value);
++	return res;
++}
++
++static PyType_Slot prioritybase_slots[] = {
++	{Py_tp_richcompare, prioritybase_richcompare},
++	{0, NULL}
++};
++
++static PyType_Spec prioritybase_spec = {
++	.name = "portage.util._hashbase.PriorityBase",
++	.basicsize = sizeof(PyObject),
++	.flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
++	.slots = prioritybase_slots,
++};
++
++/* register_dep_priority(cls): True if the __int__() of instances of exactly
++ * cls is now read from its slots, False if a slot is missing. The caller
++ * guarantees that cls.__int__ is the method shown above. */
++static PyObject *
++hashbase_register_dep_priority(PyObject *Py_UNUSED(module), PyObject *cls)
++{
++	Py_ssize_t offsets[6];
++	int i;
++
++	if (!PyType_Check(cls)) {
++		PyErr_SetString(PyExc_TypeError, "register_dep_priority: expected a class");
++		return NULL;
++	}
++	for (i = 0; i < 6; i++) {
++		offsets[i] = slot_offset((PyTypeObject *)cls, prio_name[i]);
++		if (offsets[i] < 0)
++			Py_RETURN_FALSE;
++	}
++	for (i = 0; i < 6; i++)
++		prio_off[i] = offsets[i];
++	Py_XSETREF(DepPriority_Type, (PyTypeObject *)Py_NewRef(cls));
++	Py_RETURN_TRUE;
++}
++
++/* ------------------------------------------------------------------ */
++/* cmp_sort_key                                                         */
++
++/* portage.util.cmp_sort_key: cmp_sort_key(cmp_func) is a callable for the
++ * key argument of sort(); the key objects it makes compare with
++ *
++ *     def __lt__(self, other):
++ *         if other.__class__ is not self.__class__:
++ *             raise TypeError(...)
++ *         return self._cmp_func(self._obj, other._obj) < 0
++ */
++typedef struct {
++	PyObject_HEAD
++	PyObject *cmp_func;
++} CmpSortKeyObject;
++
++typedef struct {
++	PyObject_HEAD
++	PyObject *cmp_func;
++	PyObject *obj;
++} CmpKeyObject;
++
++static PyTypeObject *CmpKey_Type = NULL;
++
++static int
++cmpkey_traverse(PyObject *op, visitproc visit, void *arg)
++{
++	CmpKeyObject *self = (CmpKeyObject *)op;
++	Py_VISIT(Py_TYPE(op));
++	Py_VISIT(self->cmp_func);
++	Py_VISIT(self->obj);
++	return 0;
++}
++
++static int
++cmpkey_clear(PyObject *op)
++{
++	CmpKeyObject *self = (CmpKeyObject *)op;
++	Py_CLEAR(self->cmp_func);
++	Py_CLEAR(self->obj);
++	return 0;
++}
++
++static void
++cmpkey_dealloc(PyObject *op)
++{
++	PyObject_GC_UnTrack(op);
++	(void)cmpkey_clear(op);
++	base_dealloc_finish(op);
++}
++
++static PyObject *
++cmpkey_richcompare(PyObject *op, PyObject *other, int cmp)
++{
++	CmpKeyObject *self = (CmpKeyObject *)op;
++	PyObject *result, *zero, *res;
++
++	if (cmp != Py_LT)
++		Py_RETURN_NOTIMPLEMENTED;
++	if (Py_TYPE(other) != Py_TYPE(op)) {
++		PyErr_Format(PyExc_TypeError, "Expected type %R, got %R",
++			(PyObject *)Py_TYPE(op), (PyObject *)Py_TYPE(other));
++		return NULL;
++	}
++	if (self->cmp_func == NULL || self->obj == NULL
++		|| ((CmpKeyObject *)other)->obj == NULL) {
++		PyErr_SetString(PyExc_AttributeError, "_obj");
++		return NULL;
++	}
++	result = PyObject_CallFunctionObjArgs(self->cmp_func, self->obj,
++		((CmpKeyObject *)other)->obj, NULL);
++	if (result == NULL)
++		return NULL;
++	zero = PyLong_FromLong(0);
++	if (zero == NULL) {
++		Py_DECREF(result);
++		return NULL;
++	}
++	res = PyObject_RichCompare(result, zero, Py_LT);
++	Py_DECREF(zero);
++	Py_DECREF(result);
++	return res;
++}
++
++static PyMemberDef cmpkey_members[] = {
++	{"_cmp_func", Py_T_OBJECT_EX, offsetof(CmpKeyObject, cmp_func), Py_READONLY, NULL},
++	{"_obj", Py_T_OBJECT_EX, offsetof(CmpKeyObject, obj), Py_READONLY, NULL},
++	{NULL}
++};
++
++static PyType_Slot cmpkey_slots[] = {
++	{Py_tp_dealloc, cmpkey_dealloc},
++	{Py_tp_traverse, cmpkey_traverse},
++	{Py_tp_clear, cmpkey_clear},
++	{Py_tp_richcompare, cmpkey_richcompare},
++	{Py_tp_members, cmpkey_members},
++	{0, NULL}
++};
++
++static PyType_Spec cmpkey_spec = {
++	.name = "portage.util._hashbase._cmp_key",
++	.basicsize = sizeof(CmpKeyObject),
++	.flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC
++		| Py_TPFLAGS_DISALLOW_INSTANTIATION,
++	.slots = cmpkey_slots,
++};
++
++static int
++cmpsortkey_traverse(PyObject *op, visitproc visit, void *arg)
++{
++	Py_VISIT(Py_TYPE(op));
++	Py_VISIT(((CmpSortKeyObject *)op)->cmp_func);
++	return 0;
++}
++
++static int
++cmpsortkey_clear(PyObject *op)
++{
++	Py_CLEAR(((CmpSortKeyObject *)op)->cmp_func);
++	return 0;
++}
++
++static void
++cmpsortkey_dealloc(PyObject *op)
++{
++	PyObject_GC_UnTrack(op);
++	(void)cmpsortkey_clear(op);
++	base_dealloc_finish(op);
++}
++
++static int
++cmpsortkey_init(PyObject *op, PyObject *args, PyObject *kwargs)
++{
++	static char *kwlist[] = {"cmp_func", NULL};
++	PyObject *cmp_func;
++
++	if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O:cmp_sort_key", kwlist, &cmp_func))
++		return -1;
++	Py_XSETREF(((CmpSortKeyObject *)op)->cmp_func, Py_NewRef(cmp_func));
++	return 0;
++}
++
++/* def __call__(self, lhs): return self._cmp_key(self._cmp_func, lhs) */
++static PyObject *
++cmpsortkey_call(PyObject *op, PyObject *args, PyObject *kwargs)
++{
++	CmpSortKeyObject *self = (CmpSortKeyObject *)op;
++	CmpKeyObject *key;
++	PyObject *lhs;
++
++	if (kwargs != NULL && PyDict_GET_SIZE(kwargs) != 0) {
++		PyErr_SetString(PyExc_TypeError, "cmp_sort_key() takes no keyword arguments");
++		return NULL;
++	}
++	if (!PyArg_ParseTuple(args, "O:cmp_sort_key", &lhs))
++		return NULL;
++	if (self->cmp_func == NULL) {
++		PyErr_SetString(PyExc_AttributeError, "_cmp_func");
++		return NULL;
++	}
++	key = PyObject_GC_New(CmpKeyObject, CmpKey_Type);
++	if (key == NULL)
++		return NULL;
++	key->cmp_func = Py_NewRef(self->cmp_func);
++	key->obj = Py_NewRef(lhs);
++	PyObject_GC_Track((PyObject *)key);
++	return (PyObject *)key;
++}
++
++static PyMemberDef cmpsortkey_members[] = {
++	{"_cmp_func", Py_T_OBJECT_EX, offsetof(CmpSortKeyObject, cmp_func), 0, NULL},
++	{NULL}
++};
++
++static PyType_Slot cmpsortkey_slots[] = {
++	{Py_tp_dealloc, cmpsortkey_dealloc},
++	{Py_tp_traverse, cmpsortkey_traverse},
++	{Py_tp_clear, cmpsortkey_clear},
++	{Py_tp_init, cmpsortkey_init},
++	{Py_tp_call, cmpsortkey_call},
++	{Py_tp_members, cmpsortkey_members},
++	{0, NULL}
++};
++
++static PyType_Spec cmpsortkey_spec = {
++	.name = "portage.util._hashbase.cmp_sort_key",
++	.basicsize = sizeof(CmpSortKeyObject),
++	.flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
++	.slots = cmpsortkey_slots,
++};
++
++/* ------------------------------------------------------------------ */
++/* module                                                               */
++
++static PyMethodDef hashbase_functions[] = {
++	{"register_package", hashbase_register_package, METH_VARARGS,
++	 "register_package(cls, vercmp, lt, le, gt, ge) -> bool"},
++	{"register_dep_priority", hashbase_register_dep_priority, METH_O,
++	 "register_dep_priority(cls) -> bool"},
++	{NULL}
++};
++
++static struct PyModuleDef hashbase_module = {
++	PyModuleDef_HEAD_INIT,
++	.m_name = "_hashbase",
++	.m_doc = "C base types with the hash and equality of Task and Atom",
++	.m_size = -1,
++	.m_methods = hashbase_functions,
++};
++
++PyMODINIT_FUNC
++PyInit__hashbase(void)
++{
++	PyObject *m, *slots, *type;
++
++	m = PyModule_Create(&hashbase_module);
++	if (m == NULL)
++		return NULL;
++
++	str_hash_key = PyUnicode_InternFromString("_hash_key");
++	if (str_hash_key == NULL)
++		goto fail;
++
++	TaskBase_Type = (PyTypeObject *)PyType_FromSpec(&taskbase_spec);
++	if (TaskBase_Type == NULL)
++		goto fail;
++	/* SlotObject.__init__ and SlotObject.copy() walk __slots__ of every
++	 * base class: name the two fields there as Task.__slots__ did. */
++	slots = Py_BuildValue("(ss)", "_hash_key", "_hash_value");
++	if (slots == NULL)
++		goto fail;
++	if (PyObject_SetAttrString((PyObject *)TaskBase_Type, "__slots__", slots) < 0) {
++		Py_DECREF(slots);
++		goto fail;
++	}
++	Py_DECREF(slots);
++	if (PyModule_AddObjectRef(m, "TaskBase", (PyObject *)TaskBase_Type) < 0)
++		goto fail;
++
++	AtomBase_Type = (PyTypeObject *)PyType_FromSpec(&atombase_spec);
++	if (AtomBase_Type == NULL)
++		goto fail;
++	if (PyModule_AddObjectRef(m, "AtomBase", (PyObject *)AtomBase_Type) < 0)
++		goto fail;
++
++	str_build_time = PyUnicode_InternFromString("build_time");
++	str_dunder_int = PyUnicode_InternFromString("__int__");
++	if (str_build_time == NULL || str_dunder_int == NULL)
++		goto fail;
++
++	type = PyType_FromSpec(&prioritybase_spec);
++	if (type == NULL)
++		goto fail;
++	if (PyModule_AddObjectRef(m, "PriorityBase", type) < 0) {
++		Py_DECREF(type);
++		goto fail;
++	}
++	Py_DECREF(type);
++
++	CmpKey_Type = (PyTypeObject *)PyType_FromSpec(&cmpkey_spec);
++	if (CmpKey_Type == NULL)
++		goto fail;
++	type = PyType_FromSpec(&cmpsortkey_spec);
++	if (type == NULL)
++		goto fail;
++	/* cmp_sort_key._cmp_key, as in the Python class */
++	if (PyObject_SetAttrString(type, "_cmp_key", (PyObject *)CmpKey_Type) < 0
++		|| PyModule_AddObjectRef(m, "cmp_sort_key", type) < 0) {
++		Py_DECREF(type);
++		goto fail;
++	}
++	Py_DECREF(type);
++
++	return m;
++
++fail:
++	Py_DECREF(m);
++	return NULL;
++}

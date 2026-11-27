@@ -1,0 +1,335 @@
+Portage 3.0.83 resolver patches, re-cut into independent sub-series (2026-11-21)
+================================================================================
+
+This directory holds the ladder of sys-apps/portage::pwr (formerly 25 patches) cut again
+into 30 patches that form 13 sub-series, A to M. Every line of code is the same as before:
+
+  * all 30 files applied in numeric order to pristine 3.0.83 (patch -p1 -F0) give the tested
+    tree, byte for byte, and so do the first 1, 3, 9, 11, 14, 16 and 18 of them compared with
+    the same prefixes of the 25-patch ladder (0001-0018 are the same changes as before; only
+    their context lines differ);
+  * every sub-series applies alone, in its own order, to pristine 3.0.83 without any patch of
+    another sub-series, byte-compiles, and gives the same merge list in the same order with the
+    same number of backtracking attempts and packages as unpatched 3.0.83 on the six test states;
+  * any two sub-series apply together in numeric order (78 pairs tried, no textual conflict),
+    and so does the series with any one sub-series left out.
+
+Every patch header carries a line "Sub-series: <letter> (<name>) - patch <i> of <n>; ...".
+To use one sub-series, apply its files in numeric order:
+
+    for n in 0009 0019; do patch -p1 -F0 < $n-*.patch; done      # sub-series D
+
+patch reports offsets (line numbers are those of the full series); with -F0 it uses no fuzz.
+
+
+Sub-series
+----------
+
+"Alone on stock" = resolve seconds of `emerge -p -uND @world`, summed over the six states
+(start holds masks py313 bdeps policykit), ONE run per state, with only this sub-series on
+stock 3.0.83; the stock arm was run in the same pass. Gate ok = on all six states the merge list
+in order, the backtracking attempts and the package count equal the stock arm. The figures are
+single runs: differences of a few seconds between arms are inside the noise.
+
+A  probe, match and config memos
+     0001 probe-memo
+     0002 match-replay
+     0004 probe-upgrade-downgrade-memo
+     0005 probe-similar-lazy-replay
+     0012 regenerate-memos
+     0013 probe-memo-object
+     0014 probe-version-bounds
+     0016 pkg-use-without-setcpv
+     0028 atom-key-caches
+     0029 probe-certain-atoms
+     Memos for the slot-operator probes inside one _slot_operator_trigger_reinstalls loop,
+     replay of atom matches across backtracking attempts, memos for config.regenerate() and
+     package USE without setcpv(); on top of these the probes pass over versions that cannot
+     qualify and atoms that dep_check() cannot drop.
+     Alone on stock: 256.6 s against stock 447.3 s (-43 %), gate ok
+
+B  cycle search and frontier
+     0003 mergeable-from-frontier
+     0006 empty-cycle-search-memo
+     0007 one-node-cycle-shortcut
+     0010 frontier-leaf-sets
+     0011 gather-ok-tracker
+     0024 frontier-mergeable-set-node-removal
+     The selection loop of _serialize_tasks takes mergeable nodes and cycle-search state
+     from the leaf frontier: exact leaf sets, no repeated search that found no cycle, one-
+     node closures, a tracker that skips the cycle-closure pass.
+     Alone on stock: 375.3 s against stock 447.3 s (-16 %), gate ok
+
+C  use_reduce parser
+     0008 use-reduce-store
+     0018 c-parser-atom-memo
+     0030 use-reduce-store-rewrap
+     use_reduce(): parse results kept beyond the 1,024-entry LRU, an atom memo in the C
+     parser glue, the C parser also for calls with is_valid_flag.
+     Alone on stock: 407.1 s against stock 447.3 s (-9 %), gate ok
+
+D  garbage collector
+     0009 gc-threshold
+     0019 pretend-gc-off-fast-exit
+     Cyclic garbage collector: higher threshold during the resolve; for `emerge --pretend`
+     no collection during the run and os._exit instead of heap teardown.
+     Alone on stock: 420.2 s against stock 447.3 s (-6 %), gate ok
+
+E  single-atom lookups
+     0015 single-atom-lookups
+     Matches one atom against one package directly, without building a package set.
+     Alone on stock: 399.6 s against stock 447.3 s (-11 %), gate ok
+
+F  slot-object constructors
+     0017 slot-object-constructors
+     SlotObject sets ordinary slots directly; explicit constructors for Dependency and
+     _dep_choice.
+     Alone on stock: 427.5 s against stock 447.3 s (-4 %), gate ok
+
+G  flat dependency lists
+     0020 flat-dep-lists
+     Builds the dep_check() result directly for dependency lists that contain no choice.
+     Alone on stock: 434.9 s against stock 447.3 s (-3 %), gate ok
+
+H  atom matching caches
+     0021 atom-matching-caches
+     One-atom path in match_from_list(), slot descriptors for Atom attributes, unbounded
+     vercmp/catpkgsplit caches.
+     Alone on stock: 430.8 s against stock 447.3 s (-4 %), gate ok
+
+I  REQUIRED_USE memo
+     0022 required-use-memo
+     Remembers per (package, enabled USE) whether REQUIRED_USE is satisfied, for all
+     backtracking attempts.
+     Alone on stock: 443.1 s against stock 447.3 s (-1 %), gate ok
+
+J  priority copy
+     0023 priority-copy
+     Copies dependency priorities slot by slot and builds them from templates.
+     Alone on stock: 439.6 s against stock 447.3 s (-2 %), gate ok
+
+K  config trims
+     0025 config-trims
+     Small memos in the per-package config work (USE mask/force stacks, ACCEPT_LICENSE
+     stack, config._getitem, the RESTRICT/PROPERTIES USE set).
+     Alone on stock: 434.6 s against stock 447.3 s (-3 %), gate ok
+
+L  flatten-atoms memo
+     0026 flatten-atoms-memo
+     Moves the _flatten_atoms() cache to _frozen_config so that backtracking attempts share
+     it.
+     Alone on stock: 439.2 s against stock 447.3 s (-2 %), gate ok
+
+M  leftovers
+     0027 leftovers
+     Six local rewrites of hot statements (Package.__bool__, metadata wrapper constructor,
+     digraph.add, dep_expand, noise-level tests in dep_check, _pkg_use_enabled).
+     Alone on stock: 434.9 s against stock 447.3 s (-3 %), gate ok
+
+Per state (resolve seconds, single runs, pass p1; stock first):
+
+  arm           start     holds     masks     py313     bdeps policykit      sum  vs stock  gate
+  stock         122.0      44.9      96.3      71.2      69.9      43.1    447.3       +0%  (reference)
+  A              91.7      20.0      47.1      47.7      30.2      20.0    256.6      -43%  ok
+  B              76.4      44.2      95.2      46.6      70.2      42.7    375.3      -16%  ok
+  C             113.2      40.3      84.8      66.7      63.5      38.5    407.1       -9%  ok
+  D             114.9      42.4      88.6      68.3      64.9      41.0    420.2       -6%  ok
+  E             114.5      39.8      80.7      66.6      59.7      38.3    399.6      -11%  ok
+  F             119.3      43.1      89.2      69.5      65.0      41.4    427.5       -4%  ok
+  G             119.6      43.6      90.6      73.7      65.8      41.6    434.9       -3%  ok
+  H             120.0      43.2      88.9      69.9      67.3      41.5    430.8       -4%  ok
+  I             121.5      44.6      91.7      72.4      69.8      43.0    443.1       -1%  ok
+  J             123.0      44.1      89.7      72.5      68.1      42.2    439.6       -2%  ok
+  K             121.1      42.9      90.1      71.4      68.2      40.9    434.6       -3%  ok
+  L             122.3      44.2      89.4      72.5      68.8      42.0    439.2       -2%  ok
+  M             120.4      44.6      89.0      72.2      66.7      42.0    434.9       -3%  ok
+  A-probe       101.8      32.2      63.0      61.0      41.7      31.2    330.8      -26%  ok
+  A-match       111.6      39.7      75.7      67.8      57.5      37.6    389.8      -13%  ok
+  A-config      118.5      40.9      86.8      68.8      62.4      38.3    415.7       -7%  ok
+  attempts / packages of the stock arm: start 13/522, holds 3/64, masks 29/87, py313 4/506, bdeps 4/64, policykit 3/101
+
+Textual conflicts between pairs of sub-series: none (see Checks).
+
+
+What is entangled, and how far
+------------------------------
+
+A is one sub-series because of two patches that sit on three otherwise separate lines of work:
+
+  * 0014 probe-version-bounds threads a version bound through _iter_match_pkgs_atom_imp()
+    (created by 0002) and _iter_similar_available_imp() (created by 0005), stores its key in
+    the memo object of 0013, and reads config._regenerate_warned, which 0012 sets for it.
+  * 0029 probe-certain-atoms calls _probe_bounds_allowed() of 0014.
+  * 0016 pkg-use-without-setcpv is built on the memo functions of 0012.
+  * 0028 atom-key-caches changes the key of the memo of 0002 (two lines) and places its helper
+    after the class that 0005 adds.
+
+Inside A three branches stand alone and were measured alone (arms A-probe, A-match, A-config
+above): 0001 0004 0005 0013 (probe memo), 0002 (match replay), 0012 0016 (config memos). What
+each patch needs is written in its header ("Of these it needs ... only") and is listed here:
+
+  A  0001 probe-memo                             needs nothing
+  A  0002 match-replay                           needs nothing
+  A  0004 probe-upgrade-downgrade-memo           needs 0001
+  A  0005 probe-similar-lazy-replay              needs 0001
+  A  0012 regenerate-memos                       needs nothing
+  A  0013 probe-memo-object                      needs 0001 0004 0005
+  A  0014 probe-version-bounds                   needs 0001 0002 0004 0005 0012 0013
+  A  0016 pkg-use-without-setcpv                 needs 0012
+  A  0028 atom-key-caches                        needs 0001 0002 0005
+  A  0029 probe-certain-atoms                    needs 0001 0002 0004 0005 0012 0013 0014
+  B  0003 mergeable-from-frontier                needs nothing
+  B  0006 empty-cycle-search-memo                needs nothing
+  B  0007 one-node-cycle-shortcut                needs nothing
+  B  0010 frontier-leaf-sets                     needs 0003 0006
+  B  0011 gather-ok-tracker                      needs 0003 0006 0007 0010
+  B  0024 frontier-mergeable-set-node-removal    needs 0003 0006 0007 0010 0011
+  C  0008 use-reduce-store                       needs nothing
+  C  0018 c-parser-atom-memo                     needs 0008
+  C  0030 use-reduce-store-rewrap                needs 0008
+  D  0009 gc-threshold                           needs nothing
+  D  0019 pretend-gc-off-fast-exit               needs 0009
+
+A patch applies, and gives the tree the weave predicts, on pristine 3.0.83 plus exactly the
+patches named for it (check.sh deps). Of these smaller sets only the three branches of A were
+run through the gate here; 0001, 0002, 0003, 0006, 0007, 0008, 0009 and the pairs 0001+0004,
+0001+0004+0005 were measured alone earlier (emerge-fast-upstream/pick/results.tsv, three
+states), not again in this pass.
+
+B is the cycle search of _serialize_tasks: 0010 rewrites the memo of 0006 and one line of 0003,
+0011 rewrites part of 0007, 0024 replaces the reduced forms of 0003 and 0007.
+C: 0018 calls the C parser from inside the function that 0008 adds; 0030 re-wraps a line of 0008.
+D: 0019 turns the literal threshold of 0009 into a constant and adds the --pretend path.
+
+
+What changed against the 25-patch ladder
+----------------------------------------
+
+Unchanged numbers and names, same change as before: 0001-0020, 0023, 0024.
+
+Split:
+  old 0021 atom-matching-caches  -> 0021 atom-matching-caches (portage/dep/__init__.py and
+                                    portage/versions.py: one-atom match path, Atom slot
+                                    descriptors, vercmp/catpkgsplit caches)        sub-series H
+                                 -> 0028 atom-key-caches (all hunks in _emerge/: depgraph.py,
+                                    PackageVirtualDbapi.py, resolver/package_tracker.py)   A
+  old 0025 config-trims-and-leftovers
+                                 -> 0022 required-use-memo (depgraph.py: the
+                                    _required_use_sat_memo line and the _add_pkg hunk)      I
+                                 -> 0025 config-trims (config.py, LicenseManager.py,
+                                    UseManager.py)                                          K
+                                 -> 0026 flatten-atoms-memo (depgraph.py: the
+                                    _flatten_atoms_cache lines)                             L
+                                 -> 0027 leftovers (Package.py, dep_check.py, dep_expand.py,
+                                    digraph.py, the _pkg_use_enabled hunk of depgraph.py)   M
+                                 -> 0030 use-reduce-store-rewrap (the one hunk in
+                                    portage/dep/__init__.py)                                C
+Moved:
+  old 0022 probe-certain-atoms   -> 0029 (same change)                                      A
+
+Nothing was merged, and no hunk moved between two patches that both still exist. Why the order
+of the tail changed: required-use-memo, flatten-atoms-memo and probe-certain-atoms each add
+lines at one and the same place of _frozen_depgraph_config.__init__, and in the tested tree
+they stand in this order. Each can apply without the others only if it is the lowest block at
+that place when it is applied, hence 0022 < 0026 < 0029. Trees after 19 to 29 patches therefore
+differ from the old trees after 19 to 24; none of them is a ladder prefix.
+
+Ladder prefixes (ebuilds 9999-r1 .. -r8): 1, 3, 9, 11, 14, 16, 18 patches as before; the last
+step is now "all 30" instead of "all 25". No prefix tree changed, so nothing was re-measured.
+
+
+How the hunks are cut
+---------------------
+
+Written by tools/recut.py from a weave of the original series (tools/weave.py: every line with
+the patch that adds it and the patch that deletes it). A patch must apply to several trees (the
+full chain, its sub-series alone, its own dependencies alone, its sub-series with any other
+one), and patch(1) wants the same number of context lines before and after a hunk, so each hunk
+has as many context lines (3 at most) as are identical on both sides in all those trees.
+
+Reduced context (2 lines instead of 3), 4 hunks, each checked to land where it should:
+  0010 _serialize_frontier.py  the ready_nodes() hunk
+  0015 depgraph.py             the _find_single_atom() helper; the findAtomForPackage hunk in
+                               _iter_match_pkgs_atom
+  0026 depgraph.py             the second _flatten_atoms_cache assignment
+
+"Anchor" hunks, 6: a pure insertion next to lines of another sub-series has no context line that
+is the same in every tree on both sides. It is written without context as a replacement of the
+one neighbouring line that IS the same in every tree, re-stating that line:
+
+    -        self._highest_license_masked = {}
+    +        # (pkg, enabled USE flags) -> bool, see depgraph._add_pkg.
+    +        self._required_use_sat_memo = {}
+    +        self._highest_license_masked = {}
+
+The re-stated line occurs once in the file in every tree that was tried, so the hunk cannot land
+elsewhere. These are in 0006 (first hunk in the selection loop of _serialize_tasks; needed so
+that 0006 applies without 0003), 0022, 0023, 0026, 0028, 0029 (helpers and memo attributes that
+several sub-series add at the same two places of depgraph.py). Two hunks at the end of a file
+(0017 Dependency.py, 0023 AbstractDepPriority.py) have no trailing context because there is none.
+
+
+Checks (tools/check.sh; rebuilds nothing)
+-----------------------------------------
+
+    tools/check.sh all        # full, alone, deps, pairs      -> check.log
+    tools/check.sh leaveout
+
+  full      30 patches in order on pristine source, patch -p1 -F0: equal to the tested tree
+            (emerge-fast-ebuild/b/lib) and to the 25-patch ladder; prefixes 1 3 9 11 14 16 18
+            equal to the same prefixes of the 25-patch ladder; byte-compile after every patch
+  alone     each sub-series alone on pristine source: applies with -F0, equals the tree the
+            weave predicts for that set of patches, changed files byte-compile
+  deps      each patch on pristine source plus only the patches it is said to need: same tests
+  pairs     every two sub-series together in numeric order: same tests; 78 pairs
+  leaveout  the series without one sub-series, 13 times: same tests
+
+Result of the last run: see check.log (all PASS, pairs "78 tried, 0 not clean").
+Not checked by these scripts: three or more sub-series together other than the full series and
+the 13 leave-one-out sets.
+
+
+Measurements (tools/run-arms.sh, tools/summary.py; results.tsv has every run)
+----------------------------------------------------------------------------
+
+    tools/run-arms.sh build          # arms/NAME = installed stock 3.0.83 files + the patches
+    tools/run-arms.sh run p1         # six states x (stock + every arm of tools/arms.txt)
+    tools/summary.py p1
+
+Test bed: ~/Claude/qagent/emerge-fast (scenario.sh, apply-run.sh), image rootfs read-only, one
+resolve at a time, 1-minute load recorded at the start and end of every run (columns 9 and 10
+of results.tsv); no run was started with a load above 3.5. Raw output of every run: out/p1/.
+The stock merge lists of this pass equal the stored reference lists of the ladder run
+(emerge-fast-upstream/ladder/out/STATE.stock.order) for all six states.
+
+Pass p1, 2026-11-21 08:26-10:37: 102 runs (6 states x stock + 16 arms), all with gate ok and
+status ok. Highest 1-minute load at the start of a run 3.38; one run (start, arm L) ended with a
+load of 4.43 after starting at 2.65 and was not repeated (its figure, 122.3 s, is the stock
+figure). The desktop was in use during the pass (load about 2 throughout), so take the seconds
+as indicative. A "smoke" pass of two runs (holds: stock, A) precedes p1 in results.tsv.
+Not done: second runs, the full series as an arm (its tree is the tested tree, measured in the
+ladder run), the gate for dependency sets other than the three branches of A.
+
+
+Files
+-----
+
+  patches/          the 30 patch files
+  README            this file (tools/mkreadme.py writes it from tools/README.in and results.tsv)
+  results.tsv       pass state arm resolve_s wall_s backtracks packages gate load_start load_end
+                    status started patches
+  check.log         output of tools/check.sh all leaveout
+  build.log         output of tools/recut.py build (the hunks with reduced context)
+  out/PASS/         STATE.ARM.{json,log,order,err} of every run
+  arms/             the candidate trees that were measured
+  tools/plan.py     the cut: units, order, sub-series, dependencies
+  tools/weave.py    the weave of the original series; `weave.py deps` lists who rewrites whom
+  tools/recut.py    writes patches/ (build), a predicted tree (view), the tables (info)
+  tools/check.sh    the checks
+  tools/run-arms.sh, tools/arms.txt, tools/summary.py     the measurement
+  tools/headers/    header texts of the patches that were split off
+  tools/show.py, tools/idents.py   helpers used while cutting (weave regions of a patch; names
+                    one patch introduces and another uses)
+
+Origin: the patches were written by AI agents (see each header); this re-cut was made by an AI
+agent as well (Claude, 2026-11-21) and changes no line of code.

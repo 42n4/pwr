@@ -1,0 +1,306 @@
+depgraph: skip the cycle closure pass when it cannot select anything (_GatherOkTracker)
+
+Sub-series: B (cycle search and frontier) - patch 5 of 6; applies to 3.0.83 with only the earlier patches of this sub-series.
+
+When no leaf is available, find_smallest_cycle calls
+_gather_deps_closures for each priority level: one O(V+E) pass over the
+graph that computes, for every candidate, whether gather_deps succeeds and
+how large its closure is. In most passes of the selection loop that work
+selects nothing, because no candidate with parents is in the resulting
+ok_nodes. _GatherOkTracker (one per priority range and level) maintains
+exactly that ok_nodes set across passes: while the graph only loses nodes,
+an ok node stays ok until removed, and a not-ok node stays so as long as
+its recorded witness (a not-ok child) is still there, so only the nodes
+whose witness chain was cut are re-examined. If nodes or edges were added,
+or a node left the candidate set while staying in the graph, the set is
+rebuilt from scratch by the same procedure. When the tracker's set holds no
+candidate with parents, the closure pass is skipped for that level; when it
+does, the original code runs unchanged and decides.
+
+On top of patches 0001-0010, resolve seconds before -> after
+(median of the runs, at least 2 per figure):
+  start 59.9 -> 43.5, holds 25.9 -> 26.0, masks 47.2 -> 47.1,
+  py313 38.0 -> 29.4, bdeps 34.1 -> 34.5, policykit 26.0 -> 25.9
+  sum of six 231.1 -> 206.6 (-24.6 s, -5.5 % of the stock sum 447.5)
+Patches 0001-0011 together: 447.5 -> 206.6 s (-54 %); 447.5 is the
+stock sum of the ladder run of 2026-11-20, stock was not run again here.
+
+Lock-step check on 2026-11-21 (at every sync the ok set was recomputed with
+_gather_deps_closures and compared): start 7,366 syncs with this tree and
+7,366 with the final tree, py313 4,136, masks 18; 0 mismatches. On start
+7,345 of the 7,366 syncs let the closure pass be skipped. The gain is on the
+states with long merge lists (start, py313); the other four do not change.
+
+Weak spots and what was not checked:
+* The largest piece of new logic in the series (140 lines); its equivalence
+  rests on the invariant in the class docstring. The lock-step check above
+  covers three states only; holds, bdeps and policykit were not run with it.
+  No test forced the rebuild path (nodes or edges added during the loop).
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20..21. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+--- a/lib/_emerge/_serialize_frontier.py
++++ b/lib/_emerge/_serialize_frontier.py
+@@ -24,6 +24,7 @@
+ digraph.leaf_nodes() path (frontier not built).
+ """
+ 
++from collections import deque
+ 
+ from portage.util.digraph import digraph
+ 
+@@ -241,6 +242,147 @@
+             m ^= lb
+ 
+ 
++class _GatherOkTracker:
++    """Incrementally maintained set of the nodes for which gather_deps (see
++    depgraph._serialize_tasks) succeeds under one ignore_priority filter.
++
++    It yields exactly the ok_nodes set that
++    depgraph._gather_deps_closures(graph, valid, ignore_priority) computes
++    from scratch: the nodes of `valid` from which every node reachable over
++    child edges surviving `ignore_priority` is in `valid` too. Equivalently,
++    the largest subset of `valid` that is closed under those child edges.
++
++    Why it can be maintained instead of recomputed: as long as the graph only
++    loses nodes (hence edges) and `valid` only loses nodes that left the
++    graph, an ok node stays ok until it is removed, and a not-ok ("bad") node
++    stays bad as long as one particular proof of its badness survives. The
++    proof kept for each bad member of `valid` is a witness: one surviving child
++    that is itself bad. Witness chains end at a node outside `valid` (a "root",
++    bad by definition) and never loop, because a witness is only ever assigned
++    when it already has a complete chain. So only nodes whose chain was cut
++    (by a removal, or because its root became valid) have to be re-examined.
++
++    Whenever the monotonicity premise does not hold (an edge or node was added,
++    or a node left `valid` while staying in the graph) everything is rebuilt
++    from scratch, which is the same procedure applied to all of `valid`.
++    """
++
++    def __init__(self, graph, frontier, ignore_priority):
++        self._graph = graph
++        self._frontier = frontier
++        self._ignore_priority = ignore_priority
++        self._ok = set()
++        # bad member of valid -> its witness (a bad child)
++        self._wit = {}
++        # bad node -> set of the nodes that use it as their witness
++        self._deps = {}
++        self._prev_valid = None
++        self._log_pos = 0
++        self._add_count = 0
++
++    def sync(self, valid):
++        """Bring the state up to date with the graph and with `valid` (a set
++        the caller will not mutate) and return the set of ok nodes. The
++        returned set is owned by the tracker; do not mutate it."""
++        graph = self._graph
++        graph_nodes = graph.nodes
++        frontier = self._frontier
++        removed_log = frontier.removed_log
++        ok = self._ok
++        wit = self._wit
++        deps = self._deps
++        prev_valid = self._prev_valid
++
++        rebuild = prev_valid is None or frontier.add_count != self._add_count
++        if not rebuild:
++            for node in prev_valid - valid:
++                if node in graph_nodes:
++                    # Left valid without leaving the graph: not monotone.
++                    rebuild = True
++                    break
++
++        if rebuild:
++            ok.clear()
++            wit.clear()
++            deps.clear()
++            unsettled = set(valid)
++        else:
++            # Collect the nodes whose proof of badness is gone: those whose
++            # witness was removed, and former roots that became valid.
++            pending = []
++            for i in range(self._log_pos, len(removed_log)):
++                node = removed_log[i]
++                ok.discard(node)
++                witness = wit.pop(node, None)
++                if witness is not None:
++                    users = deps.get(witness)
++                    if users is not None:
++                        users.discard(node)
++                users = deps.pop(node, None)
++                if users:
++                    pending.extend(users)
++            pending.extend(valid - prev_valid)
++            # ... together with everything whose witness chain passes through
++            # one of them.
++            unsettled = set()
++            while pending:
++                node = pending.pop()
++                if node in unsettled or node not in graph_nodes:
++                    continue
++                unsettled.add(node)
++                witness = wit.pop(node, None)
++                if witness is not None:
++                    users = deps.get(witness)
++                    if users is not None:
++                        users.discard(node)
++                users = deps.pop(node, None)
++                if users:
++                    pending.extend(users)
++
++        self._prev_valid = valid
++        self._log_pos = len(removed_log)
++        self._add_count = frontier.add_count
++
++        if unsettled:
++            # Every graph node is now exactly one of: ok, settled bad (outside
++            # valid, or holding a witness), or unsettled. An unsettled node is
++            # bad iff it has a surviving child that is settled bad, or one that
++            # is unsettled and turns out bad.
++            ignore_priority = self._ignore_priority
++            queue = deque()
++            for node in unsettled:
++                for child in graph.child_nodes_iter(
++                    node, ignore_priority=ignore_priority
++                ):
++                    if child not in unsettled and child not in ok:
++                        wit[node] = child
++                        users = deps.get(child)
++                        if users is None:
++                            deps[child] = users = set()
++                        users.add(node)
++                        queue.append(node)
++                        break
++            unsettled.difference_update(queue)
++            while queue:
++                node = queue.popleft()
++                for parent in graph.parent_nodes(
++                    node, ignore_priority=ignore_priority
++                ):
++                    if parent in unsettled:
++                        unsettled.discard(parent)
++                        wit[parent] = node
++                        users = deps.get(node)
++                        if users is None:
++                            deps[node] = users = set()
++                        users.add(parent)
++                        queue.append(parent)
++            # What is left is closed under surviving child edges and inside
++            # valid, hence ok.
++            ok.update(unsettled)
++
++        return ok
++
++
+ class _FrontierDigraph(digraph):
+     """digraph that keeps an attached _SerializeFrontier in sync on every
+     mutation."""
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -80,7 +80,11 @@
+ from portage.versions import _pkg_str, catpkgsplit
+ 
+ from _emerge._find_deep_system_runtime_deps import _find_deep_system_runtime_deps
+-from _emerge._serialize_frontier import _FrontierDigraph, _SerializeFrontier
++from _emerge._serialize_frontier import (
++    _FrontierDigraph,
++    _GatherOkTracker,
++    _SerializeFrontier,
++)
+ from _emerge.AbstractDepPriority import AbstractDepPriority
+ from _emerge.AtomArg import AtomArg
+ from _emerge.Blocker import Blocker
+@@ -9948,6 +9952,9 @@
+             frontier = _SerializeFrontier(mygraph)
+             mygraph.frontier = frontier
+ 
++        # (local_priority_range, level index) -> _GatherOkTracker, see
++        # find_smallest_cycle.
++        ok_trackers = {}
+         # local_priority_range -> the search state for which the runtime cycle
+         # search of that range last came back empty, see below.
+         no_cycle_memo = {}
+@@ -10093,27 +10100,33 @@
+                         blocked_nodes = frozenset((replacement_portage,))
+ 
+                     # Sort nodes for deterministic results. The sort is done
+-                    # lazily, since the shortcut below does not need it.
++                    # lazily, since the shortcuts below do not need it.
+                     sorted_nodes = None
+-                    for priority in (
+-                        local_priority_range.ignore_priority[i]
+-                        for i in range(
+-                            local_priority_range.MEDIUM_POST,
+-                            local_priority_range.MEDIUM_SOFT + 1,
+-                        )
++                    if frontier is not None:
++                        # The nodes that gather_deps may gather.
++                        if blocked_nodes is None:
++                            valid_nodes = mergeable_nodes
++                        else:
++                            valid_nodes = mergeable_nodes - blocked_nodes
++                        graph_nodes = mygraph.nodes
++
++                    for i in range(
++                        local_priority_range.MEDIUM_POST,
++                        local_priority_range.MEDIUM_SOFT + 1,
+                     ):
++                        priority = local_priority_range.ignore_priority[i]
+                         level = None
+                         if frontier is not None:
+                             level = frontier.level_of(priority)
+                         if level is not None:
+-                            # A candidate without any child at this level has
+-                            # the closure {itself}. No closure is smaller than
+-                            # one node, and the loop below keeps the first
+-                            # candidate of minimal size in sorted order, so the
+-                            # result is the least such candidate. Taking the
+-                            # first minimum while iterating nodes in its own
+-                            # order is what the stable sort followed by that
+-                            # loop returns.
++                            # Shortcut 1: a candidate without any child at this
++                            # level has the closure {itself}. No closure is
++                            # smaller than one node, and the loop at the end of
++                            # this block keeps the first candidate of minimal
++                            # size in sorted order, so the result is the least
++                            # such candidate. Taking the first minimum while
++                            # iterating nodes in its own order is what the
++                            # stable sort followed by that loop returns.
+                             smallest_leaf = None
+                             graph_nodes = mygraph.nodes
+                             for node in frontier.leaves_among(nodes, level):
+@@ -10134,6 +10147,27 @@
+                                 smallest_size = 1
+                                 ignore_priority = priority
+                                 break
++
++                            # Shortcut 2: skip the closure computation when it
++                            # cannot select anything, i.e. when no candidate
++                            # that has parents would be in its ok_nodes. The
++                            # tracker maintains that same set incrementally
++                            # across iterations of the selection loop.
++                            tracker = ok_trackers.get((local_priority_range, i))
++                            if tracker is None:
++                                tracker = ok_trackers[
++                                    (local_priority_range, i)
++                                ] = _GatherOkTracker(mygraph, frontier, priority)
++                            ok_nodes = tracker.sync(valid_nodes)
++                            if nodes is mergeable_nodes:
++                                # ok_nodes is a subset of mergeable_nodes.
++                                if not any(graph_nodes[node][1] for node in ok_nodes):
++                                    continue
++                            elif not any(
++                                node in ok_nodes and graph_nodes[node][1]
++                                for node in nodes
++                            ):
++                                continue
+                         if sorted_nodes is None:
+                             sorted_nodes = sorted(nodes)
+                         # Compute gather_deps success and closure size for every

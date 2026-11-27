@@ -1,0 +1,67 @@
+depgraph: take mergeable_nodes from the leaf frontier in _serialize_tasks
+
+Sub-series: B (cycle search and frontier) - patch 1 of 6; applies to 3.0.83 with only the earlier patches of this sub-series.
+Ported to upstream 73646c35d: unchanged (line numbers only)
+
+The frontier that _serialize_tasks already maintains returns the same nodes
+in the same order as the get_nodes() scan of the whole graph.
+
+Alone on 3.0.83: start 119.6 -> 108.6; no effect on states with a short
+merge list (masks, base).
+Patches 0001-0003 together, sum of six states: 447.5 -> 300.6 s (-33 %):
+  start 85.8, holds 30.4, masks 59.9, py313 53.6, bdeps 40.5, policykit 30.4
+Applies to upstream head unchanged.
+
+Origin: written by AI agents (Claude) in the emerge-fast job, 2026-11-17..20;
+isolated from the full patch and measured on 2026-11-20. Not a human-written
+change. Base: Portage 3.0.83. Test: `emerge -p -uND @world` on six states of
+one system image, one resolve at a time; every run gave the same merge list
+in the same order, the same number of backtracking attempts and the same
+package count as unpatched 3.0.83.
+---
+
+Ported to upstream bdf046b03 (2026-11-23) by a three-way merge per file (base 73646c35d).
+
+diff -ruN a/lib/_emerge/depgraph.py b/lib/_emerge/depgraph.py
+--- a/lib/_emerge/depgraph.py
++++ b/lib/_emerge/depgraph.py
+@@ -10375,9 +10375,24 @@
+                     priority_ranges.append(DepPrioritySatisfiedRange)
+ 
+                 for local_priority_range in priority_ranges:
+-                    mergeable_nodes = set(
+-                        get_nodes(ignore_priority=local_priority_range.ignore_medium)
+-                    )
++                    if frontier is not None:
++                        # ignore_medium is ignore_priority[MEDIUM] for both
++                        # ranges, and frontier_leaves() returns the nodes of
++                        # get_nodes() in the same order, without the scan of
++                        # the whole graph.
++                        mergeable_nodes = set(
++                            frontier_leaves(
++                                local_priority_range.ignore_priority[
++                                    local_priority_range.MEDIUM
++                                ]
++                            )
++                        )
++                    else:
++                        mergeable_nodes = set(
++                            get_nodes(
++                                ignore_priority=local_priority_range.ignore_medium
++                            )
++                        )
+                     if mergeable_nodes:
+                         selected_nodes, ignore_priority = find_smallest_cycle(
+                             mergeable_nodes, local_priority_range
+@@ -10721,7 +10736,10 @@
+                 # only trigger when the graph is nearly empty and the only
+                 # remaining nodes are isolated (no parents or children). Since
+                 # the nodes must be isolated, ignore_priority is not needed.
+-                selected_nodes = get_nodes()
++                if frontier is not None:
++                    selected_nodes = frontier_leaves(None)
++                else:
++                    selected_nodes = get_nodes()
+ 
+             if not selected_nodes and not drop_satisfied:
+                 drop_satisfied = True

@@ -1,0 +1,37 @@
+--- a/python/xgrammar/kernels/apply_token_bitmask_inplace_cuda.py
++++ b/python/xgrammar/kernels/apply_token_bitmask_inplace_cuda.py
+@@ -57,6 +57,17 @@
+         raise ImportError(f"nvcc compiler not found at {nvcc_path}")
+ 
+ 
++def _select_cuda_host_compiler() -> None:
++    """Select the compiler declared by the CUDA-enabled Gentoo package."""
++    import os
++
++    # torch.utils.cpp_extension uses CXX for its C++ shim and CC to select
++    # nvcc's host compiler.  Translate the standard CUDA overrides and
++    # otherwise use the GCC slot pulled in by USE=cuda.
++    os.environ["CC"] = os.environ.get("CUDAHOSTCC", "/usr/bin/gcc-16")
++    os.environ["CXX"] = os.environ.get("CUDAHOSTCXX", "/usr/bin/g++-16")
++
++
+ def _remove_torch_nvcc_flags() -> None:
+     REMOVE_NVCC_FLAGS = [
+         "-D__CUDA_NO_HALF_OPERATORS__",
+@@ -78,7 +89,7 @@
+     cflags = ["-O3"]
+     if platform.system() != "Windows":
+         cflags.append("-Wno-switch-bool")
+-    cuda_cflags = ["-O3", "-std=c++17", "--threads", "4", "-use_fast_math"]
++    cuda_cflags = ["-O3", "-std=c++20", "--threads", "4", "-use_fast_math"]
+     # Use the safer cpp_extension.load_inline instead of cpp_extension.load
+     torch.utils.cpp_extension.load_inline(
+         name="xgrammar",
+@@ -92,6 +103,7 @@
+ 
+ 
+ _check_cuda_toolchain()
++_select_cuda_host_compiler()
+ _remove_torch_nvcc_flags()
+ _load_torch_ops()
+ 
